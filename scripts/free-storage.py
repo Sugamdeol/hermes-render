@@ -2,7 +2,7 @@
 """Optional GoFile state sync for Render's Free filesystem.
 
 Render Free services cannot attach persistent disks. When configured with a
-GoFile account token and folder, this module restores the newest Hermes state
+GoFile account token, this module resolves a state folder and restores the newest Hermes state
 archive before Hermes starts and periodically uploads a fresh archive while
 Hermes is running. It keeps one current archive by deleting older matching
 backups after a successful upload.
@@ -54,6 +54,7 @@ class StorageConfig:
         self,
         token: str,
         folder_id: str,
+        folder_name: str,
         prefix: str,
         interval: int,
         max_archive_bytes: int,
@@ -63,6 +64,7 @@ class StorageConfig:
     ) -> None:
         self.token = token
         self.folder_id = folder_id
+        self.folder_name = folder_name or "hermes-render-state"
         self.prefix = prefix or "hermes-state-"
         self.interval = interval
         self.max_archive_bytes = max_archive_bytes
@@ -74,7 +76,7 @@ class StorageConfig:
     def from_env(cls) -> "StorageConfig | None":
         token = (os.environ.get("GOFILE_API_TOKEN") or os.environ.get("GOFILE_TOKEN", "")).strip()
         folder_id = os.environ.get("GOFILE_FOLDER_ID", "").strip()
-        if not token or not folder_id:
+        if not token:
             return None
 
         def positive_int(name: str, default: int) -> int:
@@ -87,6 +89,7 @@ class StorageConfig:
         return cls(
             token=token,
             folder_id=folder_id,
+            folder_name=os.environ.get("GOFILE_FOLDER_NAME", "hermes-render-state"),
             prefix=os.environ.get("GOFILE_STATE_PREFIX", "hermes-state-"),
             interval=positive_int("GOFILE_SYNC_INTERVAL_SECONDS", 60),
             max_archive_bytes=positive_int("GOFILE_MAX_ARCHIVE_MB", 25) * 1024 * 1024,
@@ -227,13 +230,12 @@ def _safe_extract(archive: tarfile.TarFile, data_dir: Path) -> None:
         archive.extract(member, path=data_dir)
 
 
-def _file_entries(config: StorageConfig) -> list[dict]:
+def _folder_children(config: StorageConfig, folder_id: str) -> dict:
     # GoFile's current web API accepts the website token for free accounts.
-    # Ask for newest first and still sort locally for defensive compatibility.
     data = _json_request(
         config,
         "GET",
-        f"/contents/{quote(config.folder_id, safe='-_.~')}",
+        f"/contents/{quote(folder_id, safe='-_.~')}",
         query={
             "wt": _website_token(config),
             "page": 1,
@@ -244,13 +246,59 @@ def _file_entries(config: StorageConfig) -> list[dict]:
         },
     )
     if data.get("type") != "folder":
-        raise GofileError("GOFILE_FOLDER_ID is not a folder owned by this token")
+        raise GofileError(f"GoFile content {folder_id} is not a folder")
     children = data.get("children", {})
-    if not isinstance(children, dict):
-        return []
+    return children if isinstance(children, dict) else {}
+
+
+def _ensure_folder(config: StorageConfig) -> str:
+    """Resolve or create the state folder so only the token is required."""
+    if config.folder_id:
+        return config.folder_id
+
+    account = _json_request(config, "GET", "/accounts/getid")
+    account_id = account.get("id")
+    if not isinstance(account_id, str) or not account_id:
+        raise GofileError("GoFile did not return an account id for this token")
+    details = _json_request(
+        config, "GET", f"/accounts/{quote(account_id, safe='-_.~')}"
+    )
+    root_id = details.get("rootFolder")
+    if not isinstance(root_id, str) or not root_id:
+        raise GofileError("GoFile did not return the account root folder")
+
+    for child in _folder_children(config, root_id).values():
+        if (
+            isinstance(child, dict)
+            and child.get("type") == "folder"
+            and child.get("name") == config.folder_name
+        ):
+            folder_id = child.get("id")
+            if isinstance(folder_id, str) and folder_id:
+                config.folder_id = folder_id
+                return folder_id
+
+    body = json.dumps(
+        {
+            "parentFolderId": root_id,
+            "folderName": config.folder_name,
+            "public": False,
+        }
+    ).encode("utf-8")
+    created = _json_request(config, "POST", "/contents/createFolder", body=body)
+    folder_id = created.get("id")
+    if not isinstance(folder_id, str) or not folder_id:
+        raise GofileError(f"GoFile did not return the new folder id: {created!r}")
+    config.folder_id = folder_id
+    LOG.info("created GoFile state folder %s", folder_id)
+    return folder_id
+
+
+def _file_entries(config: StorageConfig) -> list[dict]:
+    folder_id = _ensure_folder(config)
     entries = [
         child
-        for child in children.values()
+        for child in _folder_children(config, folder_id).values()
         if isinstance(child, dict)
         and child.get("type") == "file"
         and str(child.get("name", "")).startswith(config.prefix)
@@ -320,10 +368,7 @@ def sync_once(data_dir: Path, config: StorageConfig) -> bool:
 def _configured_or_log() -> StorageConfig | None:
     config = StorageConfig.from_env()
     if config is None:
-        LOG.info(
-            "GoFile state sync disabled; set GOFILE_API_TOKEN and "
-            "GOFILE_FOLDER_ID to enable it"
-        )
+        LOG.info("GoFile state sync disabled; set GOFILE_API_TOKEN to enable it")
     return config
 
 

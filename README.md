@@ -222,20 +222,19 @@ LLM costs are separate and depend entirely on your provider and usage. OpenRoute
 Render Free cannot attach a persistent disk. This repo includes an optional
 GoFile state sync so Hermes sessions, memories, config, and other important
 `/opt/data` files can survive a spin-down or redeploy. The sync is disabled
-unless both `GOFILE_API_TOKEN` and `GOFILE_FOLDER_ID` are configured.
+unless `GOFILE_API_TOKEN` is configured.
 
 ### Configure GoFile
 
 1. Create or sign in to a GoFile account and copy its API token from
    [My Profile](https://gofile.io/myprofile). Use an account token rather than
-   anonymous uploads so the folder remains associated with your account.
-2. Create a private folder for this service and copy its folder ID. The ID is
-   the folder UUID, not only the public share code. If GoFile shows both, use
-   the UUID in `GOFILE_FOLDER_ID`.
-3. In Render's **Environment** tab, add:
-   - `GOFILE_API_TOKEN` — your GoFile account token
-   - `GOFILE_FOLDER_ID` — the destination folder UUID
-4. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, 60-second sync
+   anonymous uploads so the folder remains associated with your account. A
+   guest token works too, but it is the only way back to that guest account.
+2. In Render's **Environment** tab, add `GOFILE_API_TOKEN`. The service will
+   find or create a private `hermes-render-state` folder under that account.
+   To use an existing folder instead, also set `GOFILE_FOLDER_ID` to its UUID,
+   not only its public share code.
+3. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, 60-second sync
    interval, and 25 MB compressed archive cap unless you have a reason to
    change them.
 

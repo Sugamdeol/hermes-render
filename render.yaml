@@ -61,13 +61,15 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
 
-      # Optional GoFile state backup for Free. Leave both values blank to
-      # run with disposable local state. The account token and folder ID are
-      # kept out of the Blueprint repository.
+      # Optional GoFile state backup for Free. Leave the token blank to run
+      # with disposable local state. The service can create/find its own
+      # private state folder; an existing folder UUID may be supplied.
       - key: GOFILE_API_TOKEN
         sync: false
       - key: GOFILE_FOLDER_ID
         sync: false
+      - key: GOFILE_FOLDER_NAME
+        value: hermes-render-state
       - key: GOFILE_STATE_PREFIX
         value: hermes-state-
       - key: GOFILE_SYNC_INTERVAL_SECONDS

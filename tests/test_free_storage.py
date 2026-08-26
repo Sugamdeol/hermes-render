@@ -42,16 +42,51 @@ class FreeStorageTests(unittest.TestCase):
             self.assertNotIn("logs/gateway.log", names)
             self.assertIn("config.yaml", names)
 
-    def test_storage_is_disabled_without_all_credentials(self):
+    def test_storage_is_disabled_without_gofile_token(self):
         storage = load_storage()
-        names = ("GOFILE_API_TOKEN", "GOFILE_FOLDER_ID")
-        old = {name: os.environ.pop(name, None) for name in names}
+        old = os.environ.pop("GOFILE_API_TOKEN", None)
+        old_alias = os.environ.pop("GOFILE_TOKEN", None)
         try:
             self.assertIsNone(storage.StorageConfig.from_env())
         finally:
-            for name, value in old.items():
-                if value is not None:
-                    __import__("os").environ[name] = value
+            if old is not None:
+                os.environ["GOFILE_API_TOKEN"] = old
+            if old_alias is not None:
+                os.environ["GOFILE_TOKEN"] = old_alias
+
+    def test_state_folder_is_created_when_folder_id_is_not_set(self):
+        storage = load_storage()
+        config = storage.StorageConfig(
+            token="token",
+            folder_id="",
+            folder_name="hermes-render-state",
+            prefix="hermes-state-",
+            interval=60,
+            max_archive_bytes=1024,
+            user_agent="agent",
+            language="en-US",
+            wt_salt="salt",
+        )
+        calls = []
+        responses = {
+            "/accounts/getid": {"id": "account"},
+            "/accounts/account": {"rootFolder": "root"},
+            "/contents/root": {"type": "folder", "children": {}},
+            "/contents/createFolder": {"id": "state-folder"},
+        }
+        original = storage._json_request
+
+        def fake_request(_config, _method, path, **_kwargs):
+            calls.append(path)
+            return responses[path]
+
+        storage._json_request = fake_request
+        try:
+            self.assertEqual(storage._ensure_folder(config), "state-folder")
+            self.assertEqual(config.folder_id, "state-folder")
+            self.assertIn("/contents/createFolder", calls)
+        finally:
+            storage._json_request = original
 
 
 if __name__ == "__main__":
