@@ -28,7 +28,19 @@ upstream skill assumes something that isn't true on this host.
 | MCP auth                 | `Authorization: Bearer ${RENDER_MCP_API_KEY}` (lazy-substituted) |
 | MCP tool scope           | **Full MCP tool access** for the provided API key            |
 | Render CLI               | **Not installed.** See "About the render-cli skill" below   |
-| Skill bundle             | `github.com/render-oss/skills` at a pinned commit, exposed via `skills.external_dirs` |
+| Skill bundle              | `github.com/render-oss/skills` at a pinned commit, exposed via `skills.external_dirs` |
+
+## Free-tier runtime constraints
+
+This template runs as a Render **Free** web service. Its `/opt/data` filesystem
+is ephemeral: it is reset after a spin-down or redeploy. Do not tell the user
+that sessions, memories, dashboard configuration, logs, or files saved there
+will persist. Provider keys, channel tokens, and other important configuration
+must live in Render environment variables, not only in `/opt/data/.env`.
+
+Free services also spin down after inactivity and do not provide Render Shell
+or SSH. Prefer the dashboard and MCP for interaction. Avoid browser automation
+and parallel subagents when possible; the instance has limited memory.
 
 ## Default scope: full MCP access
 

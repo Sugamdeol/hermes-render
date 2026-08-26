@@ -25,3 +25,12 @@ class PatchConfigTests(unittest.TestCase):
         render_entry = patch_config._render_entry()
 
         self.assertNotIn("tools", render_entry)
+
+    def test_render_blueprint_is_free_and_has_no_persistent_disk(self):
+        blueprint = (Path(__file__).resolve().parents[1] / "render.yaml").read_text()
+        service = blueprint.split("services:", 1)[1]
+
+        self.assertRegex(service, r"(?m)^    plan: free$")
+        self.assertNotRegex(service, r"(?m)^    disk:")
+        self.assertIn("key: HERMES_HOME", service)
+        self.assertIn("key: OPENROUTER_API_KEY", service)

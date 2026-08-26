@@ -11,8 +11,9 @@
 #
 # Inside the container the gateway runs in the foreground and the
 # dashboard runs as a background side-process (HERMES_DASHBOARD=1).
-# Render's public URL serves the dashboard on port 10000; persistent
-# state lives on a 5 GB disk mounted at /opt/data (HERMES_HOME default).
+# Render's public URL serves the dashboard on port 10000. This Blueprint
+# deliberately uses the Free instance type, so /opt/data is ephemeral;
+# provider keys must be supplied as Render environment variables.
 #
 # To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile and redeploy.
 # To upgrade Render skills: bump RENDER_SKILLS_REF and redeploy.
@@ -22,7 +23,10 @@ services:
     name: hermes
     runtime: docker
     region: oregon
-    plan: standard
+    # Free web services have an ephemeral filesystem and spin down after
+    # inactivity, but are enough for a personal/demo Hermes deployment.
+    # Do not add a disk here: Render does not allow persistent disks on Free.
+    plan: free
     # Render builds the image from this repo's Dockerfile on every deploy.
     # The Dockerfile FROMs the pinned upstream Hermes image, adds Render
     # tooling + the skill bundle, and sets ENTRYPOINT to our bootstrap wrapper — so
@@ -31,16 +35,21 @@ services:
     autoDeployTrigger: off
     healthCheckPath: /api/status
 
-    disk:
-      name: hermes-data
-      mountPath: /opt/data
-      sizeGB: 5
-
     envVars:
-      # The Blueprint only carries vars that change how the container boots
-      # or that wire up the bundled Render tools. All provider keys, tool
-      # keys, and chat platform tokens are set through the Hermes dashboard
-      # (API Keys tab), which writes them to /opt/data/.env on the disk.
+      # Free instances lose /opt/data when they spin down or redeploy. Keep
+      # secrets in Render environment variables rather than in the dashboard's
+      # API Keys tab, which writes to the ephemeral filesystem.
+      - key: HERMES_HOME
+        value: /opt/data
+      - key: PORT
+        value: "10000"
+
+      # The most convenient free-tier setup is OpenRouter. Leave this blank
+      # if you use a different provider and add that provider's key in the
+      # Render Environment tab instead. sync: false keeps the value out of
+      # the Blueprint repository and prompts for it during deploy.
+      - key: OPENROUTER_API_KEY
+        sync: false
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
@@ -54,13 +63,16 @@ services:
         value: "10000"
       # Exposes a Chat tab in the dashboard that embeds the full Hermes TUI
       # over a server-side PTY + xterm.js. This is how you chat with the
-      # agent without a real terminal on the host side.
+      # agent without a real terminal on the host side. The TUI is retained
+      # because it is the primary Free-tier chat surface. If a particularly
+      # memory-constrained Free instance OOMs, set this to "0" and use a
+      # configured chat platform instead.
       - key: HERMES_DASHBOARD_TUI
         value: "1"
 
       # Generated once at first deploy. Reuse this value as API_SERVER_KEY
-      # in the dashboard if you later opt into the OpenAI-compatible API
-      # server (API_SERVER_ENABLED=true).
+      # in the Render Environment tab if you later opt into the
+      # OpenAI-compatible API server (API_SERVER_ENABLED=true).
       - key: HERMES_GATEWAY_TOKEN
         generateValue: true
 

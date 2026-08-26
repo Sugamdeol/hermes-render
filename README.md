@@ -1,6 +1,6 @@
-# Hermes Agent on Render, pre-baked with Render tools
+# Hermes Agent on Render, free-tier friendly
 
-Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single Docker web service, **already wired up to your Render account**. The image extends the upstream Hermes container with:
+Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-improving AI agent from Nous Research) on Render as a single **Free web service**, already wired up to your Render account. The image extends the upstream Hermes container with:
 
 - The [Render MCP server](https://render.com/docs/mcp-server) registered in `config.yaml` at boot, so MCP tools appear as `mcp_render_list_services`, `mcp_render_get_metrics`, `mcp_render_list_logs`, etc. The agent gets the full MCP tool catalog that your API key can use.
 - The official [render-oss/skills](https://github.com/render-oss/skills) bundle (22 Render skills) pinned at a commit and exposed via `skills.external_dirs`.
@@ -8,7 +8,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-im
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy-template/api/github/start?template_repo=hermes-render)
 
-The Hermes release and the skills commit are both pinned in the `Dockerfile` for reproducible deploys. All Hermes state lives on a persistent disk so upgrades stay non-destructive, and the dashboard at the service URL is the primary setup surface.
+The Hermes release and the skills commit are both pinned in the `Dockerfile` for reproducible deploys. This template intentionally has **no persistent disk**, because Render Free does not support one. Hermes runtime state is disposable; keep API keys and other configuration in Render environment variables so they survive restarts and redeploys. The dashboard at the service URL is the primary setup surface.
 
 > **Use at your own risk:** The agent can use every Render MCP tool allowed by `RENDER_MCP_API_KEY`, including tools that mutate resources. Lock down dashboard access and use the least-privileged Render account you can.
 
@@ -16,7 +16,7 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
 
 ```
                             ┌──────────────────────────────────────────────┐
-                            │ Render web service (Docker, plan: standard)  │
+                            │ Render web service (Docker, plan: free)      │
                             │                                              │
    you / external clients   │  ┌────────────────────────────────────────┐  │
    ─────────HTTPS──────────►│  │  hermes dashboard (port 10000)         │  │
@@ -34,8 +34,8 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
                             │                  │                           │
                             │                  ▼                           │
                             │  ┌────────────────────────────────────────┐  │
-                            │  │  /opt/data (persistent disk, 5 GB)     │  │
-                            │  │  .env, config.yaml, sessions/,         │  │
+                            │  │  /opt/data (ephemeral Free filesystem) │  │
+                            │  │  config.yaml, sessions/,               │  │
                             │  │  skills/, memories/, logs/             │  │
                             │  └────────────────────────────────────────┘  │
                             │                                              │
@@ -47,7 +47,7 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
 
 A single container runs both Hermes processes. The dashboard ([upstream docs](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-dashboard.md)) is a side-process that the upstream entrypoint backgrounds whenever `HERMES_DASHBOARD=1` is set; the gateway is the foreground PID. They share `/opt/data` and a PID namespace, which is required for the dashboard's gateway-liveness checks.
 
-The disk holds everything that should survive a redeploy: API keys (`.env`), config (`config.yaml`), the FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy), not the disk.
+The Free service has an ephemeral filesystem. `/opt/data` holds the config (`config.yaml`), FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs only for the current instance. Render environment variables are the durable source for API keys and other secrets. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy).
 
 ## What's pre-baked for Render
 
@@ -82,11 +82,13 @@ The patcher is **insert-only**: it never overwrites edits you make from the dash
 You need:
 
 - **An LLM provider API key.** [OpenRouter](https://openrouter.ai/keys) is the easiest because it routes to most providers behind a single key. Direct keys for Anthropic, OpenAI, Google, or Hugging Face also work.
-- **A Render account** with at least the `standard` plan ($25/month at time of writing). The free plan can't run this image; the `standard` plan has the memory headroom Hermes needs.
+- **A Render account** with access to the Free web-service instance type. This template uses `plan: free` and has no persistent disk. Free services spin down after inactivity, can be restarted by Render at any time, and lose their local filesystem state when they stop. That is why provider keys belong in Render's Environment tab, not only in the Hermes dashboard.
+
+The upstream Hermes image is resource-intensive. This Free configuration is intended for personal testing and light, text-only use. Avoid browser automation and many concurrent subagents; if the service is OOM-killed, set `HERMES_DASHBOARD_TUI=0` and use a configured chat platform, or upgrade the service plan. The image build can also take several minutes on a first deploy.
 
 Optional, depending on which channels you want Hermes to listen on:
 
-- **A Render API key**, if you want the bundled MCP server to inspect or manage Render resources. Generate one at [`dashboard.render.com/u/*/settings#api-keys`](https://dashboard.render.com/u/*/settings#api-keys) and paste it as `RENDER_MCP_API_KEY`. The agent runs without it, but can't see anything on your Render account.
+- **A Render API key**, if you want the bundled MCP server to inspect or manage Render resources. Generate one at [`dashboard.render.com/u/*/settings#api-keys`](https://dashboard.render.com/u/*/settings#api-keys) and add it as `RENDER_MCP_API_KEY` in Render's **Environment** tab. The agent runs without it, but can't see anything on your Render account.
 - **Telegram bot token** from [@BotFather](https://t.me/BotFather), plus your Telegram user ID from [@userinfobot](https://t.me/userinfobot).
 - **Discord bot token** from [discord.com/developers/applications](https://discord.com/developers/applications) (enable the Message Content Intent).
 - **Slack bot + app-level tokens** from [api.slack.com/apps](https://api.slack.com/apps) (Socket Mode requires both `xoxb-...` and `xapp-...`).
@@ -96,7 +98,7 @@ Optional, depending on which channels you want Hermes to listen on:
 >
 > Hermes can use the key through MCP to inspect any workspace the key's owner can access. Some MCP tools can mutate resources today, and more write-capable tools may be added over time. Use a dedicated low-privilege Render user when possible, and do not paste a personal Owner key unless you accept that risk.
 
-You don't need any optional keys to deploy. You can fill them in via the Render Dashboard after the service is up. `RENDER_MCP_API_KEY` is gated behind `sync: false` in the Blueprint, so the **Deploy to Render** flow will prompt for it.
+You don't need the optional Render MCP key to deploy. The Blueprint prompts for `OPENROUTER_API_KEY` and `RENDER_MCP_API_KEY` without committing either value. For any other provider or channel token, add the variable in the Render **Environment** tab; Render-managed environment variables survive Free service restarts and redeploys.
 
 ## Deploy
 
@@ -104,9 +106,8 @@ You don't need any optional keys to deploy. You can fill them in via the Render 
 
 1. Click the **Deploy to Render** button above.
 2. Pick a workspace and a service name.
-3. Optionally paste your `RENDER_MCP_API_KEY` when prompted, or leave it blank and add it later from the Environment tab. The agent works without it, just without Render tools.
-4. Render reads `render.yaml`, generates a value for `HERMES_GATEWAY_TOKEN`, and creates the service. All other env vars start blank.
-5. The first deploy builds the image from the `Dockerfile`. Expect ~3 to 5 minutes for the upstream pull (~2.6 GB compressed) plus our thin Render tooling and skills layers, then ~1 minute for the gateway to boot.
+3. Render reads `render.yaml`, creates a Free web service, and generates a value for `HERMES_GATEWAY_TOKEN`. The deploy flow can prompt for `OPENROUTER_API_KEY` and `RENDER_MCP_API_KEY`; leave either blank if you do not need it. If you use another LLM provider, add its key in the Render Environment tab.
+4. The first deploy builds the image from the `Dockerfile`. Expect several minutes for the upstream pull plus our thin Render tooling and skills layers, followed by a cold-start delay while the gateway boots. Free services can take about a minute to wake after being idle.
 
 ### Option 2: Manual Blueprint sync
 
@@ -128,19 +129,20 @@ Read the **Security** section before you paste production API keys.
 
 Once the service is healthy (the **Events** tab shows "Deploy live"), open the URL Render assigned (it ends in `.onrender.com`). You'll see the Hermes dashboard.
 
-The Blueprint deliberately keeps the env-var surface tiny. All provider keys, tool keys, and chat platform tokens are set from the dashboard, not from `render.yaml`. The dashboard writes everything to `/opt/data/.env`, which lives on the persistent disk and survives redeploys.
+The Free instance has no persistent disk. The dashboard can still write `/opt/data/.env` while the current instance is alive, but that file disappears when Render spins the service down or redeploys it. Set durable secrets in Render's **Environment** tab instead; those variables are injected on every boot.
 
 Walk through these tabs in order:
 
-1. **API Keys**. Paste a key for at least one LLM provider. Pick one:
+1. **Render Environment**. Set a key for at least one LLM provider. Pick one:
    - `OPENROUTER_API_KEY` from [openrouter.ai/keys](https://openrouter.ai/keys) routes to most providers behind a single key
    - `ANTHROPIC_API_KEY` from [console.anthropic.com](https://console.anthropic.com) for Claude models direct
    - `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `HF_TOKEN`, etc. for the others
-2. **Config**. Set the `model` field at the top of the list. The upstream image's default is `anthropic/claude-opus-4.6`, which works as soon as you've set `ANTHROPIC_API_KEY`. Otherwise pick a model your provider supports (for example, `anthropic/claude-sonnet-4.6` for Anthropic, or any OpenRouter model ID like `openai/gpt-5.5`).
+   Add your chat platform tokens (`TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`, etc.) here as well. Saving Environment changes restarts the service.
+2. **Config**. Set the `model` field at the top of the list. The upstream image's default is `anthropic/claude-opus-4.6`, which works as soon as you've set `ANTHROPIC_API_KEY`. Otherwise pick a model your provider supports (for example, `anthropic/claude-sonnet-4.6` for Anthropic, or any OpenRouter model ID like `openai/gpt-5.5`). Config edits are temporary on Free unless you reproduce them after a redeploy.
 3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until you add a chat platform.
-4. **API Keys** again, optionally. If you want a chat gateway, add the matching tokens: `TELEGRAM_BOT_TOKEN`, `DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN`, etc. Use the **Restart gateway** button on the Status tab so the new tokens are picked up.
+4. **Chat**. The in-browser TUI is the easiest way to talk to the agent. Use the **Restart gateway** button on the Status tab after changing keys outside Render's Environment tab.
 
-If you'd rather set keys from the Render Dashboard's **Environment** tab (handy for CI or secrets-manager workflows), that path also works: Render env vars override `/opt/data/.env` at process start. Pick one path and stick with it to avoid drift. **The two `RENDER_*` variables are the exception** — set them from the Render **Environment** tab (not the Hermes dashboard's API Keys tab), since `config.yaml` reads `${RENDER_MCP_API_KEY}` from the gateway process environment.
+**Do not rely on the dashboard API Keys tab for durable configuration on Free.** It writes to `/opt/data/.env`, which is ephemeral. The `RENDER_MCP_API_KEY` exception is still important: set it from the Render **Environment** tab (not the Hermes dashboard), since `config.yaml` reads `${RENDER_MCP_API_KEY}` from the gateway process environment.
 
 ### Verify the Render tools are wired up
 
@@ -156,46 +158,25 @@ Before you ask the agent to mutate Render resources, read the **Security: agent 
 
 ### Where the "gateway token" fits
 
-The Blueprint generates a `HERMES_GATEWAY_TOKEN` for you. Today, upstream Hermes doesn't read this variable directly at runtime: it's a placeholder for the OpenAI-compatible API server's bearer key. If you opt into the API server (set `API_SERVER_ENABLED=true` from the dashboard's **API Keys** tab, then paste this token into `API_SERVER_KEY`), external HTTP clients can authenticate against `/v1/chat/completions` using `Authorization: Bearer <that value>`.
+The Blueprint generates a `HERMES_GATEWAY_TOKEN` for you. Today, upstream Hermes doesn't read this variable directly at runtime: it's a placeholder for the OpenAI-compatible API server's bearer key. If you opt into the API server, set `API_SERVER_ENABLED=true` and `API_SERVER_KEY` in Render's **Environment** tab, then external HTTP clients can authenticate against `/v1/chat/completions` using `Authorization: Bearer <that value>`. Keeping these values in Render's environment is important on Free because dashboard edits to `/opt/data` are ephemeral.
 
 ## Chatting with the agent
 
-The simplest way to talk to your deployed Hermes is the dashboard's **Chat** tab. The Blueprint sets `HERMES_DASHBOARD_TUI=1`, which makes the upstream dashboard expose the full TUI in the browser over a server-side PTY plus xterm.js. Slash commands, model picker, tool-call cards, streaming, sessions: everything works the same as a local terminal.
+The dashboard's **Chat** tab is the recommended Free-tier interface. The Blueprint sets `HERMES_DASHBOARD_TUI=1`, which exposes the full Hermes TUI in the browser over a server-side PTY plus xterm.js. Slash commands, model picker, tool-call cards, streaming, and sessions work like a local terminal. You do not need Render Shell or SSH (neither is available for Free web services). You can also connect a chat platform such as Telegram or Discord by putting its token in Render's Environment tab. A Free service only stays awake while it receives traffic, so an outbound-only long-polling or gateway connection may not keep a bot running continuously; use the dashboard to wake it or upgrade for an always-on service.
 
-If you'd rather stay on the command line, two paths work, both because the in-container `hermes` is the same binary as the local CLI:
-
-- **One-shot prompts via Render Shell or SSH.** The browser shell on Render does not allocate a TTY for `runtime: image` services. The interactive REPL (`hermes` with no args) will print a banner and quit immediately with `Warning: Input is not a terminal (fd=0)`. Use the non-interactive form instead:
-
-  ```bash
-  /opt/hermes/.venv/bin/hermes chat -q "summarize today's logs"
-  ```
-
-  This runs one turn, prints the result, and exits cleanly. You can chain it with `--resume <session-id>` to continue an existing conversation.
-
-- **Real terminal via the Render CLI.** From your local machine:
-
-  ```bash
-  render ssh <service-id>
-  /opt/hermes/.venv/bin/hermes
-  ```
-
-  `render ssh` allocates a PTY, so the interactive REPL works.
-
-The chat tab in the dashboard is still the cleanest UX. Use the CLI fallbacks when you're scripting or already in a terminal context.
+The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
 
 ## Cost expectations
 
-Costs assume Render's published prices in May 2026 and don't include data egress, which is unmetered for typical Hermes traffic.
+This Blueprint uses Render's **Free** web-service instance. It has no service charge, but Free usage is subject to Render's monthly instance-hour allowance and the service spins down after inactivity. The next request may wait for a cold start. There is no persistent-disk charge because Free services cannot attach persistent disks.
 
-| Component                     | Plan                              | Cost            |
-|-------------------------------|-----------------------------------|-----------------|
-| Web service (`runtime: image`) | `standard` (2 GB / 1 CPU)         | $25/month       |
-| Persistent disk (`/opt/data`)  | 5 GB SSD                          | $1.25/month     |
-| **Subtotal (this template)**   |                                   | **$26.25/month**|
+| Component                      | Plan   | Cost |
+|--------------------------------|--------|------|
+| Web service (`runtime: docker`) | `free` | $0   |
+| Persistent disk (`/opt/data`)  | none   | $0   |
+| **Subtotal (this template)**    |        | **$0** |
 
-If you do a lot of Playwright browsing or run several subagents in parallel, bump the plan to `pro` (4 GB / 2 CPU, $85/month). The starter plan (512 MB) cannot hold the Hermes image and is not supported.
-
-LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page.
+LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
 
 ## Updating
 
@@ -212,7 +193,7 @@ Bump either, commit, and push. Render won't auto-deploy (the Blueprint sets `aut
 render deploys create <service-id>
 ```
 
-Your `/opt/data` disk is untouched across image upgrades. The upstream entrypoint runs a manifest-based `skills_sync.py` on each boot, which preserves edits to bundled Hermes skills. The `render-oss/skills` bundle and the `render-on-hermes` overlay live under `/opt/render-tools/` (read-only image layer), so they're replaced wholesale on every new build and never touch the disk.
+Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Treat sessions, memories, installed skills, logs, and dashboard config as disposable. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep anything important outside the container, especially secrets in Render environment variables.
 
 Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`. The [skills repo's commit log](https://github.com/render-oss/skills/commits/main) is the source of truth for `RENDER_SKILLS_REF`.
 
@@ -226,23 +207,13 @@ Render keeps logs in the **Logs** tab of your service. Filter by stream:
 - Gateway and agent logs are unprefixed.
 - For deeper inspection, log files also live on disk at `/opt/data/logs/` (`agent.log`, `errors.log`, `gateway.log`).
 
-You can tail them from the dashboard's **Logs** tab too, or via SSH (next section).
+These logs are also ephemeral and disappear when the Free instance is replaced. Use Render's **Logs** tab for the current instance; Free web services do not provide Dashboard Shell or SSH access.
 
 ### Shell access
 
-Render gives you SSH into the container. From the service's overview page, click **Shell** (browser PTY) or copy the SSH command from **Settings**.
+Free web services do not include Render Shell or SSH. Use the dashboard's **Chat** tab, Render's **Logs** tab, or a configured chat platform instead. The CLI can be run from a local Hermes installation or after upgrading this service to a paid instance with shell access.
 
-```bash
-# Inspect the data volume.
-ls /opt/data
-cat /opt/data/.env
-
-# Run the Hermes CLI directly.
-/opt/hermes/.venv/bin/hermes status
-/opt/hermes/.venv/bin/hermes config get model.default
-```
-
-The container runs as the `hermes` user (UID 10000), not root.
+The container runs the gateway as the `hermes` user (UID 10000), not root.
 
 ### Service won't start
 
@@ -252,9 +223,9 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 |------------------------------------------------------|------------------------------------------------------------------------------|
 | `Refusing to start: binding to 0.0.0.0 requires API_SERVER_KEY` | You set `API_SERVER_ENABLED=true` and `API_SERVER_HOST=0.0.0.0` without an `API_SERVER_KEY`. Set the key or flip back to `127.0.0.1`. |
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
-| Container OOM-killed                                 | Bump plan to `pro`. Playwright/Chromium is the usual culprit.                 |
-| `Permission denied` on `/opt/data/...`               | The disk was attached after a deploy that ran as a different UID. Restart the service; the entrypoint chowns `/opt/data` on boot when run as root. |
-| `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Render's browser shell pipes stdin instead of allocating a PTY. Chat from the dashboard's **Chat** tab, or use `hermes chat -q "..."`, or `render ssh <service-id>` from a local terminal. |
+| Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
+| API keys or sessions disappear                      | Expected on Free: `/opt/data` is ephemeral. Put provider and channel keys in Render's **Environment** tab. Sessions and dashboard config must be recreated after a cold start/redeploy. |
+| `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
 | `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
 | Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | Two upstream bugs combined to break the Chat tab on hosted deploys: (1) [#20500](https://github.com/NousResearch/hermes-agent/issues/20500): `/opt/hermes/ui-tui/` ships root-owned but the dashboard runs as the `hermes` user, so the runtime esbuild rebuild fails with `EACCES`. (2) Separate filename mismatch: `_hermes_ink_bundle_stale()` in `hermes_cli/main.py` looks for `packages/hermes-ink/dist/ink-bundle.js`, but `@hermes/ink`'s build script (`esbuild src/entry-exports.ts --outdir=dist`) only produces `entry-exports.js`. The bundle the staleness check expects is never created, so every `/api/pty` connect runs a 28-second `npm run build` that exceeds Render's WebSocket-upgrade timeout. The Dockerfile chowns the directories AND `touch`es the two expected paths at build time so both checks short-circuit. If you've forked the template and removed those lines, restore them. |
@@ -269,13 +240,9 @@ Set, change, or delete env vars under the service's **Environment** tab. Render 
 
 ### Forcing a clean rebuild
 
-If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), wipe it:
+Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. The new instance starts with a clean `/opt/data` directory and reseeds defaults. Remember that any dashboard-only configuration will be lost; Render Environment variables are re-injected automatically.
 
-1. SSH in.
-2. `mv /opt/data /opt/data.bak && exit`.
-3. Restart the service from the Render Dashboard. The entrypoint recreates the directory tree and reseeds defaults.
-
-Or restore the most recent automatic disk snapshot from the **Disks** page.
+There is no persistent-disk snapshot to restore on Free.
 
 ## Security
 
@@ -315,13 +282,13 @@ Two practical options.
 
 #### Option A: Auth gateway
 
-Expose a small authenticated Web Service in front of Hermes and keep Hermes itself private. The gateway verifies a bearer token, OAuth session, or identity-provider token, then forwards approved traffic to Hermes over Render's private network.
+Expose a small authenticated proxy in front of Hermes. The proxy verifies a bearer token, OAuth session, or identity-provider token, then forwards approved traffic to the Hermes URL. If the proxy is another Render service, remember that a Free Hermes service cannot receive private-network traffic; use an external proxy or upgrade Hermes to a paid instance for private networking.
 
 This is the most portable option because it does not depend on static client IPs.
 
 #### Option B: Tailscale
 
-Skip the public internet entirely. Run Tailscale on a sidecar (or use Render's [Tailscale template](https://render.com/docs/deploy-tailscale-derp)) and reach the dashboard only from devices on your Tailnet. This takes more setup, but it avoids IP rotation pain and works from anywhere.
+On Render Free, a Tailscale sidecar/private-network path is not supported because Free web services cannot receive private-network traffic. Use an external access layer such as Cloudflare Access or Tailscale Funnel, or upgrade Hermes to a paid instance before using a private Render-sidecar design.
 
 #### Notes
 
@@ -335,10 +302,10 @@ What it does:
 
 - Pins a specific upstream Hermes image and `render-oss/skills` commit for reproducible deploys.
 - Runs the Hermes gateway and dashboard inside one container, the way upstream supports.
-- Mounts a persistent disk at the upstream-default `HERMES_HOME` path.
+- Uses the upstream-default `HERMES_HOME` path (`/opt/data`) on the Free service's ephemeral filesystem.
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
 - Idempotently patches `config.yaml` on each boot to register the Render MCP server with the full MCP tool catalog available to your API key, without overwriting your edits.
-- Generates a `HERMES_GATEWAY_TOKEN` and marks `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
+- Generates a `HERMES_GATEWAY_TOKEN` and marks `OPENROUTER_API_KEY` and `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
 What it deliberately doesn't do:
@@ -346,7 +313,7 @@ What it deliberately doesn't do:
 - **It doesn't install the `render` CLI.** MCP is the supported in-container Render integration. Install the CLI only as a deliberate operator choice.
 - It doesn't try to add authentication on top of the dashboard. Use an auth gateway, private network path, or another access-control layer you trust.
 - It doesn't enable the OpenAI-compatible API server. Flip `API_SERVER_ENABLED=true` and supply `API_SERVER_KEY` if you need it.
-- It doesn't ship a default model. Hermes' upstream default is set in `config.yaml`, which lives on disk and is owner-configurable from the dashboard.
+- It doesn't ship a default model. Hermes' upstream default is set in `config.yaml`, which lives in ephemeral `/opt/data` and can be changed from the dashboard for the current instance.
 - It doesn't configure browser automation tweaks (`--shm-size`, GPU access). Those need an instance type with more RAM, not extra Render config.
 - It doesn't fork or modify the upstream `render-oss/skills` content. The overlay in `skills/render-on-hermes/` is the only Hermes-specific addition; everything else is the canonical Render skill bundle.
 

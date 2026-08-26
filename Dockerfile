@@ -61,8 +61,9 @@ COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
 RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
-# first boot. The mounted disk replaces this empty dir at runtime;
-# baking it just keeps the image self-contained for any non-disk use.
+# first boot. Render Free has no persistent disk, so this image directory
+# is intentionally disposable. A paid deployment may mount a disk here
+# without requiring a different image.
 RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
 # Stay as root so the bootstrap can chown the mounted /opt/data on first
