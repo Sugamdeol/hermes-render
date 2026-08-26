@@ -58,7 +58,7 @@ The `Dockerfile` adds two layers on top of `nousresearch/hermes-agent`:
 | Render skill bundle | `/opt/render-tools/skills-upstream/` | [render-oss/skills](https://github.com/render-oss/skills) tarball | `RENDER_SKILLS_REF` ARG (commit SHA) |
 | Hermes-on-Render overlay | `/opt/render-tools/skills-local/` | [`./skills/`](./skills) in this repo | This repo's commits |
 
-On every boot, [`scripts/bootstrap.sh`](scripts/bootstrap.sh) runs an idempotent patcher ([`scripts/patch-config.py`](scripts/patch-config.py)) that adds two entries to `/opt/data/config.yaml` if they're missing:
+On every boot, [`scripts/bootstrap.sh`](scripts/bootstrap.sh) restores optional remote state and runs an idempotent patcher ([`scripts/patch-config.py`](scripts/patch-config.py)) that adds the Render MCP server, Bynara provider, and external skill directories to `/opt/data/config.yaml` if they're missing:
 
 ```yaml
 mcp_servers:
@@ -66,6 +66,11 @@ mcp_servers:
     url: https://mcp.render.com/mcp
     headers:
       Authorization: "Bearer ${RENDER_MCP_API_KEY}"
+
+custom_providers:
+  - name: bynara
+    base_url: https://router.bynara.id/v1
+    key_env: BYNARA_API_KEY
 
 skills:
   external_dirs:
@@ -76,6 +81,40 @@ skills:
 The patcher is **insert-only**: it never overwrites edits you make from the dashboard. The `${RENDER_MCP_API_KEY}` placeholder is resolved lazily at gateway startup, so you can rotate the key from Render's **Environment** tab without rebuilding the image — just restart the service.
 
 > **Why `RENDER_MCP_API_KEY` and not `RENDER_API_KEY`?** The standard name is what the `render` CLI looks for. We deliberately don't ship the CLI in this image (see **Security: agent capabilities**). This is still a normal Render API key with the permissions of the user who created it. The nonstandard env var name avoids accidental CLI auto-auth if you later install the CLI manually. Name your CLI key separately.
+
+## Bynara router support
+
+The Blueprint includes the Bynara OpenAI-compatible router as a custom Hermes
+provider. Add `BYNARA_API_KEY` in Render's **Environment** tab (or provide it
+when the Deploy button prompts for it). Never commit the key to this
+repository; rotate it if it has been shared publicly.
+
+On a fresh instance, when `BYNARA_API_KEY` is present, the boot patcher adds:
+
+```yaml
+custom_providers:
+  - name: bynara
+    base_url: https://router.bynara.id/v1
+    key_env: BYNARA_API_KEY
+
+model:
+  default: qwen-3.8-max-free
+  provider: custom:bynara
+```
+
+The default is selected only when the config still has Hermes' upstream
+model default. An explicit model/provider choice, or a config restored from
+remote storage, is left alone. From the dashboard Chat tab you can change
+models with `/model custom:bynara:<alias>`. Available aliases currently
+include `agnes-2.0-flash`, `agnes-2.5-flash`, `deepseek-v4-flash`,
+`laguna-s-2.1`, `minimax-m3-free`, `mistral-large`, `mistral-medium-3-5`,
+`nemotron-3-ultra`, `ox-alpha`, `ox-alpha-bynara`, `qwen-3.8-max-free`,
+`qwen3.8-27b`, `stepfun-3.7-flash`, and `tencent-hy3-free`.
+
+The key is referenced through `key_env`, so it is never written into
+`config.yaml` by this repository. To reach the agent from Telegram, also add
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` in Render's **Environment**
+tab. Use a comma-separated allowlist if you need more than one Telegram user.
 
 ## Prerequisites
 
@@ -119,8 +158,8 @@ You don't need the optional Render MCP key to deploy. The Blueprint prompts for 
 
 The Hermes dashboard has no built-in authentication. Anyone who knows the service URL can read and write your API keys. Before you visit the dashboard for the first time, choose how you want to protect it:
 
-- Put the service behind an auth gateway that verifies a bearer token, OAuth session, or trusted identity provider.
-- Keep the dashboard reachable only through a private network path, such as Tailscale.
+- Put the service behind an external auth gateway that verifies a bearer token, OAuth session, or trusted identity provider.
+- Use an external access layer such as Cloudflare Access or Tailscale Funnel. Render Free services cannot receive private-network traffic.
 - Accept the risk for a demo, use low-privilege keys, and delete the service when you're done.
 
 Read the **Security** section before you paste production API keys.
@@ -178,6 +217,38 @@ This Blueprint uses Render's **Free** web-service instance. It has no service ch
 
 LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
 
+## Keeping files on Free
+
+Render Free cannot attach a persistent disk. This repo includes an optional
+S3-compatible state sync so you can keep Hermes sessions, memories, config,
+and other `/opt/data` files in a free-tier object store such as Cloudflare R2.
+The sync is disabled unless all four storage credentials are present.
+
+### Configure Cloudflare R2 (or another S3-compatible provider)
+
+1. Create a bucket and an access key with read/write access to that bucket.
+2. In Render's **Environment** tab, add:
+   - `HERMES_STORAGE_ENDPOINT_URL` — for R2, your account's R2 S3 endpoint
+     (`https://<account-id>.r2.cloudflarestorage.com`)
+   - `HERMES_STORAGE_BUCKET` — the bucket name
+   - `HERMES_STORAGE_ACCESS_KEY_ID`
+   - `HERMES_STORAGE_SECRET_ACCESS_KEY`
+3. Leave `HERMES_STORAGE_REGION=auto`, keep the default prefix `hermes`, and
+   keep the 60-second sync interval unless you have a reason to change it.
+
+The boot wrapper restores `hermes/state.tar.gz` before Hermes starts, then the
+background worker uploads a compressed snapshot periodically and makes a
+best-effort upload on shutdown. Logs are excluded because Render already keeps
+service logs; `/opt/data/.env` is also excluded on purpose. Keep
+`BYNARA_API_KEY`, provider keys, and chat tokens in Render's Environment tab
+instead. The default compressed-archive safety cap is 25 MB (`HERMES_STORAGE_MAX_ARCHIVE_MB`). Use a private bucket and least-privilege credentials.
+
+Only one Hermes instance should write a given storage prefix. The Free
+Blueprint runs one instance, but do not reuse the same prefix from another
+service. Remote sync is a backup/restore layer, not a replacement for a
+real database or a high-concurrency shared filesystem. The object store's
+own free-tier limits and retention policies apply.
+
 ## Updating
 
 Both pinned versions live in the [`Dockerfile`](Dockerfile) as build args:
@@ -193,7 +264,7 @@ Bump either, commit, and push. Render won't auto-deploy (the Blueprint sets `aut
 render deploys create <service-id>
 ```
 
-Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Treat sessions, memories, installed skills, logs, and dashboard config as disposable. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep anything important outside the container, especially secrets in Render environment variables.
+Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Without the optional S3-compatible sync, sessions, memories, installed skills, logs, and dashboard config are disposable. With storage configured, those files are restored from and periodically backed up to the configured object store. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep secrets outside the archive in Render environment variables.
 
 Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`. The [skills repo's commit log](https://github.com/render-oss/skills/commits/main) is the source of truth for `RENDER_SKILLS_REF`.
 
@@ -224,7 +295,7 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | `Refusing to start: binding to 0.0.0.0 requires API_SERVER_KEY` | You set `API_SERVER_ENABLED=true` and `API_SERVER_HOST=0.0.0.0` without an `API_SERVER_KEY`. Set the key or flip back to `127.0.0.1`. |
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
 | Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
-| API keys or sessions disappear                      | Expected on Free: `/opt/data` is ephemeral. Put provider and channel keys in Render's **Environment** tab. Sessions and dashboard config must be recreated after a cold start/redeploy. |
+| API keys or sessions disappear                      | API keys must be in Render's **Environment** tab; `/opt/data/.env` is never durable on Free. Configure the optional S3-compatible sync if sessions and dashboard config must survive a cold start/redeploy. |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
 | `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
@@ -240,9 +311,9 @@ Set, change, or delete env vars under the service's **Environment** tab. Render 
 
 ### Forcing a clean rebuild
 
-Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. The new instance starts with a clean `/opt/data` directory and reseeds defaults. Remember that any dashboard-only configuration will be lost; Render Environment variables are re-injected automatically.
+Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. With remote storage disabled, the new instance starts with a clean `/opt/data` directory and reseeds defaults. With remote storage enabled, delete or replace the remote `hermes/state.tar.gz` object before redeploying if you also need to discard the saved state. Render Environment variables are re-injected automatically.
 
-There is no persistent-disk snapshot to restore on Free.
+There is no persistent-disk snapshot to restore on Free; the optional S3-compatible archive is the available backup.
 
 ## Security
 
@@ -304,8 +375,9 @@ What it does:
 - Runs the Hermes gateway and dashboard inside one container, the way upstream supports.
 - Uses the upstream-default `HERMES_HOME` path (`/opt/data`) on the Free service's ephemeral filesystem.
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
-- Idempotently patches `config.yaml` on each boot to register the Render MCP server with the full MCP tool catalog available to your API key, without overwriting your edits.
-- Generates a `HERMES_GATEWAY_TOKEN` and marks `OPENROUTER_API_KEY` and `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
+- Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, and the full MCP tool catalog available to your API key, without overwriting explicit edits.
+- Restores and periodically backs up `/opt/data` through optional S3-compatible object storage; `.env` is excluded from the archive.
+- Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, and `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
 What it deliberately doesn't do:
@@ -313,7 +385,7 @@ What it deliberately doesn't do:
 - **It doesn't install the `render` CLI.** MCP is the supported in-container Render integration. Install the CLI only as a deliberate operator choice.
 - It doesn't try to add authentication on top of the dashboard. Use an auth gateway, private network path, or another access-control layer you trust.
 - It doesn't enable the OpenAI-compatible API server. Flip `API_SERVER_ENABLED=true` and supply `API_SERVER_KEY` if you need it.
-- It doesn't ship a default model. Hermes' upstream default is set in `config.yaml`, which lives in ephemeral `/opt/data` and can be changed from the dashboard for the current instance.
+- It doesn't hardcode a model API key. When `BYNARA_API_KEY` is configured, the patcher selects Bynara's `qwen-3.8-max-free` default on a fresh/upstream-default config; otherwise Hermes uses its upstream model default. The setting lives in ephemeral `/opt/data` unless remote storage is enabled.
 - It doesn't configure browser automation tweaks (`--shm-size`, GPU access). Those need an instance type with more RAM, not extra Render config.
 - It doesn't fork or modify the upstream `render-oss/skills` content. The overlay in `skills/render-on-hermes/` is the only Hermes-specific addition; everything else is the canonical Render skill bundle.
 

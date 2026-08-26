@@ -4,8 +4,9 @@
 #
 # Extends the upstream NousResearch/hermes-agent image with:
 #   - A bundle of Render-focused skills mounted via skills.external_dirs
-#   - A boot-time patcher that registers the Render MCP server in
-#     config.yaml (idempotent; never overwrites user edits)
+#   - A boot-time patcher that registers the Render MCP server and Bynara
+#     custom provider in config.yaml (idempotent; never overwrites user edits)
+#   - An optional S3-compatible state sync for Render's Free filesystem
 #
 # We deliberately do NOT install the `render` CLI. This image is configured
 # around the Render MCP server; installing extra CLIs should be a conscious
@@ -54,11 +55,14 @@ RUN set -eu; \
 # overlays would shadow upstream entries.
 COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 
-# Boot-time wrapper: patches /opt/data/config.yaml, then hands off to
-# the upstream entrypoint chain (tini → docker/entrypoint.sh).
+# Boot-time wrapper: restores optional remote state, patches
+# /opt/data/config.yaml, starts optional state sync, then hands off to the
+# upstream entrypoint chain (tini → docker/entrypoint.sh).
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
+COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
+RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
+             /opt/render-tools/free-storage.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. Render Free has no persistent disk, so this image directory

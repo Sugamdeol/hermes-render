@@ -44,12 +44,42 @@ services:
       - key: PORT
         value: "10000"
 
-      # The most convenient free-tier setup is OpenRouter. Leave this blank
-      # if you use a different provider and add that provider's key in the
-      # Render Environment tab instead. sync: false keeps the value out of
-      # the Blueprint repository and prompts for it during deploy.
+      # Bynara's OpenAI-compatible free router. When this key is present,
+      # the boot patcher adds custom:bynara and selects qwen-3.8-max-free
+      # unless an explicit model/provider is already configured.
+      - key: BYNARA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USERS
+        sync: false
+
+      # OpenRouter is an alternative provider. Leave this blank if you use
+      # Bynara or another provider and add that provider's key in the Render
+      # Environment tab instead. sync: false keeps the value out of the
+      # Blueprint repository and prompts for it during deploy.
       - key: OPENROUTER_API_KEY
         sync: false
+
+      # Optional remote state backup for Free. These variables target any
+      # S3-compatible object store; Cloudflare R2 is a practical free-tier
+      # option. Leave all four blank to run with disposable local state.
+      - key: HERMES_STORAGE_ENDPOINT_URL
+        sync: false
+      - key: HERMES_STORAGE_BUCKET
+        sync: false
+      - key: HERMES_STORAGE_ACCESS_KEY_ID
+        sync: false
+      - key: HERMES_STORAGE_SECRET_ACCESS_KEY
+        sync: false
+      - key: HERMES_STORAGE_REGION
+        value: auto
+      - key: HERMES_STORAGE_PREFIX
+        value: hermes
+      - key: HERMES_STORAGE_SYNC_INTERVAL_SECONDS
+        value: "60"
+      - key: HERMES_STORAGE_MAX_ARCHIVE_MB
+        value: "25"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
