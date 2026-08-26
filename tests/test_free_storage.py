@@ -54,6 +54,55 @@ class FreeStorageTests(unittest.TestCase):
             if old_alias is not None:
                 os.environ["GOFILE_TOKEN"] = old_alias
 
+    def test_state_fingerprint_ignores_logs_and_env(self):
+        storage = load_storage()
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            config_file = data_dir / "config.yaml"
+            env_file = data_dir / ".env"
+            log_dir = data_dir / "logs"
+            log_dir.mkdir()
+            config_file.write_text("model: test\n")
+            env_file.write_text("SECRET=one\n")
+            log_file = log_dir / "gateway.log"
+            log_file.write_text("first\n")
+
+            first = storage._state_fingerprint(data_dir)
+            log_file.write_text("second and different\n")
+            env_file.write_text("SECRET=two\n")
+            self.assertEqual(first, storage._state_fingerprint(data_dir))
+
+            config_file.write_text("model: changed\n")
+            self.assertNotEqual(first, storage._state_fingerprint(data_dir))
+
+    def test_unchanged_state_skips_archive_creation(self):
+        storage = load_storage()
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "config.yaml").write_text("model: test\n")
+            config = storage.StorageConfig(
+                token="token",
+                folder_id="folder",
+                folder_name="hermes-render-state",
+                prefix="hermes-state-",
+                interval=300,
+                max_archive_bytes=1024,
+                user_agent="agent",
+                language="en-US",
+                wt_salt="salt",
+            )
+            config.last_fingerprint = storage._state_fingerprint(data_dir)
+            original = storage._create_archive
+
+            def unexpected_archive(*_args, **_kwargs):
+                raise AssertionError("unchanged state was recompressed")
+
+            storage._create_archive = unexpected_archive
+            try:
+                self.assertTrue(storage.sync_once(data_dir, config))
+            finally:
+                storage._create_archive = original
+
     def test_state_folder_is_created_when_folder_id_is_not_set(self):
         storage = load_storage()
         config = storage.StorageConfig(

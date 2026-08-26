@@ -2,10 +2,11 @@
 """Optional GoFile state sync for Render's Free filesystem.
 
 Render Free services cannot attach persistent disks. When configured with a
-GoFile account token, this module resolves a state folder and restores the newest Hermes state
-archive before Hermes starts and periodically uploads a fresh archive while
-Hermes is running. It keeps one current archive by deleting older matching
-backups after a successful upload.
+GoFile account token, this module resolves a state folder and restores the
+newest Hermes state archive before Hermes starts and periodically uploads a
+fresh archive while Hermes is running. It keeps one current archive by deleting
+older matching backups after a successful upload. Syncs are metadata-aware and
+run at low priority so idle Free instances do not repeatedly recompress state.
 
 The archive excludes /opt/data/.env and runtime logs. Render environment
 variables are the durable source for secrets, and Render already retains
@@ -16,19 +17,20 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
-import io
+import http.client
 import json
 import logging
 import os
 from pathlib import Path
 import signal
+import stat
 import tarfile
 import tempfile
 import threading
 import time
 from typing import BinaryIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 import uuid
 
@@ -71,6 +73,7 @@ class StorageConfig:
         self.user_agent = user_agent
         self.language = language
         self.wt_salt = wt_salt
+        self.last_fingerprint: str | None = None
 
     @classmethod
     def from_env(cls) -> "StorageConfig | None":
@@ -91,7 +94,7 @@ class StorageConfig:
             folder_id=folder_id,
             folder_name=os.environ.get("GOFILE_FOLDER_NAME", "hermes-render-state"),
             prefix=os.environ.get("GOFILE_STATE_PREFIX", "hermes-state-"),
-            interval=positive_int("GOFILE_SYNC_INTERVAL_SECONDS", 60),
+            interval=positive_int("GOFILE_SYNC_INTERVAL_SECONDS", 300),
             max_archive_bytes=positive_int("GOFILE_MAX_ARCHIVE_MB", 25) * 1024 * 1024,
             user_agent=os.environ.get("GOFILE_USER_AGENT", DEFAULT_USER_AGENT),
             language=os.environ.get("GOFILE_LANGUAGE", "en-US"),
@@ -147,21 +150,31 @@ def _json_request(
     return data if isinstance(data, dict) else {}
 
 
-def _download(url: str, config: StorageConfig) -> bytes:
+def _download(url: str, config: StorageConfig, destination: BinaryIO) -> int:
+    """Stream a remote archive to disk, returning its byte count."""
     last_error: Exception | None = None
     # The website token rotates every four hours. Retry the previous window
     # around a boundary, matching the behavior of GoFile's web clients.
     for offset in (0, -1):
+        destination.seek(0)
+        destination.truncate(0)
         headers = _content_headers(config, offset)
         request = Request(url, headers=headers, method="GET")
         try:
+            total = 0
             with urlopen(request, timeout=60) as response:
-                payload = response.read(config.max_archive_bytes + 1)
-            if len(payload) > config.max_archive_bytes:
-                raise GofileError(
-                    f"remote archive is larger than the {config.max_archive_bytes // (1024 * 1024)} MB limit"
-                )
-            return payload
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > config.max_archive_bytes:
+                        raise GofileError(
+                            "remote archive is larger than the "
+                            f"{config.max_archive_bytes // (1024 * 1024)} MB limit"
+                        )
+                    destination.write(chunk)
+            return total
         except (HTTPError, URLError, OSError, GofileError) as exc:
             last_error = exc
             if isinstance(exc, HTTPError) and exc.code == 404:
@@ -169,27 +182,49 @@ def _download(url: str, config: StorageConfig) -> bytes:
     raise GofileError(f"GoFile download failed: {last_error}")
 
 
-def _multipart_upload(config: StorageConfig, filename: str, payload: bytes) -> dict:
-    boundary = f"----hermes-gofile-{uuid.uuid4().hex}"
-    boundary_bytes = boundary.encode("ascii")
-    parts = [
-        b"--" + boundary_bytes + b"\r\n",
-        b'Content-Disposition: form-data; name="folderId"\r\n\r\n',
-        config.folder_id.encode("utf-8"),
-        b"\r\n--" + boundary_bytes + b"\r\n",
-        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(
+def _multipart_upload(
+    config: StorageConfig, filename: str, archive: BinaryIO, archive_size: int
+) -> dict:
+    """Stream the multipart body instead of duplicating a whole archive in RAM."""
+    boundary = f"----hermes-gofile-{uuid.uuid4().hex}".encode("ascii")
+    folder_part = (
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="folderId"\r\n\r\n'
+        + config.folder_id.encode("utf-8")
+        + b"\r\n"
+    )
+    file_part = (
+        b"--" + boundary + b"\r\n"
+        + f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(
             "utf-8"
-        ),
-        b"Content-Type: application/gzip\r\n\r\n",
-        payload,
-        b"\r\n--" + boundary_bytes + b"--\r\n",
-    ]
-    body = b"".join(parts)
+        )
+        + b"Content-Type: application/gzip\r\n\r\n"
+    )
+    closing = b"\r\n--" + boundary + b"--\r\n"
+    content_length = len(folder_part) + len(file_part) + archive_size + len(closing)
+
+    parsed = urlsplit(GOFILE_UPLOAD_URL)
+    connection = http.client.HTTPSConnection(parsed.netloc, timeout=120)
     headers = _content_headers(config)
-    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
-    request = Request(GOFILE_UPLOAD_URL, data=body, headers=headers, method="POST")
-    with urlopen(request, timeout=120) as response:
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary.decode('ascii')}"
+    headers["Content-Length"] = str(content_length)
+    try:
+        connection.putrequest("POST", parsed.path or "/")
+        for key, value in headers.items():
+            connection.putheader(key, value)
+        connection.endheaders()
+        connection.send(folder_part)
+        connection.send(file_part)
+        while True:
+            chunk = archive.read(1024 * 1024)
+            if not chunk:
+                break
+            connection.send(chunk)
+        connection.send(closing)
+        response = connection.getresponse()
         result = json.loads(response.read())
+    finally:
+        connection.close()
     if not isinstance(result, dict) or result.get("status") != "ok":
         raise GofileError(f"GoFile upload failed: {result!r}")
     data = result.get("data")
@@ -200,9 +235,7 @@ def _multipart_upload(config: StorageConfig, filename: str, payload: bytes) -> d
 
 def _archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     name = member.name.removeprefix("./").rstrip("/")
-    if name == ".env" or name.startswith(".env/"):
-        return None
-    if name == "logs" or name.startswith("logs/"):
+    if ".env" in Path(name).parts or "logs" in Path(name).parts:
         return None
     # Do not copy sockets, device files, or symlinks into a new instance.
     if not (member.isdir() or member.isfile()):
@@ -211,7 +244,9 @@ def _archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
 
 
 def _create_archive(data_dir: Path, destination: BinaryIO) -> None:
-    with tarfile.open(fileobj=destination, mode="w:gz") as archive:
+    # Level 3 materially reduces CPU spikes on the single Free CPU while
+    # keeping the archive substantially smaller than an uncompressed tar.
+    with tarfile.open(fileobj=destination, mode="w:gz", compresslevel=3) as archive:
         archive.add(data_dir, arcname=".", recursive=True, filter=_archive_filter)
 
 
@@ -310,6 +345,50 @@ def _file_entries(config: StorageConfig) -> list[dict]:
     return entries
 
 
+def _state_fingerprint(data_dir: Path) -> str:
+    """Return a cheap metadata fingerprint for change-aware syncs.
+
+    Reading metadata is much cheaper than recompressing /opt/data every
+    minute. The archive filter and this walk intentionally exclude the same
+    secret/log paths and non-regular filesystem entries.
+    """
+    digest = hashlib.blake2b(digest_size=16)
+    for root, dirs, files in os.walk(data_dir, topdown=True, followlinks=False):
+        dirs[:] = sorted(
+            name
+            for name in dirs
+            if name not in {".env", "logs"}
+            and not (Path(root) / name).is_symlink()
+        )
+        for name in dirs:
+            path = Path(root) / name
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode):
+                continue
+            relative = path.relative_to(data_dir).as_posix()
+            digest.update(
+                f"D\\0{relative}\\0{info.st_mtime_ns}\\0{info.st_mode & 0o7777}\\n".encode()
+            )
+        for name in sorted(files):
+            if name == ".env":
+                continue
+            path = Path(root) / name
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            relative = path.relative_to(data_dir).as_posix()
+            digest.update(
+                f"F\\0{relative}\\0{info.st_size}\\0{info.st_mtime_ns}\\0{info.st_mode & 0o7777}\\n".encode()
+            )
+    return digest.hexdigest()
+
+
 def restore(data_dir: Path, config: StorageConfig) -> bool:
     entries = _file_entries(config)
     if not entries:
@@ -318,11 +397,13 @@ def restore(data_dir: Path, config: StorageConfig) -> bool:
     link = entries[0].get("link")
     if not isinstance(link, str) or not link:
         raise GofileError("newest GoFile state file has no download link")
-    payload = _download(link, config)
-    if not payload:
-        raise GofileError("newest GoFile state file was empty")
-    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
-        _safe_extract(archive, data_dir)
+    with tempfile.TemporaryFile(mode="w+b") as payload:
+        size = _download(link, config, payload)
+        if not size:
+            raise GofileError("newest GoFile state file was empty")
+        payload.seek(0)
+        with tarfile.open(fileobj=payload, mode="r:gz") as archive:
+            _safe_extract(archive, data_dir)
     LOG.info("restored Hermes state from GoFile folder %s", config.folder_id)
     return True
 
@@ -340,7 +421,13 @@ def _delete_old_entries(config: StorageConfig, entries: list[dict], keep_id: str
             LOG.warning("could not delete old GoFile backup %s: %s", content_id, exc)
 
 
-def sync_once(data_dir: Path, config: StorageConfig) -> bool:
+def sync_once(data_dir: Path, config: StorageConfig, *, force: bool = False) -> bool:
+    fingerprint = _state_fingerprint(data_dir)
+    if not force and config.last_fingerprint == fingerprint:
+        LOG.debug("state unchanged; skipping GoFile archive")
+        return True
+
+    filename = f"{config.prefix}{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.tar.gz"
     with tempfile.TemporaryFile(mode="w+b") as archive_file:
         _create_archive(data_dir, archive_file)
         size = archive_file.tell()
@@ -352,16 +439,15 @@ def sync_once(data_dir: Path, config: StorageConfig) -> bool:
             )
             return False
         archive_file.seek(0)
-        payload = archive_file.read()
+        old_entries = _file_entries(config)
+        metadata = _multipart_upload(config, filename, archive_file, size)
 
-    filename = f"{config.prefix}{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.tar.gz"
-    old_entries = _file_entries(config)
-    metadata = _multipart_upload(config, filename, payload)
     new_id = metadata.get("id") or metadata.get("fileId")
     if not isinstance(new_id, str) or not new_id:
         raise GofileError(f"GoFile upload did not return a file id: {metadata!r}")
     _delete_old_entries(config, old_entries, new_id)
-    LOG.info("uploaded Hermes state to GoFile (%d bytes)", len(payload))
+    config.last_fingerprint = fingerprint
+    LOG.info("uploaded Hermes state to GoFile (%d bytes)", size)
     return True
 
 
@@ -396,7 +482,7 @@ def run_daemon(data_dir: Path, config: StorageConfig) -> None:
     # Render normally sends SIGTERM to the process group. Make a best-effort
     # final upload so a recent chat/config change is not lost.
     try:
-        sync_once(data_dir, config)
+        sync_once(data_dir, config, force=True)
     except (GofileError, OSError, HTTPError, URLError, tarfile.TarError, ValueError) as exc:
         LOG.warning("final GoFile state upload failed: %s", exc)
 

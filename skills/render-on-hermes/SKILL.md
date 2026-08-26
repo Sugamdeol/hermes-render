@@ -45,8 +45,11 @@ The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when
 that variable is set. An explicit model/provider choice wins.
 
 Free services also spin down after inactivity and do not provide Render Shell
-or SSH. Prefer the dashboard and MCP for interaction. Avoid browser automation
-and parallel subagents when possible; the instance has limited memory.
+or SSH. The Blueprint leaves the memory-heavy browser TUI off by default
+(`HERMES_DASHBOARD_TUI=0`) and inserts conservative turn, delegation,
+cache, and subagent limits on first boot. Prefer Telegram or another
+configured chat channel for the lightest runtime. Avoid browser automation and
+parallel subagents when possible; the instance has limited memory.
 
 ## Default scope: full MCP access
 

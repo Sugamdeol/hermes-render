@@ -73,7 +73,7 @@ services:
       - key: GOFILE_STATE_PREFIX
         value: hermes-state-
       - key: GOFILE_SYNC_INTERVAL_SECONDS
-        value: "60"
+        value: "300"
       - key: GOFILE_MAX_ARCHIVE_MB
         value: "25"
 
@@ -87,14 +87,33 @@ services:
         value: "0.0.0.0"
       - key: HERMES_DASHBOARD_PORT
         value: "10000"
-      # Exposes a Chat tab in the dashboard that embeds the full Hermes TUI
-      # over a server-side PTY + xterm.js. This is how you chat with the
-      # agent without a real terminal on the host side. The TUI is retained
-      # because it is the primary Free-tier chat surface. If a particularly
-      # memory-constrained Free instance OOMs, set this to "0" and use a
-      # configured chat platform instead.
+      # The full browser TUI starts a Node/esbuild PTY per chat and is
+      # expensive on Free. Keep it off by default; use Telegram or another
+      # configured channel for chat. Set to "1" only when the dashboard Chat
+      # tab is needed and the instance has enough headroom.
       - key: HERMES_DASHBOARD_TUI
+        value: "0"
+
+      # Keep native runtimes from multiplying worker threads or retaining
+      # large allocator arenas on the small Free instance.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=128
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: OMP_NUM_THREADS
         value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      # Bound the pinned gateway's cached per-session agent objects. These
+      # values are read by the small Dockerfile source patch at process import.
+      - key: HERMES_AGENT_CACHE_MAX_SIZE
+        value: "16"
+      - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
+        value: "900"
 
       # Generated once at first deploy. Reuse this value as API_SERVER_KEY
       # in the Render Environment tab if you later opt into the

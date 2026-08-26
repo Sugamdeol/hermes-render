@@ -123,7 +123,15 @@ You need:
 - **An LLM provider API key.** [OpenRouter](https://openrouter.ai/keys) is the easiest because it routes to most providers behind a single key. Direct keys for Anthropic, OpenAI, Google, or Hugging Face also work.
 - **A Render account** with access to the Free web-service instance type. This template uses `plan: free` and has no persistent disk. Free services spin down after inactivity, can be restarted by Render at any time, and lose their local filesystem state when they stop. That is why provider keys belong in Render's Environment tab, not only in the Hermes dashboard.
 
-The upstream Hermes image is resource-intensive. This Free configuration is intended for personal testing and light, text-only use. Avoid browser automation and many concurrent subagents; if the service is OOM-killed, set `HERMES_DASHBOARD_TUI=0` and use a configured chat platform, or upgrade the service plan. The image build can also take several minutes on a first deploy.
+The upstream Hermes image is resource-intensive. This Free configuration is intended for personal testing and light, text-only use. The Blueprint disables the memory-heavy browser TUI by default, limits concurrency/cache growth, and keeps native worker pools to one thread. Avoid browser automation and parallel subagents; set `HERMES_DASHBOARD_TUI=1` only when you need the dashboard Chat tab and have enough headroom, or upgrade the service plan. The image build can also take several minutes on a first deploy.
+
+On first boot, the patcher adds conservative Free-tier defaults: 30 agent
+turns, one API retry, one delegation worker, a 16-entry cached-agent cap with
+15-minute idle eviction, one session-search worker, earlier context
+compression, shorter browser lifetimes, and smaller tool-output/code-
+execution caps. Edit `config.yaml` from the dashboard or the restored state if
+you deliberately need higher budgets; the profile marker prevents later boots
+from overwriting those explicit values.
 
 Optional, depending on which channels you want Hermes to listen on:
 
@@ -201,7 +209,7 @@ The Blueprint generates a `HERMES_GATEWAY_TOKEN` for you. Today, upstream Hermes
 
 ## Chatting with the agent
 
-The dashboard's **Chat** tab is the recommended Free-tier interface. The Blueprint sets `HERMES_DASHBOARD_TUI=1`, which exposes the full Hermes TUI in the browser over a server-side PTY plus xterm.js. Slash commands, model picker, tool-call cards, streaming, and sessions work like a local terminal. You do not need Render Shell or SSH (neither is available for Free web services). You can also connect a chat platform such as Telegram or Discord by putting its token in Render's Environment tab. A Free service only stays awake while it receives traffic, so an outbound-only long-polling or gateway connection may not keep a bot running continuously; use the dashboard to wake it or upgrade for an always-on service.
+The dashboard's **Chat** tab is optional on Free because the full TUI creates a server-side PTY, Node process, and xterm.js session. The Blueprint sets `HERMES_DASHBOARD_TUI=0` to reduce idle RAM and CPU usage. Set it to `1` when you need the browser TUI and accept the additional resource cost. For the lightest deployment, connect Telegram or another chat platform through Render's Environment tab. You do not need Render Shell or SSH (neither is available for Free web services). A Free service only stays awake while it receives traffic, so an outbound-only long-polling or gateway connection may not keep a bot running continuously; use the dashboard to wake it or upgrade for an always-on service.
 
 The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
 
@@ -234,15 +242,17 @@ unless `GOFILE_API_TOKEN` is configured.
    find or create a private `hermes-render-state` folder under that account.
    To use an existing folder instead, also set `GOFILE_FOLDER_ID` to its UUID,
    not only its public share code.
-3. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, 60-second sync
+3. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, five-minute sync
    interval, and 25 MB compressed archive cap unless you have a reason to
-   change them.
+   change them. The worker skips the archive entirely when `/opt/data` has
+   not changed, so the interval is a safety check rather than a constant
+   compression workload.
 
 The boot wrapper lists the folder, downloads the newest matching archive,
 and restores it before Hermes starts. While Hermes runs, a background worker
-uploads a compressed snapshot every minute and deletes older matching backups
-only after a successful upload. It also makes a best-effort upload on
-shutdown. Logs are excluded because Render already keeps service logs;
+checks for changed state every five minutes, then uploads a compressed
+snapshot only when needed and deletes older matching backups only after a
+successful upload. It also makes a best-effort upload on shutdown. Logs are excluded because Render already keeps service logs;
 `/opt/data/.env` is excluded so `BYNARA_API_KEY`, provider keys, and chat
 tokens stay in Render's Environment tab.
 
@@ -380,8 +390,8 @@ What it does:
 - Runs the Hermes gateway and dashboard inside one container, the way upstream supports.
 - Uses the upstream-default `HERMES_HOME` path (`/opt/data`) on the Free service's ephemeral filesystem.
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
-- Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, and the full MCP tool catalog available to your API key, without overwriting explicit edits.
-- Restores and periodically backs up `/opt/data` through optional GoFile storage; `.env` and logs are excluded from the archive.
+- Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, the full MCP tool catalog available to your API key, and conservative Free-tier concurrency/cache defaults, without overwriting explicit edits.
+- Restores and change-aware backs up `/opt/data` through optional low-priority GoFile storage; `.env` and logs are excluded from the archive.
 - Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GOFILE_API_TOKEN`, and `GOFILE_FOLDER_ID` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
