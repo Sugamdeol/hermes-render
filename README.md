@@ -116,6 +116,12 @@ The key is referenced through `key_env`, so it is never written into
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` in Render's **Environment**
 tab. Use a comma-separated allowlist if you need more than one Telegram user.
 
+Note on free-tier gating: Bynara occasionally requires the account behind an
+API key to join their Telegram group/channel and relink from their dashboard
+at <https://router.bynara.id/settings>. Until you do, every completion fails
+with `403 telegram_required` regardless of which model you pick — that error
+comes from the provider, not from Telegram, Render, or this template.
+
 ## Prerequisites
 
 You need:
@@ -319,6 +325,23 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | Agent says it tried to run `render <something>` and got `command not found` | Working as designed — the Render CLI is not installed in this image (see **Security: agent capabilities**). Most CLI capabilities have an MCP equivalent the agent should use instead; the rest (live log streaming, `render psql`, SSH) the user runs from their own machine. |
 | `[render-tools] config patch failed; continuing` in the boot logs | Non-fatal. The agent still runs; you just won't see the Render MCP server until you fix it. Usually means `/opt/data/config.yaml` isn't valid YAML — fix it from the dashboard or wipe it (see "Forcing a clean rebuild"). |
 | `tirith security scanner enabled but not available`  | Harmless. Tirith is an optional Rust-based command scanner; without it, Hermes uses pattern matching. Ignore unless you specifically want native scanning. |
+| `Error code: 403 - {'type': 'forbidden', 'message': 'telegram_required: Join the required Telegram group/channel and relink at /settings...'` | This is **Bynara (NaraRouter) gating your free-tier API key**, not a Telegram or Hermes problem. Log in at [router.bynara.id/settings](https://router.bynara.id/settings) with the account that created your `BYNARA_API_KEY`, join the Telegram group/channel it names, and relink there. No Render restart needed — the next message goes through. |
+| `telegram.error.InvalidToken: The token ... was rejected by the server` then `Gateway failed to connect any configured messaging platform` | Telegram rejected `TELEGRAM_BOT_TOKEN` — it was revoked (e.g. regenerated in BotFather), belongs to a deleted bot, or was mistyped. Rotate it as described in **Telegram token rejected** below. On image builds from 2026‑08‑26 onward the boot script pre-flights the token and starts the gateway without Telegram instead of crash-looping. |
+| Repeating `Instance failed: Exited with status 1` / `Service recovered` events | The gateway (foreground process) is exiting and Render keeps restarting the container. Check the **Logs** tab for the first `ERROR` line after each boot; it is usually one of the two rows above. |
+
+### Telegram token rejected
+
+If the logs show `telegram.error.InvalidToken` / `The token '...' was rejected by the server`, Telegram's API has refused your `TELEGRAM_BOT_TOKEN`. The request reached Telegram and came back `401 Unauthorized`, so the value is dead — it was **revoked** (regenerating a token in BotFather invalidates the old one), the bot was deleted, or the pasted value is wrong. The env var always wins over any token stored in `config.yaml`, so a restored GoFile state file cannot shadow the fix.
+
+Rotate it like this:
+
+1. Message [@BotFather](https://t.me/BotFather) → `/mybots` → select your bot → **API Token** → copy the **current** token (or `/token` to regenerate one).
+2. In Render, open the service → **Environment** → edit `TELEGRAM_BOT_TOKEN` and paste the new value. Do not copy the masked `123456789:***` form from logs.
+3. Saving the env var restarts the service; Telegram connects on the next boot.
+
+Since the gateway is the container's foreground process, a rejected token used to make `gateway run` exit(1) — Render then restarted the container into the same failure every ~90 seconds (the `Instance failed: Exited with status 1` / `Service recovered` flapping), and the dashboard died with it. The boot script now pre-flights the token against Telegram's `getMe`: on an authoritative `401`/`404` it prints the steps above to the logs and starts the gateway **without** Telegram, so the dashboard, cron scheduler, and GoFile state sync stay up while you fix the token. Transient network errors leave the token untouched for the gateway's own retries, and a token that only fails because of stray surrounding whitespace is trimmed and re-exported automatically.
+
+Reminder: on the Free plan the service still spins down after ~15 minutes without inbound HTTP traffic, and Telegram long-polling is outbound-only. Ping the dashboard URL to wake the bot, or upgrade the plan for an always-on gateway.
 
 ### Changing env vars
 
