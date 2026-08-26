@@ -8,6 +8,9 @@
 #     custom provider in config.yaml (idempotent; never overwrites user edits)
 #   - Free-tier resource guardrails for the gateway, dashboard, and GoFile sync
 #   - An optional GoFile state sync for Render's Free filesystem
+#   - A TELEGRAM_BOT_TOKEN pre-flight so a revoked token starts the
+#     gateway without Telegram instead of exit(1)-crash-looping the
+#     whole web service (dashboard included)
 #
 # We deliberately do NOT install the `render` CLI. This image is configured
 # around the Render MCP server; installing extra CLIs should be a conscious
@@ -97,8 +100,9 @@ COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
 COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
+COPY --chown=root:root scripts/check-telegram-token.py /opt/render-tools/check-telegram-token.py
 RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
-             /opt/render-tools/free-storage.py
+             /opt/render-tools/free-storage.py /opt/render-tools/check-telegram-token.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. Render Free has no persistent disk, so this image directory

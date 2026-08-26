@@ -90,6 +90,43 @@ if [ -x "${STORAGE_SYNC}" ] && [ "${STORAGE_RESTORE_OK}" -eq 1 ]; then
   echo "[render-tools] started optional low-priority remote state sync"
 fi
 
+# Pre-flight TELEGRAM_BOT_TOKEN when it is configured. A revoked or mistyped
+# token makes the upstream gateway exit(1) at startup — and as the foreground
+# process that takes the whole container (dashboard included) down with it,
+# restarting straight into the same failure. The checker asks Telegram's
+# getMe endpoint and, only on an authoritative 401/404, exits 3 so we drop
+# the platform for this boot and the service stays up and fixable from the
+# dashboard. Transient network errors leave the token untouched. See
+# scripts/check-telegram-token.py for the full exit-code contract.
+TOKEN_CHECK="/opt/render-tools/check-telegram-token.py"
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -x "${TOKEN_CHECK}" ]; then
+  TOKEN_CHECK_STATUS=0
+  TOKEN_CHECK_STDOUT="$(gosu hermes "${TOKEN_CHECK}")" || TOKEN_CHECK_STATUS=$?
+  case "${TOKEN_CHECK_STATUS}" in
+    0) ;;
+    3)
+      # Telegram definitively rejected the token; the checker already
+      # printed remediation steps. Run the gateway platform-less this boot.
+      unset TELEGRAM_BOT_TOKEN
+      echo "[render-tools] starting the gateway without Telegram for this boot" >&2
+      ;;
+    4)
+      # The raw value had whitespace damage; the checker verified the
+      # trimmed token and printed it on stdout. Re-export the clean value.
+      if [ -n "${TOKEN_CHECK_STDOUT}" ]; then
+        TELEGRAM_BOT_TOKEN="${TOKEN_CHECK_STDOUT}"
+        export TELEGRAM_BOT_TOKEN
+        echo "[render-tools] re-exported the trimmed TELEGRAM_BOT_TOKEN" >&2
+      else
+        echo "[render-tools] warning: token pre-flight returned no cleaned value; continuing unchanged" >&2
+      fi
+      ;;
+    *)
+      echo "[render-tools] warning: token pre-flight exited ${TOKEN_CHECK_STATUS}; continuing with TELEGRAM_BOT_TOKEN unchanged" >&2
+      ;;
+  esac
+fi
+
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 exec /opt/hermes/docker/entrypoint.sh "$@"
