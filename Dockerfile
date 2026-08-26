@@ -4,8 +4,10 @@
 #
 # Extends the upstream NousResearch/hermes-agent image with:
 #   - A bundle of Render-focused skills mounted via skills.external_dirs
-#   - A boot-time patcher that registers the Render MCP server in
-#     config.yaml (idempotent; never overwrites user edits)
+#   - A boot-time patcher that registers the Render MCP server and Bynara
+#     custom provider in config.yaml (idempotent; never overwrites user edits)
+#   - Free-tier resource guardrails for the gateway, dashboard, and GoFile sync
+#   - An optional GoFile state sync for Render's Free filesystem
 #
 # We deliberately do NOT install the `render` CLI. This image is configured
 # around the Render MCP server; installing extra CLIs should be a conscious
@@ -27,6 +29,41 @@ RUN chown -R hermes:hermes /opt/hermes/ui-tui /opt/hermes/node_modules \
  && touch /opt/hermes/ui-tui/packages/hermes-ink/dist/ink-bundle.js \
           /opt/hermes/ui-tui/dist/entry.js \
  && chown -R hermes:hermes /opt/hermes/ui-tui
+
+# The pinned gateway release keeps up to 128 session agents cached for one
+# hour. That is reasonable on a workstation but can exhaust Render Free RAM.
+# Make those constants environment-configurable without changing upstream
+# behavior for other deployments. The build fails loudly if the pinned source
+# changes, so a Hermes image upgrade cannot silently lose this guardrail.
+RUN /opt/hermes/.venv/bin/python - <<'PY'
+from pathlib import Path
+
+path = Path("/opt/hermes/gateway/run.py")
+text = path.read_text(encoding="utf-8")
+old = "_AGENT_CACHE_MAX_SIZE = 128\n_AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h\n"
+new = '''def _resource_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resource_float_env(name: str, default: float) -> float:
+    try:
+        return max(1.0, float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+_AGENT_CACHE_MAX_SIZE = _resource_int_env("HERMES_AGENT_CACHE_MAX_SIZE", 16)
+_AGENT_CACHE_IDLE_TTL_SECS = _resource_float_env(
+    "HERMES_AGENT_CACHE_IDLE_TTL_SECONDS", 900.0
+)
+'''
+if old not in text:
+    raise SystemExit("expected gateway cache constants not found")
+path.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY
 
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
@@ -54,15 +91,19 @@ RUN set -eu; \
 # overlays would shadow upstream entries.
 COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 
-# Boot-time wrapper: patches /opt/data/config.yaml, then hands off to
-# the upstream entrypoint chain (tini → docker/entrypoint.sh).
+# Boot-time wrapper: restores optional remote state, patches
+# /opt/data/config.yaml, starts optional state sync, then hands off to the
+# upstream entrypoint chain (tini → docker/entrypoint.sh).
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py
+COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
+RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
+             /opt/render-tools/free-storage.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
-# first boot. The mounted disk replaces this empty dir at runtime;
-# baking it just keeps the image self-contained for any non-disk use.
+# first boot. Render Free has no persistent disk, so this image directory
+# is intentionally disposable. A paid deployment may mount a disk here
+# without requiring a different image.
 RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
 # Stay as root so the bootstrap can chown the mounted /opt/data on first

@@ -11,8 +11,9 @@
 #
 # Inside the container the gateway runs in the foreground and the
 # dashboard runs as a background side-process (HERMES_DASHBOARD=1).
-# Render's public URL serves the dashboard on port 10000; persistent
-# state lives on a 5 GB disk mounted at /opt/data (HERMES_HOME default).
+# Render's public URL serves the dashboard on port 10000. This Blueprint
+# deliberately uses the Free instance type, so /opt/data is ephemeral;
+# provider keys must be supplied as Render environment variables.
 #
 # To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile and redeploy.
 # To upgrade Render skills: bump RENDER_SKILLS_REF and redeploy.
@@ -22,7 +23,10 @@ services:
     name: hermes
     runtime: docker
     region: oregon
-    plan: standard
+    # Free web services have an ephemeral filesystem and spin down after
+    # inactivity, but are enough for a personal/demo Hermes deployment.
+    # Do not add a disk here: Render does not allow persistent disks on Free.
+    plan: free
     # Render builds the image from this repo's Dockerfile on every deploy.
     # The Dockerfile FROMs the pinned upstream Hermes image, adds Render
     # tooling + the skill bundle, and sets ENTRYPOINT to our bootstrap wrapper — so
@@ -31,16 +35,47 @@ services:
     autoDeployTrigger: off
     healthCheckPath: /api/status
 
-    disk:
-      name: hermes-data
-      mountPath: /opt/data
-      sizeGB: 5
-
     envVars:
-      # The Blueprint only carries vars that change how the container boots
-      # or that wire up the bundled Render tools. All provider keys, tool
-      # keys, and chat platform tokens are set through the Hermes dashboard
-      # (API Keys tab), which writes them to /opt/data/.env on the disk.
+      # Free instances lose /opt/data when they spin down or redeploy. Keep
+      # secrets in Render environment variables rather than in the dashboard's
+      # API Keys tab, which writes to the ephemeral filesystem.
+      - key: HERMES_HOME
+        value: /opt/data
+      - key: PORT
+        value: "10000"
+
+      # Bynara's OpenAI-compatible free router. When this key is present,
+      # the boot patcher adds custom:bynara and selects qwen-3.8-max-free
+      # unless an explicit model/provider is already configured.
+      - key: BYNARA_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_USERS
+        sync: false
+
+      # OpenRouter is an alternative provider. Leave this blank if you use
+      # Bynara or another provider and add that provider's key in the Render
+      # Environment tab instead. sync: false keeps the value out of the
+      # Blueprint repository and prompts for it during deploy.
+      - key: OPENROUTER_API_KEY
+        sync: false
+
+      # Optional GoFile state backup for Free. Leave the token blank to run
+      # with disposable local state. The service can create/find its own
+      # private state folder; an existing folder UUID may be supplied.
+      - key: GOFILE_API_TOKEN
+        sync: false
+      - key: GOFILE_FOLDER_ID
+        sync: false
+      - key: GOFILE_FOLDER_NAME
+        value: hermes-render-state
+      - key: GOFILE_STATE_PREFIX
+        value: hermes-state-
+      - key: GOFILE_SYNC_INTERVAL_SECONDS
+        value: "300"
+      - key: GOFILE_MAX_ARCHIVE_MB
+        value: "25"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
@@ -52,15 +87,37 @@ services:
         value: "0.0.0.0"
       - key: HERMES_DASHBOARD_PORT
         value: "10000"
-      # Exposes a Chat tab in the dashboard that embeds the full Hermes TUI
-      # over a server-side PTY + xterm.js. This is how you chat with the
-      # agent without a real terminal on the host side.
+      # The full browser TUI starts a Node/esbuild PTY per chat and is
+      # expensive on Free. Keep it off by default; use Telegram or another
+      # configured channel for chat. Set to "1" only when the dashboard Chat
+      # tab is needed and the instance has enough headroom.
       - key: HERMES_DASHBOARD_TUI
+        value: "0"
+
+      # Keep native runtimes from multiplying worker threads or retaining
+      # large allocator arenas on the small Free instance.
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=128
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: OMP_NUM_THREADS
         value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"
+      - key: MKL_NUM_THREADS
+        value: "1"
+      - key: TOKENIZERS_PARALLELISM
+        value: "false"
+      # Bound the pinned gateway's cached per-session agent objects. These
+      # values are read by the small Dockerfile source patch at process import.
+      - key: HERMES_AGENT_CACHE_MAX_SIZE
+        value: "16"
+      - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
+        value: "900"
 
       # Generated once at first deploy. Reuse this value as API_SERVER_KEY
-      # in the dashboard if you later opt into the OpenAI-compatible API
-      # server (API_SERVER_ENABLED=true).
+      # in the Render Environment tab if you later opt into the
+      # OpenAI-compatible API server (API_SERVER_ENABLED=true).
       - key: HERMES_GATEWAY_TOKEN
         generateValue: true
 

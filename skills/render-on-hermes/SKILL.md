@@ -28,7 +28,28 @@ upstream skill assumes something that isn't true on this host.
 | MCP auth                 | `Authorization: Bearer ${RENDER_MCP_API_KEY}` (lazy-substituted) |
 | MCP tool scope           | **Full MCP tool access** for the provided API key            |
 | Render CLI               | **Not installed.** See "About the render-cli skill" below   |
-| Skill bundle             | `github.com/render-oss/skills` at a pinned commit, exposed via `skills.external_dirs` |
+| Skill bundle              | `github.com/render-oss/skills` at a pinned commit, exposed via `skills.external_dirs` |
+
+## Free-tier runtime constraints
+
+This template runs as a Render **Free** web service. Its `/opt/data` filesystem
+is ephemeral: it is reset after a spin-down or redeploy. Without the optional
+GoFile sync, do not tell the user that sessions, memories, dashboard
+configuration, logs, or files saved there will persist. Provider keys, channel
+tokens, and other important configuration must live in Render environment
+variables, not only in `/opt/data/.env`; the sync archive intentionally
+excludes `.env` and logs.
+
+The Bynara router is available as `custom:bynara` and uses `BYNARA_API_KEY`.
+The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when
+that variable is set. An explicit model/provider choice wins.
+
+Free services also spin down after inactivity and do not provide Render Shell
+or SSH. The Blueprint leaves the memory-heavy browser TUI off by default
+(`HERMES_DASHBOARD_TUI=0`) and inserts conservative turn, delegation,
+cache, and subagent limits on first boot. Prefer Telegram or another
+configured chat channel for the lightest runtime. Avoid browser automation and
+parallel subagents when possible; the instance has limited memory.
 
 ## Default scope: full MCP access
 
