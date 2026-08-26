@@ -6,7 +6,7 @@
 #   - A bundle of Render-focused skills mounted via skills.external_dirs
 #   - A boot-time patcher that registers the Render MCP server and Bynara
 #     custom provider in config.yaml (idempotent; never overwrites user edits)
-#   - An optional S3-compatible state sync for Render's Free filesystem
+#   - An optional GoFile state sync for Render's Free filesystem
 #
 # We deliberately do NOT install the `render` CLI. This image is configured
 # around the Render MCP server; installing extra CLIs should be a conscious

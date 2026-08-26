@@ -3,7 +3,7 @@
 #
 # Runs as root (PID-1 child of tini). On every boot it:
 #   1. Ensures /opt/data exists and is owned by hermes:hermes.
-#   2. Restores optional state from S3-compatible storage.
+#   2. Restores optional state from GoFile.
 #   3. Seeds the upstream config template when this is a fresh instance.
 #   4. Runs the config patcher as the hermes user. The patcher is
 #      idempotent: it only INSERTs integration entries; it never overwrites

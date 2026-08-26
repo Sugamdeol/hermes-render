@@ -217,37 +217,43 @@ This Blueprint uses Render's **Free** web-service instance. It has no service ch
 
 LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
 
-## Keeping files on Free
+## Keeping files on Free with GoFile
 
 Render Free cannot attach a persistent disk. This repo includes an optional
-S3-compatible state sync so you can keep Hermes sessions, memories, config,
-and other `/opt/data` files in a free-tier object store such as Cloudflare R2.
-The sync is disabled unless all four storage credentials are present.
+GoFile state sync so Hermes sessions, memories, config, and other important
+`/opt/data` files can survive a spin-down or redeploy. The sync is disabled
+unless both `GOFILE_API_TOKEN` and `GOFILE_FOLDER_ID` are configured.
 
-### Configure Cloudflare R2 (or another S3-compatible provider)
+### Configure GoFile
 
-1. Create a bucket and an access key with read/write access to that bucket.
-2. In Render's **Environment** tab, add:
-   - `HERMES_STORAGE_ENDPOINT_URL` — for R2, your account's R2 S3 endpoint
-     (`https://<account-id>.r2.cloudflarestorage.com`)
-   - `HERMES_STORAGE_BUCKET` — the bucket name
-   - `HERMES_STORAGE_ACCESS_KEY_ID`
-   - `HERMES_STORAGE_SECRET_ACCESS_KEY`
-3. Leave `HERMES_STORAGE_REGION=auto`, keep the default prefix `hermes`, and
-   keep the 60-second sync interval unless you have a reason to change it.
+1. Create or sign in to a GoFile account and copy its API token from
+   [My Profile](https://gofile.io/myprofile). Use an account token rather than
+   anonymous uploads so the folder remains associated with your account.
+2. Create a private folder for this service and copy its folder ID. The ID is
+   the folder UUID, not only the public share code. If GoFile shows both, use
+   the UUID in `GOFILE_FOLDER_ID`.
+3. In Render's **Environment** tab, add:
+   - `GOFILE_API_TOKEN` — your GoFile account token
+   - `GOFILE_FOLDER_ID` — the destination folder UUID
+4. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, 60-second sync
+   interval, and 25 MB compressed archive cap unless you have a reason to
+   change them.
 
-The boot wrapper restores `hermes/state.tar.gz` before Hermes starts, then the
-background worker uploads a compressed snapshot periodically and makes a
-best-effort upload on shutdown. Logs are excluded because Render already keeps
-service logs; `/opt/data/.env` is also excluded on purpose. Keep
-`BYNARA_API_KEY`, provider keys, and chat tokens in Render's Environment tab
-instead. The default compressed-archive safety cap is 25 MB (`HERMES_STORAGE_MAX_ARCHIVE_MB`). Use a private bucket and least-privilege credentials.
+The boot wrapper lists the folder, downloads the newest matching archive,
+and restores it before Hermes starts. While Hermes runs, a background worker
+uploads a compressed snapshot every minute and deletes older matching backups
+only after a successful upload. It also makes a best-effort upload on
+shutdown. Logs are excluded because Render already keeps service logs;
+`/opt/data/.env` is excluded so `BYNARA_API_KEY`, provider keys, and chat
+tokens stay in Render's Environment tab.
 
-Only one Hermes instance should write a given storage prefix. The Free
-Blueprint runs one instance, but do not reuse the same prefix from another
-service. Remote sync is a backup/restore layer, not a replacement for a
-real database or a high-concurrency shared filesystem. The object store's
-own free-tier limits and retention policies apply.
+GoFile's free limits, retention/cold-storage behavior, rate limits, and
+account policies apply. Only one Hermes instance should write a given folder
+prefix. This is a backup/restore layer, not a replacement for a database or a
+high-concurrency shared filesystem. If GoFile rotates its website-token salt
+and restore logs show `error-notPremium`, set `GOFILE_WT_SALT` to the current
+value from GoFile's web client and restart; the default is kept in the image
+for the current API behavior.
 
 ## Updating
 
@@ -264,7 +270,7 @@ Bump either, commit, and push. Render won't auto-deploy (the Blueprint sets `aut
 render deploys create <service-id>
 ```
 
-Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Without the optional S3-compatible sync, sessions, memories, installed skills, logs, and dashboard config are disposable. With storage configured, those files are restored from and periodically backed up to the configured object store. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep secrets outside the archive in Render environment variables.
+Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Without the optional GoFile sync, sessions, memories, installed skills, and dashboard config are disposable. With GoFile configured, those files are restored from and periodically backed up to the selected folder. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep secrets outside the archive in Render environment variables.
 
 Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`. The [skills repo's commit log](https://github.com/render-oss/skills/commits/main) is the source of truth for `RENDER_SKILLS_REF`.
 
@@ -295,7 +301,7 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | `Refusing to start: binding to 0.0.0.0 requires API_SERVER_KEY` | You set `API_SERVER_ENABLED=true` and `API_SERVER_HOST=0.0.0.0` without an `API_SERVER_KEY`. Set the key or flip back to `127.0.0.1`. |
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
 | Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
-| API keys or sessions disappear                      | API keys must be in Render's **Environment** tab; `/opt/data/.env` is never durable on Free. Configure the optional S3-compatible sync if sessions and dashboard config must survive a cold start/redeploy. |
+| API keys or sessions disappear                      | API keys must be in Render's **Environment** tab; `/opt/data/.env` is never durable on Free. Configure the optional GoFile sync if sessions and dashboard config must survive a cold start/redeploy. |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
 | `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
@@ -311,9 +317,9 @@ Set, change, or delete env vars under the service's **Environment** tab. Render 
 
 ### Forcing a clean rebuild
 
-Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. With remote storage disabled, the new instance starts with a clean `/opt/data` directory and reseeds defaults. With remote storage enabled, delete or replace the remote `hermes/state.tar.gz` object before redeploying if you also need to discard the saved state. Render Environment variables are re-injected automatically.
+Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. With GoFile disabled, the new instance starts with a clean `/opt/data` directory and reseeds defaults. With GoFile enabled, delete or replace the matching `hermes-state-*.tar.gz` object in the configured folder before redeploying if you also need to discard the saved state. Render Environment variables are re-injected automatically.
 
-There is no persistent-disk snapshot to restore on Free; the optional S3-compatible archive is the available backup.
+There is no persistent-disk snapshot to restore on Free; the optional GoFile archive is the available backup.
 
 ## Security
 
@@ -376,8 +382,8 @@ What it does:
 - Uses the upstream-default `HERMES_HOME` path (`/opt/data`) on the Free service's ephemeral filesystem.
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
 - Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, and the full MCP tool catalog available to your API key, without overwriting explicit edits.
-- Restores and periodically backs up `/opt/data` through optional S3-compatible object storage; `.env` is excluded from the archive.
-- Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, and `RENDER_MCP_API_KEY` as `sync: false` so secrets never sync from the repo.
+- Restores and periodically backs up `/opt/data` through optional GoFile storage; `.env` and logs are excluded from the archive.
+- Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GOFILE_API_TOKEN`, and `GOFILE_FOLDER_ID` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
 What it deliberately doesn't do:
@@ -385,7 +391,7 @@ What it deliberately doesn't do:
 - **It doesn't install the `render` CLI.** MCP is the supported in-container Render integration. Install the CLI only as a deliberate operator choice.
 - It doesn't try to add authentication on top of the dashboard. Use an auth gateway, private network path, or another access-control layer you trust.
 - It doesn't enable the OpenAI-compatible API server. Flip `API_SERVER_ENABLED=true` and supply `API_SERVER_KEY` if you need it.
-- It doesn't hardcode a model API key. When `BYNARA_API_KEY` is configured, the patcher selects Bynara's `qwen-3.8-max-free` default on a fresh/upstream-default config; otherwise Hermes uses its upstream model default. The setting lives in ephemeral `/opt/data` unless remote storage is enabled.
+- It doesn't hardcode a model API key. When `BYNARA_API_KEY` is configured, the patcher selects Bynara's `qwen-3.8-max-free` default on a fresh/upstream-default config; otherwise Hermes uses its upstream model default. The setting lives in ephemeral `/opt/data` unless GoFile storage is enabled.
 - It doesn't configure browser automation tweaks (`--shm-size`, GPU access). Those need an instance type with more RAM, not extra Render config.
 - It doesn't fork or modify the upstream `render-oss/skills` content. The overlay in `skills/render-on-hermes/` is the only Hermes-specific addition; everything else is the canonical Render skill bundle.
 

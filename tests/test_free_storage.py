@@ -44,12 +44,7 @@ class FreeStorageTests(unittest.TestCase):
 
     def test_storage_is_disabled_without_all_credentials(self):
         storage = load_storage()
-        names = (
-            "HERMES_STORAGE_ENDPOINT_URL",
-            "HERMES_STORAGE_BUCKET",
-            "HERMES_STORAGE_ACCESS_KEY_ID",
-            "HERMES_STORAGE_SECRET_ACCESS_KEY",
-        )
+        names = ("GOFILE_API_TOKEN", "GOFILE_FOLDER_ID")
         old = {name: os.environ.pop(name, None) for name in names}
         try:
             self.assertIsNone(storage.StorageConfig.from_env())

@@ -61,24 +61,18 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
 
-      # Optional remote state backup for Free. These variables target any
-      # S3-compatible object store; Cloudflare R2 is a practical free-tier
-      # option. Leave all four blank to run with disposable local state.
-      - key: HERMES_STORAGE_ENDPOINT_URL
+      # Optional GoFile state backup for Free. Leave both values blank to
+      # run with disposable local state. The account token and folder ID are
+      # kept out of the Blueprint repository.
+      - key: GOFILE_API_TOKEN
         sync: false
-      - key: HERMES_STORAGE_BUCKET
+      - key: GOFILE_FOLDER_ID
         sync: false
-      - key: HERMES_STORAGE_ACCESS_KEY_ID
-        sync: false
-      - key: HERMES_STORAGE_SECRET_ACCESS_KEY
-        sync: false
-      - key: HERMES_STORAGE_REGION
-        value: auto
-      - key: HERMES_STORAGE_PREFIX
-        value: hermes
-      - key: HERMES_STORAGE_SYNC_INTERVAL_SECONDS
+      - key: GOFILE_STATE_PREFIX
+        value: hermes-state-
+      - key: GOFILE_SYNC_INTERVAL_SECONDS
         value: "60"
-      - key: HERMES_STORAGE_MAX_ARCHIVE_MB
+      - key: GOFILE_MAX_ARCHIVE_MB
         value: "25"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`

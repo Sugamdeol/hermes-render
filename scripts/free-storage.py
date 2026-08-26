@@ -1,24 +1,23 @@
 #!/opt/hermes/.venv/bin/python
-"""Optional S3-compatible state sync for Render's Free filesystem.
+"""Optional GoFile state sync for Render's Free filesystem.
 
-Render Free services cannot attach persistent disks. When configured with an
-S3-compatible object store (for example, a Cloudflare R2 bucket), this module
-restores a compressed archive before Hermes starts and periodically uploads the
-current `/opt/data` state while Hermes is running. Runtime logs are left out
-because Render already retains service logs and log files can grow without
-bound.
+Render Free services cannot attach persistent disks. When configured with a
+GoFile account token and folder, this module restores the newest Hermes state
+archive before Hermes starts and periodically uploads a fresh archive while
+Hermes is running. It keeps one current archive by deleting older matching
+backups after a successful upload.
 
-The archive deliberately excludes `/opt/data/.env`. Render environment variables
-are the durable source for secrets, and copying .env to object storage would
-make an otherwise safe backup unexpectedly contain provider keys.
+The archive excludes /opt/data/.env and runtime logs. Render environment
+variables are the durable source for secrets, and Render already retains
+service logs. No third-party Python package is required.
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import hashlib
-import hmac
 import io
+import json
 import logging
 import os
 from pathlib import Path
@@ -26,48 +25,56 @@ import signal
 import tarfile
 import tempfile
 import threading
+import time
 from typing import BinaryIO
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+import uuid
 
-LOG = logging.getLogger("hermes-free-storage")
+LOG = logging.getLogger("hermes-gofile-storage")
+GOFILE_API_URL = "https://api.gofile.io"
+GOFILE_UPLOAD_URL = "https://upload.gofile.io/uploadfile"
+# GoFile's current web client uses this rotating four-hour token. Keep it
+# configurable because GoFile may rotate the salt without notice.
+GOFILE_WT_SALT = "12af056dacea0b"
+WT_WINDOW_SECONDS = 14400
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+class GofileError(RuntimeError):
+    """A GoFile API response was unsuccessful."""
 
 
 class StorageConfig:
     def __init__(
         self,
-        endpoint: str,
-        bucket: str,
-        access_key: str,
-        secret_key: str,
-        region: str,
+        token: str,
+        folder_id: str,
         prefix: str,
         interval: int,
         max_archive_bytes: int,
+        user_agent: str,
+        language: str,
+        wt_salt: str,
     ) -> None:
-        self.endpoint = endpoint.rstrip("/")
-        self.bucket = bucket
-        self.access_key = access_key
-        self.secret_key = secret_key
-        self.region = region
-        self.prefix = prefix.strip("/")
+        self.token = token
+        self.folder_id = folder_id
+        self.prefix = prefix or "hermes-state-"
         self.interval = interval
         self.max_archive_bytes = max_archive_bytes
-
-    @property
-    def object_key(self) -> str:
-        return f"{self.prefix}/state.tar.gz" if self.prefix else "state.tar.gz"
+        self.user_agent = user_agent
+        self.language = language
+        self.wt_salt = wt_salt
 
     @classmethod
     def from_env(cls) -> "StorageConfig | None":
-        values = {
-            "endpoint": os.environ.get("HERMES_STORAGE_ENDPOINT_URL", "").strip(),
-            "bucket": os.environ.get("HERMES_STORAGE_BUCKET", "").strip(),
-            "access_key": os.environ.get("HERMES_STORAGE_ACCESS_KEY_ID", "").strip(),
-            "secret_key": os.environ.get("HERMES_STORAGE_SECRET_ACCESS_KEY", "").strip(),
-        }
-        if not all(values.values()):
+        token = (os.environ.get("GOFILE_API_TOKEN") or os.environ.get("GOFILE_TOKEN", "")).strip()
+        folder_id = os.environ.get("GOFILE_FOLDER_ID", "").strip()
+        if not token or not folder_id:
             return None
 
         def positive_int(name: str, default: int) -> int:
@@ -78,99 +85,120 @@ class StorageConfig:
                 return default
 
         return cls(
-            **values,
-            region=os.environ.get("HERMES_STORAGE_REGION", "auto").strip() or "auto",
-            prefix=os.environ.get("HERMES_STORAGE_PREFIX", "hermes"),
-            interval=positive_int("HERMES_STORAGE_SYNC_INTERVAL_SECONDS", 60),
-            max_archive_bytes=positive_int(
-                "HERMES_STORAGE_MAX_ARCHIVE_MB", 25
-            )
-            * 1024
-            * 1024,
+            token=token,
+            folder_id=folder_id,
+            prefix=os.environ.get("GOFILE_STATE_PREFIX", "hermes-state-"),
+            interval=positive_int("GOFILE_SYNC_INTERVAL_SECONDS", 60),
+            max_archive_bytes=positive_int("GOFILE_MAX_ARCHIVE_MB", 25) * 1024 * 1024,
+            user_agent=os.environ.get("GOFILE_USER_AGENT", DEFAULT_USER_AGENT),
+            language=os.environ.get("GOFILE_LANGUAGE", "en-US"),
+            wt_salt=os.environ.get("GOFILE_WT_SALT", GOFILE_WT_SALT),
         )
 
 
-def _hmac(key: bytes, value: str) -> bytes:
-    return hmac.new(key, value.encode("utf-8"), hashlib.sha256).digest()
+def _website_token(config: StorageConfig, window_offset: int = 0) -> str:
+    window = int(time.time() // WT_WINDOW_SECONDS) + window_offset
+    raw = (
+        f"{config.user_agent}::{config.language}::{config.token}::"
+        f"{window}::{config.wt_salt}"
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _signing_key(secret: str, date: str, region: str) -> bytes:
-    date_key = _hmac(("AWS4" + secret).encode("utf-8"), date)
-    region_key = _hmac(date_key, region)
-    service_key = _hmac(region_key, "s3")
-    return _hmac(service_key, "aws4_request")
-
-
-def _object_url(config: StorageConfig) -> tuple[str, str]:
-    parsed = urlsplit(config.endpoint)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError("HERMES_STORAGE_ENDPOINT_URL must be an http(s) URL")
-    bucket = quote(config.bucket, safe="-_.~")
-    key = quote(config.object_key, safe="/-_.~")
-    path = f"{parsed.path.rstrip('/')}/{bucket}/{key}"
-    url = urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
-    return url, path or "/"
-
-
-def _request(config: StorageConfig, method: str, body: bytes | None = None) -> bytes:
-    url, canonical_uri = _object_url(config)
-    parsed = urlsplit(url)
-    payload_hash = hashlib.sha256(body or b"").hexdigest()
-    now = dt.datetime.now(dt.timezone.utc)
-    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    short_date = now.strftime("%Y%m%d")
-    headers = {
-        "Host": parsed.netloc,
-        "x-amz-content-sha256": payload_hash,
-        "x-amz-date": amz_date,
+def _content_headers(config: StorageConfig, window_offset: int = 0) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {config.token}",
+        "X-Website-Token": _website_token(config, window_offset),
+        "X-BL": config.language,
+        "User-Agent": config.user_agent,
+        "Accept": "*/*",
+        "Origin": "https://gofile.io",
+        "Referer": "https://gofile.io/",
     }
-    if body is not None:
-        headers["Content-Type"] = "application/gzip"
 
-    canonical_headers = "".join(
-        f"{name.lower()}:{' '.join(value.strip().split())}\n"
-        for name, value in sorted(headers.items(), key=lambda item: item[0].lower())
-    )
-    signed_headers = ";".join(name.lower() for name in sorted(headers))
-    canonical_request = "\n".join(
-        [
-            method,
-            canonical_uri,
-            "",
-            canonical_headers,
-            signed_headers,
-            payload_hash,
-        ]
-    )
-    scope = f"{short_date}/{config.region}/s3/aws4_request"
-    string_to_sign = "\n".join(
-        [
-            "AWS4-HMAC-SHA256",
-            amz_date,
-            scope,
-            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-        ]
-    )
-    signature = hmac.new(
-        _signing_key(config.secret_key, short_date, config.region),
-        string_to_sign.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    headers["Authorization"] = (
-        "AWS4-HMAC-SHA256 "
-        f"Credential={config.access_key}/{scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
-    )
-    request = Request(url, data=body, headers=headers, method=method)
-    with urlopen(request, timeout=30) as response:
-        return response.read()
+
+def _api_url(path: str, query: dict[str, object] | None = None) -> str:
+    url = f"{GOFILE_API_URL}{path}"
+    if query:
+        url += "?" + urlencode(query)
+    return url
+
+
+def _json_request(
+    config: StorageConfig,
+    method: str,
+    path: str,
+    *,
+    query: dict[str, object] | None = None,
+    body: bytes | None = None,
+) -> dict:
+    headers = _content_headers(config)
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(_api_url(path, query), data=body, headers=headers, method=method)
+    with urlopen(request, timeout=45) as response:
+        payload = json.loads(response.read())
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        raise GofileError(f"GoFile {method} {path} failed: {payload!r}")
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _download(url: str, config: StorageConfig) -> bytes:
+    last_error: Exception | None = None
+    # The website token rotates every four hours. Retry the previous window
+    # around a boundary, matching the behavior of GoFile's web clients.
+    for offset in (0, -1):
+        headers = _content_headers(config, offset)
+        request = Request(url, headers=headers, method="GET")
+        try:
+            with urlopen(request, timeout=60) as response:
+                payload = response.read(config.max_archive_bytes + 1)
+            if len(payload) > config.max_archive_bytes:
+                raise GofileError(
+                    f"remote archive is larger than the {config.max_archive_bytes // (1024 * 1024)} MB limit"
+                )
+            return payload
+        except (HTTPError, URLError, OSError, GofileError) as exc:
+            last_error = exc
+            if isinstance(exc, HTTPError) and exc.code == 404:
+                break
+    raise GofileError(f"GoFile download failed: {last_error}")
+
+
+def _multipart_upload(config: StorageConfig, filename: str, payload: bytes) -> dict:
+    boundary = f"----hermes-gofile-{uuid.uuid4().hex}"
+    boundary_bytes = boundary.encode("ascii")
+    parts = [
+        b"--" + boundary_bytes + b"\r\n",
+        b'Content-Disposition: form-data; name="folderId"\r\n\r\n',
+        config.folder_id.encode("utf-8"),
+        b"\r\n--" + boundary_bytes + b"\r\n",
+        f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode(
+            "utf-8"
+        ),
+        b"Content-Type: application/gzip\r\n\r\n",
+        payload,
+        b"\r\n--" + boundary_bytes + b"--\r\n",
+    ]
+    body = b"".join(parts)
+    headers = _content_headers(config)
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    request = Request(GOFILE_UPLOAD_URL, data=body, headers=headers, method="POST")
+    with urlopen(request, timeout=120) as response:
+        result = json.loads(response.read())
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        raise GofileError(f"GoFile upload failed: {result!r}")
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise GofileError(f"GoFile upload returned no file metadata: {result!r}")
+    return data
 
 
 def _archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
     name = member.name.removeprefix("./").rstrip("/")
     if name == ".env" or name.startswith(".env/"):
         return None
-    # Render already keeps service logs, and log files can grow without bound.
     if name == "logs" or name.startswith("logs/"):
         return None
     # Do not copy sockets, device files, or symlinks into a new instance.
@@ -199,25 +227,69 @@ def _safe_extract(archive: tarfile.TarFile, data_dir: Path) -> None:
         archive.extract(member, path=data_dir)
 
 
+def _file_entries(config: StorageConfig) -> list[dict]:
+    # GoFile's current web API accepts the website token for free accounts.
+    # Ask for newest first and still sort locally for defensive compatibility.
+    data = _json_request(
+        config,
+        "GET",
+        f"/contents/{quote(config.folder_id, safe='-_.~')}",
+        query={
+            "wt": _website_token(config),
+            "page": 1,
+            "pageSize": 1000,
+            "contentFilter": "",
+            "sortField": "createTime",
+            "sortDirection": -1,
+        },
+    )
+    if data.get("type") != "folder":
+        raise GofileError("GOFILE_FOLDER_ID is not a folder owned by this token")
+    children = data.get("children", {})
+    if not isinstance(children, dict):
+        return []
+    entries = [
+        child
+        for child in children.values()
+        if isinstance(child, dict)
+        and child.get("type") == "file"
+        and str(child.get("name", "")).startswith(config.prefix)
+    ]
+    entries.sort(
+        key=lambda item: (item.get("createTime", 0), item.get("modTime", 0)),
+        reverse=True,
+    )
+    return entries
+
+
 def restore(data_dir: Path, config: StorageConfig) -> bool:
-    try:
-        payload = _request(config, "GET")
-    except HTTPError as exc:
-        if exc.code == 404:
-            LOG.info("no remote Hermes state found; starting with a clean instance")
-            return False
-        raise
-    if not payload:
-        LOG.warning("remote Hermes state archive was empty; ignoring it")
+    entries = _file_entries(config)
+    if not entries:
+        LOG.info("no GoFile Hermes state found; starting with a clean instance")
         return False
-    if len(payload) > config.max_archive_bytes:
-        raise ValueError(
-            f"remote state archive is larger than the {config.max_archive_bytes // (1024 * 1024)} MB safety limit"
-        )
+    link = entries[0].get("link")
+    if not isinstance(link, str) or not link:
+        raise GofileError("newest GoFile state file has no download link")
+    payload = _download(link, config)
+    if not payload:
+        raise GofileError("newest GoFile state file was empty")
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
         _safe_extract(archive, data_dir)
-    LOG.info("restored Hermes state from %s/%s", config.bucket, config.object_key)
+    LOG.info("restored Hermes state from GoFile folder %s", config.folder_id)
     return True
+
+
+def _delete_old_entries(config: StorageConfig, entries: list[dict], keep_id: str) -> None:
+    for entry in entries:
+        content_id = entry.get("id")
+        if not isinstance(content_id, str) or content_id == keep_id:
+            continue
+        try:
+            body = json.dumps({"contentsId": content_id}).encode("utf-8")
+            _json_request(config, "DELETE", "/contents", body=body)
+        except (GofileError, HTTPError, URLError, OSError) as exc:
+            # Keeping an older backup is safer than failing a successful upload.
+            LOG.warning("could not delete old GoFile backup %s: %s", content_id, exc)
 
 
 def sync_once(data_dir: Path, config: StorageConfig) -> bool:
@@ -233,8 +305,15 @@ def sync_once(data_dir: Path, config: StorageConfig) -> bool:
             return False
         archive_file.seek(0)
         payload = archive_file.read()
-    _request(config, "PUT", payload)
-    LOG.info("uploaded Hermes state archive (%d bytes)", len(payload))
+
+    filename = f"{config.prefix}{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:8]}.tar.gz"
+    old_entries = _file_entries(config)
+    metadata = _multipart_upload(config, filename, payload)
+    new_id = metadata.get("id") or metadata.get("fileId")
+    if not isinstance(new_id, str) or not new_id:
+        raise GofileError(f"GoFile upload did not return a file id: {metadata!r}")
+    _delete_old_entries(config, old_entries, new_id)
+    LOG.info("uploaded Hermes state to GoFile (%d bytes)", len(payload))
     return True
 
 
@@ -242,9 +321,8 @@ def _configured_or_log() -> StorageConfig | None:
     config = StorageConfig.from_env()
     if config is None:
         LOG.info(
-            "remote state sync disabled; set HERMES_STORAGE_ENDPOINT_URL, "
-            "HERMES_STORAGE_BUCKET, HERMES_STORAGE_ACCESS_KEY_ID, and "
-            "HERMES_STORAGE_SECRET_ACCESS_KEY to enable it"
+            "GoFile state sync disabled; set GOFILE_API_TOKEN and "
+            "GOFILE_FOLDER_ID to enable it"
         )
     return config
 
@@ -257,7 +335,7 @@ def run_daemon(data_dir: Path, config: StorageConfig) -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
-    LOG.info("remote state sync enabled; interval=%ss", config.interval)
+    LOG.info("GoFile state sync enabled; interval=%ss", config.interval)
 
     # Let the upstream entrypoint finish its first-boot directory setup before
     # the initial upload. Restore happens before setup in bootstrap.sh.
@@ -266,16 +344,16 @@ def run_daemon(data_dir: Path, config: StorageConfig) -> None:
     while not stop.is_set():
         try:
             sync_once(data_dir, config)
-        except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as exc:
-            LOG.warning("state upload failed; will retry: %s", exc)
+        except (GofileError, OSError, HTTPError, URLError, tarfile.TarError, ValueError) as exc:
+            LOG.warning("GoFile state upload failed; will retry: %s", exc)
         stop.wait(config.interval)
 
     # Render normally sends SIGTERM to the process group. Make a best-effort
     # final upload so a recent chat/config change is not lost.
     try:
         sync_once(data_dir, config)
-    except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as exc:
-        LOG.warning("final state upload failed: %s", exc)
+    except (GofileError, OSError, HTTPError, URLError, tarfile.TarError, ValueError) as exc:
+        LOG.warning("final GoFile state upload failed: %s", exc)
 
 
 def main() -> int:
@@ -284,8 +362,8 @@ def main() -> int:
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args()
     logging.basicConfig(
-        level=os.environ.get("HERMES_STORAGE_LOG_LEVEL", "INFO").upper(),
-        format="[hermes-storage] %(message)s",
+        level=os.environ.get("GOFILE_LOG_LEVEL", "INFO").upper(),
+        format="[hermes-gofile] %(message)s",
     )
     config = _configured_or_log()
     if config is None:
@@ -294,17 +372,17 @@ def main() -> int:
     if args.command == "restore":
         try:
             restore(args.data_dir, config)
-        except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as exc:
-            LOG.warning("state restore failed; continuing with local state: %s", exc)
-            # Tell bootstrap not to upload a fresh empty instance over a
-            # remote archive that could not be read.
+        except (GofileError, OSError, HTTPError, URLError, tarfile.TarError, ValueError) as exc:
+            LOG.warning("GoFile state restore failed; continuing with local state: %s", exc)
+            # Tell bootstrap not to upload a fresh instance over a remote
+            # archive that could not be read.
             return 2
         return 0
     if args.command == "sync":
         try:
             return 0 if sync_once(args.data_dir, config) else 1
-        except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as exc:
-            LOG.error("state upload failed: %s", exc)
+        except (GofileError, OSError, HTTPError, URLError, tarfile.TarError, ValueError) as exc:
+            LOG.error("GoFile state upload failed: %s", exc)
             return 1
     run_daemon(args.data_dir, config)
     return 0

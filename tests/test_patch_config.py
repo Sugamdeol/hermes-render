@@ -64,4 +64,5 @@ class PatchConfigTests(unittest.TestCase):
         self.assertIn("key: HERMES_HOME", service)
         self.assertIn("key: BYNARA_API_KEY", service)
         self.assertIn("key: OPENROUTER_API_KEY", service)
-        self.assertIn("key: HERMES_STORAGE_ENDPOINT_URL", service)
+        self.assertIn("key: GOFILE_API_TOKEN", service)
+        self.assertIn("key: GOFILE_FOLDER_ID", service)

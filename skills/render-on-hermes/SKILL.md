@@ -34,11 +34,11 @@ upstream skill assumes something that isn't true on this host.
 
 This template runs as a Render **Free** web service. Its `/opt/data` filesystem
 is ephemeral: it is reset after a spin-down or redeploy. Without the optional
-S3-compatible sync, do not tell the user that sessions, memories, dashboard
+GoFile sync, do not tell the user that sessions, memories, dashboard
 configuration, logs, or files saved there will persist. Provider keys, channel
 tokens, and other important configuration must live in Render environment
 variables, not only in `/opt/data/.env`; the sync archive intentionally
-excludes `.env`.
+excludes `.env` and logs.
 
 The Bynara router is available as `custom:bynara` and uses `BYNARA_API_KEY`.
 The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when
