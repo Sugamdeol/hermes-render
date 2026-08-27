@@ -72,6 +72,18 @@ FREE_LIMITS=0
 ENABLE_TUI=""
 DRY_RUN=0
 FOLLOW_LOGS=0
+ISOLATE=0
+
+# Variables that a second, simultaneously running instance (e.g. the Render
+# service) cannot safely share with this one. A chat-platform token can only be
+# consumed by one long-poller/socket at a time, and the GoFile folder is a
+# last-writer-wins snapshot of the whole /opt/data tree.
+CHANNEL_VARS=(
+  TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
+  SIGNAL_PHONE_NUMBER EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_IMAP_HOST
+  EMAIL_SMTP_HOST
+)
+STATE_SYNC_VARS=(GOFILE_API_TOKEN GOFILE_FOLDER_ID)
 
 # Secret-ish / user-supplied variables forwarded from your shell or .env.
 # Anything set in the env file is forwarded regardless; this list is what we
@@ -157,6 +169,10 @@ OPTIONS
                        (HERMES_DASHBOARD_TUI; Render default is off).
       --free-limits    Constrain the container to Render Free-ish resources
                        (512MB RAM, 0.5 CPU) to reproduce that environment.
+      --isolate        Do not forward chat-platform tokens or the GoFile
+                       token, so this instance cannot collide with a Render
+                       service running the same bot/backup folder. Chat via
+                       the dashboard or `./run-local.sh cli` instead.
       --foreground     Run in the foreground instead of detaching.
       --engine NAME    docker | podman (auto-detected).
       --dry-run        Print the commands instead of running them.
@@ -208,6 +224,7 @@ while [ $# -gt 0 ]; do
     --tui)            ENABLE_TUI=1; shift ;;
     --no-tui)         ENABLE_TUI=0; shift ;;
     --free-limits)    FREE_LIMITS=1; shift ;;
+    --isolate)        ISOLATE=1; shift ;;
     --foreground|-i)  DETACH=0; shift ;;
     --dry-run)        DRY_RUN=1; shift ;;
     -f|--follow)      FOLLOW_LOGS=1; shift ;;
@@ -316,6 +333,11 @@ set_env() {
   ENV_MAP["$key"]="$value"
 }
 
+unset_env() {
+  local key="$1"
+  if [ -n "${ENV_MAP[$key]+x}" ]; then unset 'ENV_MAP[$key]'; fi
+}
+
 gateway_token() {
   local file="$STATE_DIR/gateway-token"
   if [ -n "${HERMES_GATEWAY_TOKEN:-}" ]; then
@@ -399,6 +421,10 @@ build_env() {
   done
 
   # --- Local overrides ---------------------------------------------------
+  if [ "$ISOLATE" -eq 1 ]; then
+    local var
+    for var in "${CHANNEL_VARS[@]}" "${STATE_SYNC_VARS[@]}"; do unset_env "$var"; done
+  fi
   if [ -n "$ENABLE_TUI" ]; then set_env HERMES_DASHBOARD_TUI "$ENABLE_TUI"; fi
 
   # Keep the container's idea of its port aligned with the mapping.
@@ -410,6 +436,7 @@ write_env_file() {
   local out="$1" key
   ( umask 077; : > "$out" )
   for key in "${ENV_ORDER[@]}"; do
+    [ -n "${ENV_MAP[$key]+x}" ] || continue
     printf '%s=%s\n' "$key" "${ENV_MAP[$key]}" >> "$out"
   done
 }
@@ -503,6 +530,7 @@ cmd_up() {
   if [ -z "${ENV_MAP[RENDER_MCP_API_KEY]:-}" ]; then
     warn "RENDER_MCP_API_KEY is unset — the pre-registered Render MCP server will fail to authenticate."
   fi
+  warn_shared_identity
 
   run "$ENGINE" "${args[@]}" >/dev/null
   [ "$DRY_RUN" -eq 1 ] && return 0
@@ -531,6 +559,29 @@ cmd_up() {
 
   The dashboard has no authentication; it is bound to ${BIND_ADDR}.
 EOF
+}
+
+# One bot token / one GoFile folder cannot be shared with a second live
+# instance. Say so loudly before the container starts rather than after a
+# duplicated reply or a clobbered backup.
+warn_shared_identity() {
+  local var shared=() sync=()
+  for var in "${CHANNEL_VARS[@]}"; do
+    [ -n "${ENV_MAP[$var]:-}" ] && shared+=("$var")
+  done
+  for var in "${STATE_SYNC_VARS[@]}"; do
+    [ -n "${ENV_MAP[$var]:-}" ] && sync+=("$var")
+  done
+  [ "${#shared[@]}" -eq 0 ] && [ "${#sync[@]}" -eq 0 ] && return 0
+
+  warn "this instance claims a shared identity:"
+  [ "${#shared[@]}" -gt 0 ] && warn "  chat platforms : ${shared[*]}"
+  [ "${#sync[@]}"   -gt 0 ] && warn "  state sync     : ${sync[*]}"
+  warn "If the Render service is also running with the same values:"
+  [ "${#shared[@]}" -gt 0 ] && warn "  - incoming messages are split or duplicated between the two agents"
+  [ "${#sync[@]}"   -gt 0 ] && warn "  - each GoFile sync overwrites the other's /opt/data snapshot"
+  warn "Use a separate bot token locally, or start with --isolate to drop these."
+  return 0
 }
 
 wait_for_health() {
@@ -619,6 +670,7 @@ cmd_print_env() {
   build_env
   local key
   for key in "${ENV_ORDER[@]}"; do
+    [ -n "${ENV_MAP[$key]+x}" ] || continue
     printf '%s=%s\n' "$key" "$(redact "$key" "${ENV_MAP[$key]}")"
   done
 }

@@ -282,6 +282,44 @@ because it has no authentication. Use `--free-limits` to reproduce Free's
 `--rebuild` after changing anything in `scripts/`, `skills/`, or
 `dashboard-plugins/`.
 
+### Running local and Render at the same time
+
+The two instances are separate agents that share nothing except the identities
+you hand both of them. Three of those identities are single-consumer:
+
+| Shared value | What happens with two live instances |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Telegram allows one `getUpdates` poller per token. The second poller takes over and the other gets HTTP 409; messages land on whichever instance currently holds the connection, unpredictably. |
+| `DISCORD_BOT_TOKEN` | Both gateway connections receive every event, so the user gets two replies to each message. |
+| `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` / IMAP mailboxes | Events are split across connections, or races decide who claims each message. |
+| `GOFILE_API_TOKEN` (+ same folder) | Each sync uploads a full `/opt/data` snapshot and deletes the older archives with the same prefix. Last writer wins; the other instance's sessions and `.env` are lost, and its next boot restores the winner's tree. |
+
+Everything else diverges quietly: `/opt/data` is per-instance, so the two
+agents have separate session databases, memories, `config.yaml`, cron jobs, and
+installed skills. The same user talking to "the bot" gets answers from two
+different heads with different context. Cron jobs defined in a config that both
+instances hold will fire twice. A shared `RENDER_MCP_API_KEY` works fine
+technically — the MCP server is stateless — but both agents can then mutate the
+same Render resources.
+
+The safe patterns:
+
+- **Local for development, Render for real use** — start with
+  `./run-local.sh --isolate`, which drops the chat-platform tokens and the
+  GoFile token, and chat through the dashboard or `./run-local.sh cli`.
+- **Both on chat** — register a second bot with @BotFather (or a second Discord
+  app) and give the local instance its own token, with the same
+  `TELEGRAM_ALLOWED_USERS`.
+- **Both with remote state** — give the local instance a distinct
+  `GOFILE_FOLDER_NAME` (or `GOFILE_FOLDER_ID`), or leave GoFile off locally;
+  the Docker volume already persists state.
+- **Failover, not parallel** — suspend the Render service before pointing the
+  local instance at the production token. Note that a Free service does not
+  stop polling while it is awake; spinning down is not immediate.
+
+`run-local.sh up` prints a warning listing exactly which shared identities it is
+about to claim, so you find out before a duplicated reply or a clobbered backup.
+
 The script also works away from the repo: it carries a self-extracting copy of
 the build context, so a single copied `run-local.sh` can build and run on its
 own. Maintainers refresh that copy with `./run-local.sh update-embed` after
