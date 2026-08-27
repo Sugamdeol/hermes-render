@@ -129,7 +129,12 @@ From that card you can:
 
 - **Add provider** — name, base URL, API key *or* a `key_env` var, API mode
   (OpenAI `chat_completions` / Anthropic `anthropic_messages`, or auto), and an
-  optional default model.
+  optional default model. The plugin discovers models from every provider's
+  `/models` endpoint server-side, including keyless local endpoints and
+  Anthropic-compatible endpoints, so browser CORS settings do not matter.
+- **Refresh models** — re-query any provider and use the discovered model IDs
+  when setting it as the main model. A provider that does not implement
+  `/models` keeps its configured default model as a fallback.
 - **Set as main** — point `model.provider` at the new provider
   (`custom:<name>`) and pick the model, without leaving the page.
 - **Edit / Remove** — update or delete a provider. Removing a provider that is

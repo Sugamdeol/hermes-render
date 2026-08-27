@@ -6,9 +6,10 @@ The dashboard process imports this file at startup (see the ``api`` field in
 ``/api/plugins/render-api-providers/``.
 
 Endpoints
-  GET    /custom-providers         list custom providers from config.yaml
-  POST   /custom-providers         add (or update) a custom provider
-  DELETE /custom-providers/{key}   remove a custom provider
+  GET    /custom-providers             list custom providers and live model IDs
+  GET    /custom-providers/{key}/models refresh one provider's model IDs
+  POST   /custom-providers             add (or update) a custom provider
+  DELETE /custom-providers/{key}       remove a custom provider
 
 Where writes land
   Custom providers live in ``config.yaml``. Current Hermes releases
@@ -35,7 +36,11 @@ return plain dicts so they can be unit-tested without the hermes codebase
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import urllib.error
+import urllib.request
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
@@ -46,6 +51,8 @@ MAX_NAME_LEN = 64
 MAX_KEY_LEN = 64
 ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 API_MODES = ("", "chat_completions", "anthropic_messages")
+MODEL_FETCH_TIMEOUT = 5.0
+MAX_DISCOVERED_MODELS = 500
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +114,158 @@ def _first_str(raw: dict, *keys: str) -> str:
     return ""
 
 
+def _environment_value(name: str) -> str:
+    """Read a provider secret without ever returning it to the browser.
+
+    Render injects environment variables into the process, while a key entered
+    in Hermes' own Environment page is persisted in ``.env`` and may not be in
+    ``os.environ`` until the next restart.  Supporting both makes discovery
+    behave the same way as the runtime credential resolver.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        from hermes_cli.config import get_env_value
+
+        return str(get_env_value(name) or "").strip()
+    except Exception:
+        return ""
+
+
+def _provider_api_key(raw: dict) -> str:
+    """Resolve an inline key or key_env value for a raw config entry."""
+    inline = _first_str(raw, "api_key", "key")
+    if inline:
+        return inline
+    return _environment_value(_first_str(raw, "key_env", "api_key_env"))
+
+
+def _configured_model_ids(raw: dict) -> list[str]:
+    """Return model IDs already present in a provider config entry."""
+    model_ids: list[str] = []
+    for value in (_first_str(raw, "model", "default_model"),):
+        if value and value not in model_ids:
+            model_ids.append(value)
+
+    configured = raw.get("models")
+    if isinstance(configured, dict):
+        values = configured.keys()
+    elif isinstance(configured, list):
+        values = configured
+    else:
+        values = ()
+    for value in values:
+        if isinstance(value, dict):
+            value = _first_str(value, "id", "name", "model")
+        if isinstance(value, str) and value.strip() and value.strip() not in model_ids:
+            model_ids.append(value.strip())
+    return model_ids
+
+
+def _model_url_candidates(base_url: str) -> list[str]:
+    """Build the common endpoint and ``/v1`` fallback URLs for discovery."""
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        return []
+    candidates = [normalized + "/models"]
+    if normalized.lower().endswith("/v1"):
+        alternate = normalized[:-3].rstrip("/") + "/models"
+    else:
+        alternate = normalized + "/v1/models"
+    if alternate not in candidates:
+        candidates.append(alternate)
+    return candidates
+
+
+def _model_ids_from_response(payload: object) -> list[str] | None:
+    """Extract IDs from OpenAI-, Anthropic-, and common proxy responses."""
+    if isinstance(payload, dict):
+        if isinstance(payload.get("data"), list):
+            values = payload["data"]
+        elif isinstance(payload.get("models"), list):
+            values = payload["models"]
+        else:
+            return None
+    elif isinstance(payload, list):
+        values = payload
+    else:
+        return None
+
+    if not isinstance(values, list):
+        return None
+    model_ids: list[str] = []
+    for item in values:
+        if isinstance(item, str):
+            model_id = item.strip()
+        elif isinstance(item, dict):
+            model_id = _first_str(item, "id", "name", "model")
+        else:
+            model_id = ""
+        if model_id and model_id not in model_ids:
+            model_ids.append(model_id)
+        if len(model_ids) >= MAX_DISCOVERED_MODELS:
+            break
+    return model_ids
+
+
+def fetch_custom_provider_models(
+    raw: dict,
+    *,
+    timeout: float = MODEL_FETCH_TIMEOUT,
+) -> list[str] | None:
+    """Fetch model IDs from one custom provider's ``/models`` endpoint.
+
+    ``None`` means the endpoint could not be reached or parsed; an empty list
+    means it responded successfully but advertised no models.  Both OpenAI
+    compatible and Anthropic Messages authentication are supported.  The
+    request is made server-side so provider keys never enter browser requests
+    (and so endpoints that do not enable CORS work normally).
+    """
+    if not isinstance(raw, dict):
+        return None
+    base_url = _first_str(raw, "base_url", "url", "api")
+    if not base_url:
+        return None
+    api_key = _provider_api_key(raw)
+    api_mode = _first_str(raw, "api_mode", "transport").lower()
+    parsed = urlparse(base_url)
+    hostname = (parsed.hostname or "").lower()
+    if not api_mode and (
+        hostname == "api.anthropic.com"
+        or base_url.rstrip("/").lower().endswith("/anthropic")
+    ):
+        api_mode = "anthropic_messages"
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "hermes-render-provider-discovery/1",
+    }
+    if api_key and api_mode == "anthropic_messages":
+        headers["x-api-key"] = api_key
+        headers["anthropic-version"] = "2023-06-01"
+    elif api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    for url in _model_url_candidates(base_url):
+        try:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return _model_ids_from_response(payload)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
+            continue
+        except Exception:
+            # A provider implementation should not make the Models page fail
+            # for every other provider. Treat unexpected response/transport
+            # errors as an unavailable discovery endpoint too.
+            continue
+    return None
+
+
 def _normalize_entry(raw: dict, *, key: str = "", source: str) -> dict | None:
     """Reduce a raw config entry (either schema) to the API's entry shape."""
     base_url = _first_str(raw, "base_url", "url", "api")
@@ -122,17 +281,43 @@ def _normalize_entry(raw: dict, *, key: str = "", source: str) -> dict | None:
         "base_url": base_url.rstrip("/"),
         "api_mode": _first_str(raw, "api_mode", "transport"),
         "model": _first_str(raw, "model", "default_model"),
+        "models": _configured_model_ids(raw),
         "key_env": _first_str(raw, "key_env", "api_key_env"),
         "has_api_key": bool(_first_str(raw, "api_key")),
         "source": source,
     }
 
 
-def list_custom_provider_entries(config: dict) -> list[dict]:
+def _decorate_with_discovered_models(entry: dict, raw: dict, *, fetch_models: bool) -> dict:
+    """Attach live model IDs while retaining configured IDs as a fallback."""
+    if not fetch_models:
+        return entry
+    discover = raw.get("discover_models", True)
+    if isinstance(discover, str):
+        discover = discover.strip().lower() not in ("false", "no", "0")
+    if discover is False:
+        entry["models_fetched"] = False
+        return entry
+    live_models = fetch_custom_provider_models(raw)
+    if live_models is not None:
+        entry["models"] = live_models
+        entry["models_fetched"] = True
+    else:
+        entry["models_fetched"] = False
+    return entry
+
+
+def list_custom_provider_entries(
+    config: dict,
+    *,
+    fetch_models: bool = False,
+) -> list[dict]:
     """All custom providers across both schemas, deduplicated.
 
     The canonical ``providers:`` mapping wins; a legacy list entry is
-    skipped when a canonical entry matches it by (name, base_url).
+    skipped when a canonical entry matches it by (name, base_url).  When
+    ``fetch_models`` is true, every returned provider is probed server-side,
+    including keyless endpoints and Anthropic-compatible endpoints.
     """
     entries: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -145,6 +330,7 @@ def list_custom_provider_entries(config: dict) -> list[dict]:
             entry = _normalize_entry(raw, key=str(key), source="providers")
             if entry is None:
                 continue
+            entry = _decorate_with_discovered_models(entry, raw, fetch_models=fetch_models)
             entries.append(entry)
             seen.add((entry["name"].lower(), entry["base_url"].lower()))
 
@@ -158,6 +344,7 @@ def list_custom_provider_entries(config: dict) -> list[dict]:
                 continue
             if (entry["name"].lower(), entry["base_url"].lower()) in seen:
                 continue
+            entry = _decorate_with_discovered_models(entry, raw, fetch_models=fetch_models)
             entries.append(entry)
 
     return entries
@@ -352,6 +539,31 @@ def _parse_upsert_body(body: dict) -> dict:
     return fields
 
 
+def _raw_entry_for_key(config: dict, key: str) -> dict | None:
+    """Find the on-disk entry for a canonical or legacy provider key."""
+    requested = str(key or "").strip().lower()
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for stored_key, raw in providers.items():
+            if str(stored_key).strip().lower() == requested and isinstance(raw, dict):
+                return raw
+
+    legacy = config.get("custom_providers")
+    if isinstance(legacy, list):
+        for raw in legacy:
+            if not isinstance(raw, dict):
+                continue
+            stored_key = _first_str(raw, "provider_key")
+            if not stored_key:
+                try:
+                    stored_key = provider_key_from_name(_first_str(raw, "name"))
+                except ValueError:
+                    continue
+            if stored_key.lower() == requested:
+                return raw
+    return None
+
+
 def _entry_for_response(config: dict, key: str) -> dict:
     for entry in list_custom_provider_entries(config):
         if entry["key"] == key:
@@ -365,9 +577,40 @@ async def list_custom_providers(request: Request):
     load_config, _ = _config_backend()
     config = load_config()
     return {
-        "providers": list_custom_provider_entries(config),
+        # Probe every provider here rather than relying on the upstream
+        # picker, whose older releases only discovered entries with an
+        # inline api_key.  This also covers key_env, keyless local servers,
+        # and Anthropic-compatible transports.
+        "providers": list_custom_provider_entries(config, fetch_models=True),
         "main_provider": current_main_provider(config),
     }
+
+
+@router.get("/custom-providers/{key}/models")
+async def list_custom_provider_models(request: Request, key: str):
+    """Refresh one provider's model list without exposing its credentials."""
+    _require_session(request)
+    load_config, _ = _config_backend()
+    config = load_config()
+    raw = _raw_entry_for_key(config, key)
+    if raw is None:
+        raise HTTPException(status_code=404, detail=f"provider '{key}' not found")
+
+    models = fetch_custom_provider_models(raw)
+    if models is None:
+        # Keep the configured/default model useful when a provider does not
+        # implement GET /models, but make the failed live discovery explicit
+        # to the UI instead of silently pretending it was fetched.
+        return {
+            "provider": str(key),
+            "models": _configured_model_ids(raw),
+            "fetched": False,
+            "detail": (
+                "The provider model endpoint could not be reached or returned "
+                "an unsupported response."
+            ),
+        }
+    return {"provider": str(key), "models": models, "fetched": True}
 
 
 @router.post("/custom-providers")

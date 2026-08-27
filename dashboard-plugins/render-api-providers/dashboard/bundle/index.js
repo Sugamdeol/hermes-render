@@ -316,6 +316,27 @@
     var ui = state[0];
     var setUi = state[1];
     var [error, setError] = useState(null);
+    var modelState = useState(entry.models || []);
+    var availableModels = modelState[0];
+    var setAvailableModels = modelState[1];
+    var [modelsFetched, setModelsFetched] = useState(!!entry.models_fetched);
+
+    useEffect(function () {
+      setAvailableModels(entry.models || []);
+      setModelsFetched(!!entry.models_fetched);
+    }, [entry.key, entry.models, entry.models_fetched, setAvailableModels, setModelsFetched]);
+
+    var refreshModels = async function () {
+      setError(null);
+      try {
+        var refreshed = await fetchJSON(API_BASE + "/" + encodeURIComponent(entry.key) + "/models");
+        setAvailableModels(refreshed.models || []);
+        setModelsFetched(!!refreshed.fetched);
+        if (!refreshed.fetched && refreshed.detail) setError(refreshed.detail);
+      } catch (err) {
+        setError(apiErrorMessage(err));
+      }
+    };
 
     var setMain = useCallback(
       async function (model) {
@@ -384,6 +405,9 @@
       : entry.key_env
         ? "env " + entry.key_env
         : "no key";
+    var modelBadge = availableModels.length
+      ? (modelsFetched ? "models: " : "configured: ") + availableModels.length
+      : "models unavailable";
 
     return h(
       "div",
@@ -407,6 +431,7 @@
               { tone: "secondary", className: "rapi-badge" },
               entry.api_mode || "auto",
             ),
+            h(Badge, { tone: "secondary", className: "rapi-badge" }, modelBadge),
             entry.model
               ? h(Badge, { tone: "secondary", className: "rapi-badge" }, "model: " + entry.model)
               : null,
@@ -434,6 +459,7 @@
                       var next = {};
                       for (var k in prev) next[k] = prev[k];
                       next.modelPrompt = true;
+                      next.modelValue = availableModels.length ? availableModels[0] : "";
                       return next;
                     });
                   },
@@ -441,6 +467,17 @@
                 "Set as main",
               )
             : null,
+          h(
+            Button,
+            {
+              type: "button",
+              size: "sm",
+              outlined: true,
+              disabled: ui.busy,
+              onClick: refreshModels,
+            },
+            "Refresh models",
+          ),
           h(
             Button,
             {
@@ -470,19 +507,37 @@
         ? h(
             "div",
             { className: "rapi-model-input" },
-            h(Input, {
-              value: ui.modelValue,
-              placeholder: "Model ID, e.g. qwen-3.8-max-free",
-              maxLength: 200,
-              onChange: function (e) {
-                setUi(function (prev) {
-                  var next = {};
-                  for (var k in prev) next[k] = prev[k];
-                  next.modelValue = e.target.value;
-                  return next;
-                });
-              },
-            }),
+            availableModels.length
+              ? h(
+                  Select,
+                  {
+                    value: ui.modelValue,
+                    onValueChange: function (value) {
+                      setUi(function (prev) {
+                        var next = {};
+                        for (var k in prev) next[k] = prev[k];
+                        next.modelValue = value;
+                        return next;
+                      });
+                    },
+                  },
+                  availableModels.map(function (modelId) {
+                    return h(SelectOption, { key: modelId, value: modelId }, modelId);
+                  }),
+                )
+              : h(Input, {
+                  value: ui.modelValue,
+                  placeholder: "Model ID, e.g. qwen-3.8-max-free",
+                  maxLength: 200,
+                  onChange: function (e) {
+                    setUi(function (prev) {
+                      var next = {};
+                      for (var k in prev) next[k] = prev[k];
+                      next.modelValue = e.target.value;
+                      return next;
+                    });
+                  },
+                }),
             h(
               Button,
               {

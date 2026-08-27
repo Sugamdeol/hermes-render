@@ -7,6 +7,9 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import urllib.error
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +45,22 @@ class _FakeHTTPException(Exception):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+
+
+class _FakeURLResponse:
+    def __init__(self, payload: object) -> None:
+        import json
+
+        self.body = json.dumps(payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.body
 
 
 def _install_stubs(
@@ -154,6 +173,106 @@ class NormalizationTests(unittest.TestCase):
             self.mod.normalize_key_env("1KEY")
         with self.assertRaises(ValueError):
             self.mod.normalize_key_env("MY-KEY")
+
+
+class ModelDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {}
+        self.mod = load_plugin_api(self.env)
+
+    def test_keyless_openai_endpoint_is_discovered(self):
+        requests = []
+
+        def urlopen(request, timeout):
+            requests.append(request)
+            return _FakeURLResponse({"data": [{"id": "local-a"}, {"id": "local-b"}]})
+
+        with patch.object(self.mod.urllib.request, "urlopen", side_effect=urlopen):
+            models = self.mod.fetch_custom_provider_models(
+                {"base_url": "http://127.0.0.1:8000/v1"}
+            )
+
+        self.assertEqual(models, ["local-a", "local-b"])
+        self.assertEqual(requests[0].full_url, "http://127.0.0.1:8000/v1/models")
+        self.assertIsNone(requests[0].get_header("Authorization"))
+
+    def test_anthropic_mode_uses_anthropic_auth(self):
+        requests = []
+
+        def urlopen(request, timeout):
+            requests.append(request)
+            return _FakeURLResponse({"data": [{"id": "claude-test"}]})
+
+        with patch.object(self.mod.urllib.request, "urlopen", side_effect=urlopen):
+            models = self.mod.fetch_custom_provider_models(
+                {
+                    "base_url": "https://llm.example.com/v1",
+                    "api_key": "secret",
+                    "api_mode": "anthropic_messages",
+                }
+            )
+
+        self.assertEqual(models, ["claude-test"])
+        self.assertEqual(requests[0].get_header("X-api-key"), "secret")
+        self.assertEqual(requests[0].get_header("Anthropic-version"), "2023-06-01")
+        self.assertIsNone(requests[0].get_header("Authorization"))
+
+    def test_v1_fallback_and_key_env_are_supported(self):
+        requests = []
+
+        def urlopen(request, timeout):
+            requests.append(request)
+            if request.full_url.endswith("/models") and not request.full_url.endswith("/v1/models"):
+                raise urllib.error.HTTPError(request.full_url, 404, "missing", {}, None)
+            return _FakeURLResponse({"models": ["fallback-model"]})
+
+        with patch.dict("os.environ", {"CUSTOM_DISCOVERY_KEY": "env-secret"}, clear=False):
+            with patch.object(self.mod.urllib.request, "urlopen", side_effect=urlopen):
+                models = self.mod.fetch_custom_provider_models(
+                    {
+                        "base_url": "https://llm.example.com",
+                        "key_env": "CUSTOM_DISCOVERY_KEY",
+                    }
+                )
+
+        self.assertEqual(models, ["fallback-model"])
+        self.assertEqual(requests[0].get_header("Authorization"), "Bearer env-secret")
+        self.assertEqual(requests[1].full_url, "https://llm.example.com/v1/models")
+
+    def test_listing_fetches_models_for_each_custom_provider(self):
+        responses = iter(
+            [
+                _FakeURLResponse({"data": [{"id": "provider-a-model"}]}),
+                _FakeURLResponse({"data": [{"id": "provider-b-model"}]}),
+            ]
+        )
+
+        with patch.dict("os.environ", {"PROVIDER_A_KEY": "a-secret"}, clear=False):
+            with patch.object(
+                self.mod.urllib.request, "urlopen", side_effect=lambda request, timeout: next(responses)
+            ):
+                entries = self.mod.list_custom_provider_entries(
+                    {
+                        "providers": {
+                            "provider-a": {
+                                "name": "Provider A",
+                                "base_url": "https://a.example/v1",
+                                "key_env": "PROVIDER_A_KEY",
+                            },
+                            "provider-b": {
+                                "name": "Provider B",
+                                "base_url": "http://127.0.0.1:8000/v1",
+                            },
+                        }
+                    },
+                    fetch_models=True,
+                )
+
+        self.assertEqual([entry["models"] for entry in entries], [
+            ["provider-a-model"],
+            ["provider-b-model"],
+        ])
+        self.assertTrue(all(entry["models_fetched"] for entry in entries))
 
 
 class ListEntriesTests(unittest.TestCase):

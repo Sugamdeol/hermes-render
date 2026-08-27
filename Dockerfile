@@ -65,6 +65,16 @@ if old not in text:
 path.write_text(text.replace(old, new, 1), encoding="utf-8")
 PY
 
+# The upstream model picker historically only queried /models for custom
+# providers with an inline api_key. That omits key_env and keyless endpoints,
+# and uses Bearer auth even for Anthropic-compatible custom providers. Patch
+# the pinned picker so every custom provider added by the dashboard can be
+# discovered. The patch script is exact and fails the build if the upstream
+# source changes underneath the pin.
+COPY scripts/patch-model-discovery.py /opt/render-tools/patch-model-discovery.py
+RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-model-discovery.py \
+    /opt/hermes/hermes_cli/model_switch.py
+
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
 # upstream Hermes skills-sync flow never touches these files. To upgrade,
