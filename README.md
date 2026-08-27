@@ -5,6 +5,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) (the self-im
 - The [Render MCP server](https://render.com/docs/mcp-server) registered in `config.yaml` at boot, so MCP tools appear as `mcp_render_list_services`, `mcp_render_get_metrics`, `mcp_render_list_logs`, etc. The agent gets the full MCP tool catalog that your API key can use.
 - The official [render-oss/skills](https://github.com/render-oss/skills) bundle (22 Render skills) pinned at a commit and exposed via `skills.external_dirs`.
 - A `render-on-hermes` overlay skill that tells the agent the MCP server is already wired up, that the CLI is not installed, and how to behave when an upstream skill expects either.
+- A [dashboard plugin](#adding-api-providers-from-the-dashboard) that adds a "Custom API providers" card to the dashboard's Models page, so new OpenAI/Anthropic-compatible API providers can be added from the web UI instead of hand-editing `config.yaml`.
 
 [![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy-template/api/github/start?template_repo=hermes-render)
 
@@ -51,14 +52,15 @@ The Free service has an ephemeral filesystem. `/opt/data` holds the config (`con
 
 ## What's pre-baked for Render
 
-The `Dockerfile` adds two layers on top of `nousresearch/hermes-agent`:
+The `Dockerfile` adds three layers on top of `nousresearch/hermes-agent`:
 
 | Layer | Path in container | Source | Pinned via |
 |---|---|---|---|
 | Render skill bundle | `/opt/render-tools/skills-upstream/` | [render-oss/skills](https://github.com/render-oss/skills) tarball | `RENDER_SKILLS_REF` ARG (commit SHA) |
 | Hermes-on-Render overlay | `/opt/render-tools/skills-local/` | [`./skills/`](./skills) in this repo | This repo's commits |
+| Dashboard plugins | `/opt/render-tools/dashboard-plugins/` | [`./dashboard-plugins/`](./dashboard-plugins) in this repo | This repo's commits |
 
-On every boot, [`scripts/bootstrap.sh`](scripts/bootstrap.sh) restores optional remote state and runs an idempotent patcher ([`scripts/patch-config.py`](scripts/patch-config.py)) that adds the Render MCP server, Bynara provider, and external skill directories to `/opt/data/config.yaml` if they're missing:
+On every boot, [`scripts/bootstrap.sh`](scripts/bootstrap.sh) restores optional remote state, installs the bundled dashboard plugins into `$HERMES_HOME/plugins/`, and runs an idempotent patcher ([`scripts/patch-config.py`](scripts/patch-config.py)) that adds the Render MCP server, Bynara provider, and external skill directories to `/opt/data/config.yaml` if they're missing:
 
 ```yaml
 mcp_servers:
@@ -115,6 +117,42 @@ The key is referenced through `key_env`, so it is never written into
 `config.yaml` by this repository. To reach the agent from Telegram, also add
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USERS` in Render's **Environment**
 tab. Use a comma-separated allowlist if you need more than one Telegram user.
+
+## Adding API providers from the dashboard
+
+By default, adding a new LLM provider means editing `config.yaml` by hand.
+This image ships a [dashboard plugin](./dashboard-plugins/render-api-providers)
+(`render-api-providers`) that adds a **Custom API providers** card to the top
+of the dashboard's **Models** page so you can do it from the browser instead.
+
+From that card you can:
+
+- **Add provider** — name, base URL, API key *or* a `key_env` var, API mode
+  (OpenAI `chat_completions` / Anthropic `anthropic_messages`, or auto), and an
+  optional default model.
+- **Set as main** — point `model.provider` at the new provider
+  (`custom:<name>`) and pick the model, without leaving the page.
+- **Edit / Remove** — update or delete a provider. Removing a provider that is
+  currently the main model is blocked until you switch models first.
+
+Each add/edit writes the canonical `providers:` entry in
+`/opt/data/config.yaml` (falling back to the legacy `custom_providers:` list
+for pre-v12 configs) and applies to **new sessions** — the currently running
+chat tab is not affected, matching Hermes' normal model-switch behavior. The
+provider immediately shows up in the Models page picker and the `/model`
+command.
+
+> **Keys:** prefer `key_env` over pasting an inline API key. Render
+> environment variables survive restarts and redeploys; an inline key lives
+> only in the (ephemeral) `config.yaml` unless you have [GoFile
+> sync](#keeping-files-on-free-with-gofile) enabled. The card lists which
+> source each provider uses and never echoes a stored key back to the browser.
+
+The plugin is image-managed: [`scripts/bootstrap.sh`](scripts/bootstrap.sh)
+reinstalls it into `$HERMES_HOME/plugins/` on every boot, so the bundled
+version always wins over a restored or locally edited copy. To hide the card,
+use the visibility toggle on the dashboard's Plugins page — the plugin stays
+installed but its slot stops rendering.
 
 ## Prerequisites
 
@@ -379,6 +417,7 @@ On Render Free, a Tailscale sidecar/private-network path is not supported becaus
 #### Notes
 
 - These options compose. For example, an auth gateway can still sit behind a private network path.
+- The bundled [render-api-providers](#adding-api-providers-from-the-dashboard) plugin is one extension of the same unauthenticated dashboard surface. Upstream excludes `/api/plugins/*` from the dashboard's session-token middleware, so the plugin's backend re-checks that token on every route and refuses to serve (503) rather than run ungated if the check is unavailable. Still, this does not replace locking the dashboard down.
 - The OpenAI-compatible API server (`API_SERVER_ENABLED=true`) is separate from the dashboard. It uses a bearer token (`API_SERVER_KEY`), so it's safe to expose with a long random key, but this Blueprint doesn't route it publicly.
 - For broader Hermes security guidance see the [upstream security doc](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/security.md).
 

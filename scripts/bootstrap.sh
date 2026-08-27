@@ -80,6 +80,38 @@ else
   echo "[render-tools] warning: ${PATCHER} not found or not executable; skipping" >&2
 fi
 
+# Install the image-managed dashboard plugin(s) into $HERMES_HOME/plugins/,
+# where the dashboard scans for dashboard/manifest.json. Image wins over any
+# restored or local copy on every boot (same convention as the Bynara
+# provider entry and the baked skill bundles). The dashboard's "Add API
+# provider" card on the Models page is provided by render-api-providers.
+# Runs after state restore (a restored copy must not shadow the image) and
+# before the sync daemon starts (the image copy is what gets backed up).
+PLUGINS_SRC="/opt/render-tools/dashboard-plugins"
+PLUGINS_DST="${DATA_DIR}/plugins"
+if [ -d "${PLUGINS_SRC}" ]; then
+  if mkdir -p "${PLUGINS_DST}" 2>/dev/null && chown hermes:hermes "${PLUGINS_DST}" 2>/dev/null; then
+    plugin_install_ok=1
+    for p in "${PLUGINS_SRC}"/*/; do
+      [ -d "${p}" ] || continue
+      plugin_name="$(basename "${p}")"
+      # Replace any restored/local copy wholesale so the bundled version
+      # always wins, and drop stale files from older image versions.
+      if ! gosu hermes rm -rf "${PLUGINS_DST}/${plugin_name}" \
+        || ! gosu hermes cp -rf "${p}" "${PLUGINS_DST}/"; then
+        plugin_install_ok=0
+      fi
+    done
+    if [ "${plugin_install_ok}" -eq 1 ]; then
+      echo "[render-tools] installed dashboard plugin(s) into ${PLUGINS_DST}"
+    else
+      echo "[render-tools] warning: dashboard plugin install failed; continuing without" >&2
+    fi
+  else
+    echo "[render-tools] warning: could not prepare ${PLUGINS_DST}; dashboard plugins stay image-baked" >&2
+  fi
+fi
+
 # Keep a remote snapshot up to date in the background. The worker is started
 # as hermes so it cannot read files outside the data directory. It is fully
 # optional and exits cleanly when storage credentials are not configured.

@@ -91,6 +91,13 @@ RUN set -eu; \
 # overlays would shadow upstream entries.
 COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 
+# Dashboard plugin(s) installed into $HERMES_HOME/plugins/ at boot by
+# bootstrap.sh (image-managed, same convention as the Bynara config
+# entry). render-api-providers adds an "Add API provider" card to the
+# dashboard Models page so custom providers no longer require
+# hand-editing config.yaml.
+COPY --chown=hermes:hermes dashboard-plugins/ /opt/render-tools/dashboard-plugins/
+
 # Boot-time wrapper: restores optional remote state, patches
 # /opt/data/config.yaml, starts optional state sync, then hands off to the
 # upstream entrypoint chain (tini → docker/entrypoint.sh).
