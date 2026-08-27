@@ -1,0 +1,17 @@
+{
+  "name": "render-api-providers",
+  "label": "API Providers",
+  "description": "Add OpenAI- or Anthropic-compatible API providers directly from the dashboard (Models page) instead of hand-editing config.yaml.",
+  "icon": "KeyRound",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/api-providers",
+    "hidden": true
+  },
+  "slots": [
+    "models:top"
+  ],
+  "entry": "bundle/index.js",
+  "css": "bundle/style.css",
+  "api": "plugin_api.py"
+}

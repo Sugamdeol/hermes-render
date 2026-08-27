@@ -8,6 +8,9 @@
 #   - The official render-oss/skills bundle, pinned at a commit
 #   - The Render MCP server pre-registered in config.yaml at boot
 #     with the full MCP tool catalog available to the provided API key
+#   - A dashboard plugin ("Custom API providers" card on the Models page)
+#     for adding new API providers from the web UI instead of editing
+#     config.yaml by hand
 #
 # Inside the container the gateway runs in the foreground and the
 # dashboard runs as a background side-process (HERMES_DASHBOARD=1).
