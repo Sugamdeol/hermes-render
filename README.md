@@ -256,6 +256,37 @@ The dashboard's **Chat** tab is optional on Free because the full TUI creates a 
 
 The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
 
+## Run it locally
+
+[`run-local.sh`](./run-local.sh) is a single self-contained script that runs the
+same agent on your own machine: the same `Dockerfile` (same pinned Hermes tag
+and `render-oss/skills` commit), the same boot patcher, the same overlay skill
+and dashboard plugin, and the same environment variables `render.yaml`
+declares. It needs only Docker (or Podman).
+
+```bash
+OPENROUTER_API_KEY=sk-or-... ./run-local.sh      # build + start on http://127.0.0.1:10000
+./run-local.sh logs -f                            # follow the gateway
+./run-local.sh cli                                # interactive hermes CLI in the container
+./run-local.sh down                               # stop (data volume kept)
+./run-local.sh --help                             # all commands and flags
+```
+
+Secrets come from a local `.env` (copy `.env.example`) or from exported shell
+variables; nothing is written back into the repo. Two deliberate differences
+from Render Free: `/opt/data` is a persistent Docker volume, so config,
+sessions, memories, and skills survive restarts (add `--data-dir ./hermes-data`
+to bind-mount a directory instead), and the dashboard binds to `127.0.0.1`
+because it has no authentication. Use `--free-limits` to reproduce Free's
+512MB/0.5-CPU squeeze, `--tui` to enable the in-browser chat TUI, and
+`--rebuild` after changing anything in `scripts/`, `skills/`, or
+`dashboard-plugins/`.
+
+The script also works away from the repo: it carries a self-extracting copy of
+the build context, so a single copied `run-local.sh` can build and run on its
+own. Maintainers refresh that copy with `./run-local.sh update-embed` after
+changing the baked-in files.
+
 ## Cost expectations
 
 This Blueprint uses Render's **Free** web-service instance. It has no service charge, but Free usage is subject to Render's monthly instance-hour allowance and the service spins down after inactivity. The next request may wait for a cold start. There is no persistent-disk charge because Free services cannot attach persistent disks.
