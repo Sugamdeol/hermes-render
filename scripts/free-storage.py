@@ -8,9 +8,11 @@ fresh archive while Hermes is running. It keeps one current archive by deleting
 older matching backups after a successful upload. Syncs are metadata-aware and
 run at low priority so idle Free instances do not repeatedly recompress state.
 
-The archive excludes /opt/data/.env and runtime logs. Render environment
-variables are the durable source for secrets, and Render already retains
-service logs. No third-party Python package is required.
+The archive contains the complete Hermes data directory, including
+``.env`` and runtime logs, so dashboard settings, credentials, sessions, and
+user-created files survive a replacement. Treat the configured GoFile folder
+as sensitive because the archive contains secrets. No third-party Python
+package is required.
 """
 from __future__ import annotations
 
@@ -95,7 +97,7 @@ class StorageConfig:
             folder_name=os.environ.get("GOFILE_FOLDER_NAME", "hermes-render-state"),
             prefix=os.environ.get("GOFILE_STATE_PREFIX", "hermes-state-"),
             interval=positive_int("GOFILE_SYNC_INTERVAL_SECONDS", 300),
-            max_archive_bytes=positive_int("GOFILE_MAX_ARCHIVE_MB", 25) * 1024 * 1024,
+            max_archive_bytes=positive_int("GOFILE_MAX_ARCHIVE_MB", 100) * 1024 * 1024,
             user_agent=os.environ.get("GOFILE_USER_AGENT", DEFAULT_USER_AGENT),
             language=os.environ.get("GOFILE_LANGUAGE", "en-US"),
             wt_salt=os.environ.get("GOFILE_WT_SALT", GOFILE_WT_SALT),
@@ -234,10 +236,9 @@ def _multipart_upload(
 
 
 def _archive_filter(member: tarfile.TarInfo) -> tarfile.TarInfo | None:
-    name = member.name.removeprefix("./").rstrip("/")
-    if ".env" in Path(name).parts or "logs" in Path(name).parts:
-        return None
-    # Do not copy sockets, device files, or symlinks into a new instance.
+    # Archive every regular data file, including dotfiles, .env, and logs.
+    # Sockets and device files cannot be meaningfully restored into a new
+    # container and must not be copied from a remote archive.
     if not (member.isdir() or member.isfile()):
         return None
     return member
@@ -349,16 +350,16 @@ def _state_fingerprint(data_dir: Path) -> str:
     """Return a cheap metadata fingerprint for change-aware syncs.
 
     Reading metadata is much cheaper than recompressing /opt/data every
-    minute. The archive filter and this walk intentionally exclude the same
-    secret/log paths and non-regular filesystem entries.
+    minute. This walk covers every regular file in the data directory,
+    including .env and logs, and skips only symlinked/non-directory entries
+    that the archive filter cannot restore safely.
     """
     digest = hashlib.blake2b(digest_size=16)
     for root, dirs, files in os.walk(data_dir, topdown=True, followlinks=False):
         dirs[:] = sorted(
             name
             for name in dirs
-            if name not in {".env", "logs"}
-            and not (Path(root) / name).is_symlink()
+            if not (Path(root) / name).is_symlink()
         )
         for name in dirs:
             path = Path(root) / name
@@ -373,8 +374,6 @@ def _state_fingerprint(data_dir: Path) -> str:
                 f"D\\0{relative}\\0{info.st_mtime_ns}\\0{info.st_mode & 0o7777}\\n".encode()
             )
         for name in sorted(files):
-            if name == ".env":
-                continue
             path = Path(root) / name
             try:
                 info = path.lstat()

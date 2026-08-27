@@ -22,7 +22,7 @@ def load_storage():
 
 
 class FreeStorageTests(unittest.TestCase):
-    def test_archive_excludes_env_file(self):
+    def test_archive_includes_all_regular_state_files(self):
         storage = load_storage()
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -37,9 +37,9 @@ class FreeStorageTests(unittest.TestCase):
             archive_bytes.seek(0)
             with tarfile.open(fileobj=archive_bytes, mode="r:gz") as archive:
                 names = {member.name.removeprefix("./") for member in archive.getmembers()}
-            self.assertNotIn(".env", names)
-            self.assertNotIn("logs", names)
-            self.assertNotIn("logs/gateway.log", names)
+            self.assertIn(".env", names)
+            self.assertIn("logs", names)
+            self.assertIn("logs/gateway.log", names)
             self.assertIn("config.yaml", names)
 
     def test_storage_is_disabled_without_gofile_token(self):
@@ -54,7 +54,7 @@ class FreeStorageTests(unittest.TestCase):
             if old_alias is not None:
                 os.environ["GOFILE_TOKEN"] = old_alias
 
-    def test_state_fingerprint_ignores_logs_and_env(self):
+    def test_state_fingerprint_includes_logs_and_env(self):
         storage = load_storage()
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
@@ -69,8 +69,11 @@ class FreeStorageTests(unittest.TestCase):
 
             first = storage._state_fingerprint(data_dir)
             log_file.write_text("second and different\n")
+            self.assertNotEqual(first, storage._state_fingerprint(data_dir))
+
+            second = storage._state_fingerprint(data_dir)
             env_file.write_text("SECRET=two\n")
-            self.assertEqual(first, storage._state_fingerprint(data_dir))
+            self.assertNotEqual(second, storage._state_fingerprint(data_dir))
 
             config_file.write_text("model: changed\n")
             self.assertNotEqual(first, storage._state_fingerprint(data_dir))

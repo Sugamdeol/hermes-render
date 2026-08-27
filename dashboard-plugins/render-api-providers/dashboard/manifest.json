@@ -3,7 +3,7 @@
   "label": "API Providers",
   "description": "Add OpenAI- or Anthropic-compatible API providers directly from the dashboard (Models page) instead of hand-editing config.yaml.",
   "icon": "KeyRound",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "tab": {
     "path": "/api-providers",
     "hidden": true

@@ -40,8 +40,9 @@ services:
 
     envVars:
       # Free instances lose /opt/data when they spin down or redeploy. Keep
-      # secrets in Render environment variables rather than in the dashboard's
-      # API Keys tab, which writes to the ephemeral filesystem.
+      # secrets in Render environment variables as the durable fallback. When
+      # GoFile sync is enabled, dashboard-managed .env settings are restored
+      # too, but the GoFile archive must then be treated as sensitive.
       - key: HERMES_HOME
         value: /opt/data
       - key: PORT
@@ -78,7 +79,7 @@ services:
       - key: GOFILE_SYNC_INTERVAL_SECONDS
         value: "300"
       - key: GOFILE_MAX_ARCHIVE_MB
-        value: "25"
+        value: "100"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
