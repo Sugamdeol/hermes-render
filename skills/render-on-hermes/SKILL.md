@@ -37,8 +37,9 @@ is ephemeral: it is reset after a spin-down or redeploy. Without the optional
 GoFile sync, do not tell the user that sessions, memories, dashboard
 configuration, logs, or files saved there will persist. Provider keys, channel
 tokens, and other important configuration must live in Render environment
-variables, not only in `/opt/data/.env`; the sync archive intentionally
-excludes `.env` and logs.
+variables, not only in `/opt/data/.env`. When GoFile sync is enabled, the
+archive includes `.env`, logs, and every other regular file under `/opt/data`,
+so the GoFile folder must be treated as sensitive.
 
 The Bynara router is available as `custom:bynara` and uses `BYNARA_API_KEY`.
 The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when
