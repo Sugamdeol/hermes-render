@@ -152,8 +152,39 @@ RUN set -eu; \
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
 COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
+COPY --chown=root:root scripts/git-storage.py /opt/render-tools/git-storage.py
 RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
-             /opt/render-tools/free-storage.py /opt/render-tools/seed-env.py
+             /opt/render-tools/free-storage.py /opt/render-tools/git-storage.py \
+             /opt/render-tools/seed-env.py
+
+# The git state backend shells out to `git`, so it must exist in the image.
+# `age` is optional: without it the backend refuses to include /opt/data/.env
+# in the backup rather than committing secrets in the clear, so we install it
+# when the distro offers it but never fail the build over it.
+RUN set -eu; \
+    if command -v git >/dev/null 2>&1; then \
+      echo "git already present: $(git --version)"; \
+    elif command -v apt-get >/dev/null 2>&1; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends git; \
+      rm -rf /var/lib/apt/lists/*; \
+    elif command -v apk >/dev/null 2>&1; then \
+      apk add --no-cache git; \
+    else \
+      echo "no supported package manager to install git" >&2; exit 1; \
+    fi; \
+    git --version; \
+    if ! command -v age >/dev/null 2>&1; then \
+      if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update && apt-get install -y --no-install-recommends age \
+          && rm -rf /var/lib/apt/lists/* || true; \
+      elif command -v apk >/dev/null 2>&1; then \
+        apk add --no-cache age || true; \
+      fi; \
+    fi; \
+    command -v age >/dev/null 2>&1 \
+      && echo "age present: encrypted .env backup available" \
+      || echo "age absent: /opt/data/.env will be omitted from git backups"
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. Render Free has no persistent disk, so this image directory

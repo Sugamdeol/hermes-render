@@ -21,6 +21,27 @@ set -eu
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 PATCHER="/opt/render-tools/patch-config.py"
 STORAGE_SYNC="/opt/render-tools/free-storage.py"
+GIT_SYNC="/opt/render-tools/git-storage.py"
+
+# Which backend keeps the durable copy of ${DATA_DIR}?
+#
+#   git    - a private GitHub repo. Primary when GIT_STATE_REPO and a token are
+#            set, because it uploads only the bytes that changed (a few KB per
+#            save) instead of a whole archive (tens of MB).
+#   gofile - the original whole-archive upload. Kept as a fallback: it still
+#            holds older snapshots, and it works if GitHub is unreachable.
+#
+# Both may run at once. When git is primary, GoFile is slowed to a long
+# interval (GOFILE_FALLBACK_INTERVAL_SECONDS, default 6 hours) so the pair
+# together still fits a small monthly transfer allowance.
+#
+# Note: these must be real environment variables (Render's Environment tab),
+# not values from env/common.env -- restore runs before the repo env is merged.
+GIT_BACKEND=0
+if [ -x "${GIT_SYNC}" ] && [ -n "${GIT_STATE_REPO:-}" ] \
+   && { [ -n "${GIT_STATE_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; }; then
+  GIT_BACKEND=1
+fi
 
 # Make sure the data dir exists and the hermes user can write to it
 # before we run the patcher. Idempotent — on Free this is the ephemeral
@@ -31,10 +52,20 @@ if ! chown -R hermes:hermes "${DATA_DIR}" 2>/dev/null; then
   echo "[render-tools] warning: could not chown ${DATA_DIR}; continuing" >&2
 fi
 
-# Restore a previous instance's state when the remote-storage token is
-# configured. Run the helper as hermes so extracted files already have the
-# right owner and we avoid a second recursive chown of the whole data tree.
-if [ -x "${STORAGE_SYNC}" ]; then
+# Restore a previous instance's state. Try the git backend first when it is
+# configured; fall back to the GoFile archive if git has nothing for us yet
+# (first run after switching backends) or is unreachable. Run the helpers as
+# hermes so restored files already have the right owner.
+STORAGE_RESTORED=0
+if [ "${GIT_BACKEND}" -eq 1 ]; then
+  if gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
+    STORAGE_RESTORED=1
+  else
+    echo "[render-tools] notice: no state restored from the git repo; trying GoFile" >&2
+  fi
+fi
+
+if [ "${STORAGE_RESTORED}" -eq 0 ] && [ -x "${STORAGE_SYNC}" ]; then
   if ! gosu hermes "${STORAGE_SYNC}" restore "${DATA_DIR}"; then
     STORAGE_RESTORE_OK=0
     echo "[render-tools] warning: remote state restore failed; continuing without state sync" >&2
@@ -182,7 +213,7 @@ if [ -d "${PLUGINS_SRC}" ]; then
   fi
 fi
 
-# Failover role. When several instances share a GoFile folder (typically this
+# Failover role. When several instances share a state backend (typically this
 # Render service plus a laptop), the highest-priority one with a fresh lease is
 # ACTIVE and the others are STANDBY. A standby keeps its dashboard, but must
 # not talk to chat platforms -- otherwise both agents answer the same Telegram
@@ -192,8 +223,19 @@ fi
 # Failing open is deliberate: any error leaves the instance ACTIVE, so a
 # coordination outage can never leave you with no agent answering at all.
 HERMES_ROLE=active
-if [ "${HERMES_FAILOVER:-0}" = "1" ] && [ -x "${STORAGE_SYNC}" ]; then
-  if role_output="$(gosu hermes "${STORAGE_SYNC}" role "${DATA_DIR}" 2>/dev/null)"; then
+ROLE_SOURCE=""
+if [ "${HERMES_FAILOVER:-0}" = "1" ]; then
+  # Whichever backend is primary also arbitrates the lease, so both instances
+  # are reading the same source of truth. The git backend answers this with a
+  # single `git ls-remote`, which transfers only a few hundred bytes.
+  if [ "${GIT_BACKEND}" -eq 1 ]; then
+    ROLE_SOURCE="${GIT_SYNC}"
+  elif [ -x "${STORAGE_SYNC}" ]; then
+    ROLE_SOURCE="${STORAGE_SYNC}"
+  fi
+fi
+if [ -n "${ROLE_SOURCE}" ]; then
+  if role_output="$(gosu hermes "${ROLE_SOURCE}" role "${DATA_DIR}" 2>/dev/null)"; then
     case "${role_output}" in
       standby) HERMES_ROLE=standby ;;
       *) HERMES_ROLE=active ;;
@@ -213,14 +255,33 @@ if [ "${HERMES_FAILOVER:-0}" = "1" ] && [ -x "${STORAGE_SYNC}" ]; then
   fi
 fi
 
-# Keep a remote snapshot up to date in the background. The worker is started
-# as hermes so it cannot read files outside the data directory. It is fully
-# optional and exits cleanly when storage credentials are not configured.
+# Keep a remote snapshot up to date in the background. The workers are started
+# as hermes so they cannot read files outside the data directory. Both are
+# optional and exit cleanly when their credentials are not configured.
+if [ "${GIT_BACKEND}" -eq 1 ]; then
+  gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
+  echo "[render-tools] started git state sync (primary, delta uploads)"
+fi
+
 if [ -x "${STORAGE_SYNC}" ] && [ "${STORAGE_RESTORE_OK}" -eq 1 ]; then
   # Backups are deliberately lower priority than the gateway. The worker is
   # change-aware, so quiet instances do not repeatedly recompress /opt/data.
-  gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
-  echo "[render-tools] started optional low-priority remote state sync"
+  #
+  # When git is primary, GoFile becomes an occasional belt-and-braces copy.
+  # Each GoFile run re-uploads the whole archive, so leaving it at its normal
+  # cadence would spend the monthly transfer allowance that switching to git
+  # was meant to save.
+  if [ "${GIT_BACKEND}" -eq 1 ]; then
+    GOFILE_MIN_UPLOAD_INTERVAL_SECONDS="${GOFILE_FALLBACK_INTERVAL_SECONDS:-21600}"
+    export GOFILE_MIN_UPLOAD_INTERVAL_SECONDS
+    # The git backend owns the failover lease; a second voter would only
+    # confuse the decision.
+    HERMES_FAILOVER=0 gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
+    echo "[render-tools] started GoFile state sync (fallback, every ${GOFILE_MIN_UPLOAD_INTERVAL_SECONDS}s)"
+  else
+    gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
+    echo "[render-tools] started optional low-priority remote state sync"
+  fi
 fi
 
 # Hand off to the upstream entrypoint. The upstream script handles
