@@ -46,8 +46,11 @@ Safety rules this module enforces rather than documents:
 
   * It refuses to push to a public repository. /opt/data contains .env, chat
     history, and memories.
-  * It refuses to commit .env in plaintext. Either an age recipient is
-    configured and .env is encrypted, or .env is left out of the backup.
+  * It commits .env as the operator asked (GIT_STATE_ENV_MODE, plaintext by
+    default) but only to a repository proven private, and it says so in the
+    log every time it does. encrypt seals it with age; omit leaves it out.
+    Under encrypt, a missing recipient or age binary omits the file -- the
+    one combination that never falls back to plaintext.
   * It refuses to seed GitHub from a GoFile restore when the branch already
     holds state, unless GIT_STATE_SEED_FORCE=1 says the operator meant it.
   * Tokens are stripped from every log line and exception message.
@@ -59,6 +62,27 @@ limit even though every sync commits.
 Failover leases ride on Git refs (refs/hermes-lease/<priority>-<id>-<epoch>),
 so checking the cluster is one `git ls-remote` -- no clone, no checkout, a few
 kilobytes. Same semantics as the GoFile lease it mirrors.
+
+Start-up reconciliation: GoFile -> GitHub
+-----------------------------------------
+
+GoFile was the primary store before this backend existed, so the newest
+archive can hold files the state branch never received -- a tree written by an
+instance that only ever had GoFile configured, or state that predates the
+first seed. Once per start the daemon lists the newest GoFile archive,
+subtracts what the branch already has and what the local tree is about to
+commit anyway, and pushes only the difference. Nothing is ever overwritten: a
+path already on the branch keeps the copy that is there.
+
+It runs in the daemon rather than in bootstrap.sh for the same reason seeding
+does: it downloads an archive and pushes, and putting that in front of the
+port bind is how a deploy fails with "no open ports detected".
+
+The dotenv is part of that difference. GIT_STATE_ENV_MODE=plaintext (the
+default) commits /opt/data/.env verbatim, so the branch is a complete,
+restartable copy of the instance; encrypt seals it with age first and omit
+leaves it out. Plaintext mode is only ever allowed against a repository this
+backend has confirmed is private.
 """
 from __future__ import annotations
 
@@ -73,6 +97,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -111,9 +136,30 @@ DEFAULT_GIT_TIMEOUT_SECONDS = 600
 DEFAULT_PUSH_ATTEMPTS = 3
 DEFAULT_PUSH_RETRY_SECONDS = 5
 
-# Files that must never be committed in the clear. Matched on the data-dir
-# relative path.
+# Files that hold live credentials. Matched on the data-dir relative path.
+# Whether they are committed in the clear is GIT_STATE_ENV_MODE's decision,
+# not a hard-coded one: the operator asked for a complete, restartable copy of
+# the instance, and .env is part of that.
 SENSITIVE_FILES = (".env",)
+
+# How a sensitive file reaches the branch.
+#   plaintext - committed as-is (default). The branch can restore the
+#               instance on its own, at the cost of putting live API keys in
+#               git history. Only ever pushed to a proven-private repo.
+#   encrypt   - sealed with age first and stored as <name>.enc, so the branch
+#               holds the secrets but cannot read them.
+#   omit      - left out of the backup entirely.
+ENV_MODE_PLAINTEXT = "plaintext"
+ENV_MODE_ENCRYPT = "encrypt"
+ENV_MODE_OMIT = "omit"
+ENV_MODES = (ENV_MODE_PLAINTEXT, ENV_MODE_ENCRYPT, ENV_MODE_OMIT)
+DEFAULT_ENV_MODE = ENV_MODE_PLAINTEXT
+
+# Ceiling on how much of a GoFile archive one start-up reconcile will read
+# into memory before committing. The Free instance has 512 MB and the archive
+# itself is already capped by GOFILE_MAX_ARCHIVE_MB, but an archive of small
+# files can unpack to far more than its compressed size.
+DEFAULT_GOFILE_RECONCILE_MAX_MB = 100
 
 
 class GitStateError(RuntimeError):
@@ -171,6 +217,11 @@ class GitConfig:
         poll_interval: int = 30,
         role_switch_min: int = 300,
         allow_public: bool = False,
+        env_mode: str = DEFAULT_ENV_MODE,
+        gofile_reconcile: bool = True,
+        gofile_reconcile_max_bytes: int = (
+            DEFAULT_GOFILE_RECONCILE_MAX_MB * 1024 * 1024
+        ),
         workdir: "Path | None" = None,
         watch: bool = True,
         watch_seconds: int = 5,
@@ -214,6 +265,14 @@ class GitConfig:
         # not to overwrite GitHub state we never restored from.
         self.seed_from_gofile = seed_from_gofile
         self.seed_force = seed_force
+        # An unrecognised mode is a typo, not a request to guess: fall back to
+        # the default rather than to something more permissive.
+        self.env_mode = env_mode if env_mode in ENV_MODES else DEFAULT_ENV_MODE
+        # Once per start, push anything the GoFile archive holds that the
+        # state branch does not.
+        self.gofile_reconcile = gofile_reconcile
+        self.gofile_reconcile_max_bytes = max(0, int(gofile_reconcile_max_bytes))
+        self._env_mode_warned = False
         # How hard a push is worth trying before the caller gives up on this
         # round. GitHub's HTTP front end drops large uploads often enough that
         # one attempt is not a real answer.
@@ -282,6 +341,15 @@ class GitConfig:
             poll_interval=positive_int("HERMES_LEASE_POLL_SECONDS", 30),
             role_switch_min=positive_int("HERMES_ROLE_SWITCH_MIN_SECONDS", 300),
             allow_public=flag("GIT_STATE_ALLOW_PUBLIC"),
+            # "even the config env files": the dotenv is committed as-is so
+            # the branch is a complete copy of the instance. encrypt/omit are
+            # still available for anyone who would rather not.
+            env_mode=os.environ.get(
+                "GIT_STATE_ENV_MODE", DEFAULT_ENV_MODE).strip().lower(),
+            gofile_reconcile=flag_on("GIT_STATE_GOFILE_RECONCILE"),
+            gofile_reconcile_max_bytes=positive_int(
+                "GIT_STATE_GOFILE_RECONCILE_MAX_MB", DEFAULT_GOFILE_RECONCILE_MAX_MB
+            ) * 1024 * 1024,
             watch=flag_on("GIT_STATE_WATCH"),
             # How often the tree is fingerprinted, how long it has to stay
             # quiet before that change is pushed, and the hard floor between
@@ -751,11 +819,52 @@ def age_decrypt(ciphertext: bytes, config: GitConfig) -> "bytes | None":
     return proc.stdout
 
 
-def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
+def _prepare_sensitive(payload: bytes, config: GitConfig) -> "tuple[bytes, str]":
+    """Bytes to commit for a sensitive file, and how they were produced.
+
+    The disposition is one of "plaintext", "encrypted" or "omitted". Nothing
+    here can return a sensitive file in the clear while the mode forbids it:
+    encrypt with no working age setup yields "omitted", never a fallback to
+    plaintext.
+    """
+    if config.env_mode == ENV_MODE_OMIT:
+        return b"", ENV_MODE_OMIT
+    if config.env_mode == ENV_MODE_PLAINTEXT:
+        return payload, ENV_MODE_PLAINTEXT
+    sealed = age_encrypt(payload, config)
+    if sealed is None:
+        return b"", ENV_MODE_OMIT
+    return sealed, ENV_MODE_ENCRYPT
+
+
+def _warn_plaintext_env(names: "list[str]", config: GitConfig) -> None:
+    """Say out loud, once per process, that live keys are going into git."""
+    if not names or config._env_mode_warned:
+        return
+    config._env_mode_warned = True
+    LOG.warning(
+        "committing %s in the clear (GIT_STATE_ENV_MODE=plaintext): every API "
+        "key in it becomes part of the history of the private repo %s. Anyone "
+        "who can read that repo, now or through a future fork or export, gets "
+        "those keys -- rotate them if it is ever shared. Set "
+        "GIT_STATE_ENV_MODE=encrypt with GIT_STATE_AGE_RECIPIENT to seal it, "
+        "or GIT_STATE_ENV_MODE=omit to leave it out.",
+        ", ".join(sorted(names)), config.api_repo,
+    )
+
+
+def build_worktree(data_dir: Path, workdir: Path, config: GitConfig,
+                   extra: "dict[str, bytes] | None" = None) -> "dict":
     """Rebuild <workdir>/data from data_dir. Returns a manifest dict.
 
     The tree is rebuilt rather than patched so that files deleted locally
     disappear from the next commit: `git add -A` sees them gone.
+
+    `extra` maps data-relative paths to contents that do not exist locally --
+    files the start-up reconcile recovered from a GoFile archive that this
+    instance no longer has on disk. They are written alongside the mirrored
+    tree so one commit carries both, and they are listed in the manifest
+    under "reconciled" so a restore can tell where they came from.
     """
     excludes, _ = excludes_and_matcher()
     # Read the previous generation before the manifest is overwritten. The
@@ -767,7 +876,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
 
-    copied, encrypted, skipped = 0, [], []
+    copied, encrypted, plaintext_env, skipped = 0, [], [], []
     for relative in plan_mirror(data_dir, excludes):
         source = data_dir / relative
         destination = target / relative
@@ -778,20 +887,32 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
             continue
 
         if relative in SENSITIVE_FILES:
-            sealed = age_encrypt(payload, config)
-            if sealed is None:
-                # Never fall back to plaintext: the whole point of the check.
+            payload, disposition = _prepare_sensitive(payload, config)
+            if disposition == ENV_MODE_OMIT:
+                # Either the operator asked for omit, or encrypt was asked for
+                # and age could not seal it. Neither falls back to plaintext.
                 skipped.append(relative)
                 LOG.warning(
-                    "%s left OUT of the git backup: no GIT_STATE_AGE_RECIPIENT "
-                    "(or no age binary), and committing it in the clear is not "
-                    "an option. Keep those values in Render's Environment tab "
-                    "or the repo's encrypted secrets file.", relative
+                    "%s left OUT of the git backup (GIT_STATE_ENV_MODE=%s%s). "
+                    "Keep those values in Render's Environment tab or the "
+                    "repo's encrypted secrets file.", relative, config.env_mode,
+                    "; age encryption unavailable" if config.env_mode == ENV_MODE_ENCRYPT
+                    else "",
                 )
                 continue
-            destination = destination.with_name(destination.name + ENCRYPTED_SUFFIX)
-            destination.write_bytes(sealed)
-            encrypted.append(relative)
+            if disposition == ENV_MODE_ENCRYPT:
+                destination = destination.with_name(destination.name + ENCRYPTED_SUFFIX)
+                encrypted.append(relative)
+            else:
+                plaintext_env.append(relative)
+            destination.write_bytes(payload)
+            copied += 1
+            try:
+                # A restored .env holds live keys; keep it owner-only on disk
+                # even though the copy in the branch is world-readable.
+                os.chmod(destination, 0o600)
+            except OSError:
+                pass
             continue
 
         destination.write_bytes(payload)
@@ -801,6 +922,26 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
             pass
         copied += 1
 
+    _warn_plaintext_env(plaintext_env, config)
+
+    # Files the local tree does not have: recovered from the GoFile archive by
+    # the start-up reconcile. Written after the mirror so that a path present
+    # in both is decided by the mirror, never by the archive.
+    reconciled: list[str] = []
+    for relative, payload in sorted((extra or {}).items()):
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+        if relative in SENSITIVE_FILES:
+            plaintext_env.append(relative)
+            try:
+                os.chmod(destination, 0o600)
+            except OSError:
+                pass
+        reconciled.append(relative)
+        copied += 1
+    _warn_plaintext_env(plaintext_env, config)
+
     manifest = {
         "instance": config.instance_id,
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -808,6 +949,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         "generation": generation,
         "encrypted": sorted(encrypted),
         "omitted": sorted(skipped),
+        "reconciled": sorted(reconciled),
+        "plaintext_env": sorted(set(plaintext_env)),
     }
     (workdir / MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -848,6 +991,249 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
             os.chmod(destination, 0o600)
         restored += 1
     return restored
+
+
+# ---------------------------------------------------------------------------
+# Start-up reconciliation: GoFile -> GitHub
+# ---------------------------------------------------------------------------
+
+def logical_name(relative: str) -> str:
+    """.env and .env.enc are the same file as far as "do we have it" goes.
+
+    A branch written under encrypt mode stores the sealed copy; one written
+    under plaintext stores the clear copy. Comparing raw paths would make
+    every mode change look like a whole tree of missing files.
+    """
+    return (relative[: -len(ENCRYPTED_SUFFIX)]
+            if relative.endswith(ENCRYPTED_SUFFIX) else relative)
+
+
+def remote_tree_paths(workdir: Path) -> "set[str]":
+    """Logical data-relative paths the checked-out branch already holds."""
+    source_root = workdir / DATA_SUBDIR
+    if not source_root.is_dir():
+        return set()
+    return {
+        logical_name(path.relative_to(source_root).as_posix())
+        for path in source_root.rglob("*") if path.is_file()
+    }
+
+
+def _iter_archive_files(archive: "tarfile.TarFile"):
+    """Yield (relative name, member) for every safely-named regular file.
+
+    The archive is remote data, so the same rules as the GoFile restore apply:
+    no links, no absolute paths, nothing that escapes the destination.
+    """
+    for member in archive.getmembers():
+        if not member.isfile() or member.issym() or member.islnk():
+            continue
+        name = member.name.replace("\\", "/")
+        if name.startswith("./"):
+            name = name[2:]
+        if name.startswith("/"):
+            # A leading slash would make the extract path absolute; tarfile
+            # would strip it, but the name alone should not survive the filter.
+            continue
+        parts = [part for part in name.split("/") if part not in ("", ".")]
+        if not parts or any(part == ".." for part in parts):
+            continue
+        yield "/".join(parts), member
+
+
+def gofile_archive_paths(archive_path: Path) -> "list[str]":
+    """Sorted data-relative paths in a GoFile state archive.
+
+    Names only. Deciding what is missing needs the listing long before it
+    needs any bytes, and the archive is the largest thing this backend ever
+    downloads. Excluded paths (logs, caches) are dropped here so they cannot
+    be resurrected into the branch by a reconcile.
+    """
+    excludes, is_excluded = excludes_and_matcher()
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        names = {
+            name for name, _ in _iter_archive_files(archive)
+            if not is_excluded(name, excludes)
+        }
+    return sorted(names)
+
+
+def plan_gofile_extras(data_dir: Path, workdir: Path,
+                       archive_paths: "list[str]") -> "list[str]":
+    """Archive members GitHub lacks and the local tree will not supply.
+
+    Both sides are subtracted, not just the branch: a path that exists locally
+    is already going into this commit from disk, and the on-disk copy is the
+    newer one -- it is what this instance actually booted from.
+    """
+    excludes, _ = excludes_and_matcher()
+    local = set(plan_mirror(data_dir, excludes))
+    present = remote_tree_paths(workdir) | local
+    return sorted(path for path in archive_paths if path not in present)
+
+
+def read_archive_members(archive_path: Path, paths: "list[str]",
+                         max_bytes: int) -> "tuple[dict[str, bytes], list[str]]":
+    """Read the named members out of the archive, within a byte budget.
+
+    Returns (selected, skipped). Members that would break the budget are
+    skipped rather than read: the reconcile is an additive best effort, and
+    running the container out of memory would cost far more than the file.
+    """
+    wanted = set(paths)
+    selected: dict[str, bytes] = {}
+    skipped: list[str] = []
+    spent = 0
+    with tarfile.open(archive_path, mode="r:gz") as archive:
+        for name, member in _iter_archive_files(archive):
+            if name not in wanted:
+                continue
+            handle = archive.extractfile(member)
+            if handle is None:  # pragma: no cover - regular file with no data
+                continue
+            payload = handle.read()
+            if max_bytes and spent + len(payload) > max_bytes:
+                skipped.append(name)
+                continue
+            spent += len(payload)
+            selected[name] = payload
+    return selected, skipped
+
+
+def gofile_state_backend():
+    """The GoFile backend's config, or None when GoFile is not configured."""
+    backend = _load_free_storage()
+    return backend.StorageConfig.from_env()
+
+
+def latest_gofile_archive(destination: Path) -> "Path | None":
+    """Download the newest GoFile state archive to `destination`.
+
+    Returns the path, or None when GoFile is unconfigured or holds no state
+    archive yet -- neither is an error, they just mean there is nothing to
+    reconcile from.
+    """
+    backend = _load_free_storage()
+    gofile = backend.StorageConfig.from_env()
+    if gofile is None:
+        LOG.debug("GoFile is not configured; nothing to reconcile")
+        return None
+
+    entries = backend._file_entries(gofile)
+    if not entries:
+        LOG.debug("no GoFile state archive found")
+        return None
+    link = entries[0].get("link")
+    if not isinstance(link, str) or not link:
+        raise GitStateError("newest GoFile state file has no download link")
+
+    with open(destination, "w+b") as handle:
+        size = backend._download(link, gofile, handle)
+    if not size:
+        raise GitStateError("newest GoFile state file was empty")
+    LOG.info("fetched GoFile state archive (%d bytes) to reconcile", size)
+    return destination
+
+
+def reconcile_gofile_to_github(data_dir: Path, config: GitConfig) -> "dict":
+    """Push whatever the GoFile archive holds that the state branch does not.
+
+    GoFile is the older backup and was primary before this backend existed, so
+    its newest archive can carry files the branch never received: state from an
+    instance that only ever had GoFile configured, or a tree that predates the
+    first seed. This lists the archive, subtracts what GitHub already has and
+    what the local tree is about to commit anyway, and pushes the difference --
+    including .env and config files, which is the point of the exercise.
+
+    Nothing is ever overwritten. A path already on the branch keeps the copy
+    that is there, even if the archive holds a different one: this is a
+    backfill, not a restore.
+
+    Pushing is not conditional on finding a difference. The ask is "everything
+    ends up on GitHub", so the local tree is committed along with whatever the
+    archive contributed; `force` is only used when there is something new,
+    which keeps a quiet start from manufacturing an empty commit.
+
+    Returns a stats dict whose "status" is one of disabled, standby, empty,
+    in-sync, oversize, pushed, failed.
+    """
+    if not config.gofile_reconcile:
+        LOG.debug("GoFile reconcile disabled (GIT_STATE_GOFILE_RECONCILE=0)")
+        return {"status": "disabled", "checked": 0, "added": [], "skipped": []}
+    if config.failover and config.role == ROLE_STANDBY:
+        # A standby's /opt/data is a stale copy of the active instance's, and
+        # its view of "what GitHub is missing" is measured against that.
+        LOG.info("standby instance; skipping the GoFile reconcile")
+        return {"status": "standby", "checked": 0, "added": [], "skipped": []}
+
+    # Same guard as an ordinary push: a public repo never receives agent state,
+    # and in plaintext mode that now includes live API keys.
+    ensure_safe_to_push(config)
+    workdir = ensure_clone(config)
+
+    with tempfile.TemporaryDirectory(prefix="hermes-gofile-reconcile-") as tmp:
+        archive = Path(tmp) / "state.tar.gz"
+        if latest_gofile_archive(archive) is None:
+            LOG.info("no GoFile state archive; pushing local state only")
+            pushed = sync_once(data_dir, config)
+            return {"status": "empty" if pushed else "failed", "checked": 0,
+                    "added": [], "skipped": []}
+
+        paths = gofile_archive_paths(archive)
+        missing = plan_gofile_extras(data_dir, workdir, paths)
+        extras, oversize = read_archive_members(
+            archive, missing, config.gofile_reconcile_max_bytes)
+        if oversize:
+            LOG.warning(
+                "%d GoFile file(s) exceed the %d MB reconcile budget and are "
+                "left for a later start; raise "
+                "GIT_STATE_GOFILE_RECONCILE_MAX_MB to include them",
+                len(oversize), config.gofile_reconcile_max_bytes // (1024 * 1024),
+            )
+        if extras:
+            LOG.info("GoFile holds %d file(s) missing from %s@%s; pushing them",
+                     len(extras), config.api_repo, config.branch)
+        else:
+            LOG.info("GoFile holds nothing GitHub is missing (%d file(s) checked)",
+                     len(paths))
+
+        pushed = sync_once(data_dir, config, force=bool(extras), extra=extras)
+        if not pushed:
+            return {"status": "failed", "checked": len(paths), "added": [],
+                    "skipped": sorted(oversize)}
+        if not extras:
+            return {"status": "oversize" if oversize else "in-sync",
+                    "checked": len(paths), "added": [],
+                    "skipped": sorted(oversize)}
+        LOG.info("reconciled %d file(s) from GoFile into %s@%s: %s",
+                 len(extras), config.api_repo, config.branch,
+                 ", ".join(sorted(extras)))
+        return {"status": "pushed", "checked": len(paths), "added": sorted(extras),
+                "skipped": sorted(oversize)}
+
+
+def reconcile_on_startup(data_dir: Path, config: GitConfig) -> "dict":
+    """Run the GoFile reconcile once per start, inside the daemon.
+
+    Deliberately here and not in bootstrap.sh: it downloads an archive and
+    pushes, and everything the boot wrapper does happens before the container
+    binds its port. A slow GoFile response there is how a deploy fails with
+    "no open ports detected". Here a failure costs a retry on the next start.
+
+    Every failure is swallowed for the same reason: the reconcile is an
+    additive backfill, so losing one must never take the sync daemon with it.
+    """
+    if not config.gofile_reconcile:
+        return {"status": "disabled", "checked": 0, "added": [], "skipped": []}
+    try:
+        return reconcile_gofile_to_github(data_dir, config)
+    except (GitStateError, RuntimeError, OSError, ValueError, tarfile.TarError) as exc:
+        # RuntimeError covers the GoFile backend's GofileError without
+        # importing its exception class here.
+        LOG.warning("gofile -> github reconcile failed; retrying next start: %s",
+                    redact(str(exc)))
+        return {"status": "failed", "checked": 0, "added": [], "skipped": [],
+                "error": redact(str(exc))}
 
 
 def read_generation(workdir: Path) -> int:
@@ -892,7 +1278,8 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
 
 
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
-              seed: bool = False) -> bool:
+              seed: bool = False,
+              extra: "dict[str, bytes] | None" = None) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
         LOG.debug("standby instance; not pushing state")
         return True
@@ -914,7 +1301,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
             "GIT_STATE_SEED_FORCE=1."
         )
 
-    manifest = build_worktree(data_dir, workdir, config)
+    manifest = build_worktree(data_dir, workdir, config, extra=extra)
 
     run_git(["add", "-A"], cwd=workdir, config=config)
     # Only real state changes are worth a commit. The manifest carries a
@@ -929,10 +1316,17 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
                 check=False, config=config)
         return True
 
-    message = (
-        f"Hermes state from {config.instance_id} "
-        f"({manifest['files']} files, {manifest['updated']})"
-    )
+    if extra:
+        message = (
+            f"Hermes state from {config.instance_id} "
+            f"({manifest['files']} files, +{len(extra)} recovered from GoFile, "
+            f"{manifest['updated']})"
+        )
+    else:
+        message = (
+            f"Hermes state from {config.instance_id} "
+            f"({manifest['files']} files, {manifest['updated']})"
+        )
     proc = run_git(["commit", "-q", "-m", message], cwd=workdir, check=False, config=config)
     if proc.returncode != 0 and "nothing to commit" not in (proc.stdout + proc.stderr):
         raise GitStateError(redact(proc.stderr or proc.stdout))
@@ -1205,6 +1599,13 @@ def run_daemon(data_dir: Path, config: GitConfig,
     # redeploy.
     seed_on_startup(data_dir, config)
 
+    # GoFile was the primary store before this backend existed, so its newest
+    # archive can still hold files the state branch never received -- config
+    # and .env included. Backfill the difference once per start, here rather
+    # than in the boot wrapper, so the archive download sits behind a bound
+    # port instead of in front of it.
+    reconcile_on_startup(data_dir, config)
+
     # Change-driven saves. The interval below is only the safety net: a change
     # is normally pushed within `debounce` seconds of the last write, not at
     # the next interval boundary.
@@ -1288,7 +1689,8 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("restore", "sync", "seed", "state", "daemon", "role", "release"),
+        choices=("restore", "sync", "seed", "state", "reconcile", "daemon",
+                 "role", "release"),
     )
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args(argv)
@@ -1325,6 +1727,13 @@ def main(argv: "list[str] | None" = None) -> int:
             return 0 if restore(args.data_dir, config) else 2
         if args.command == "sync":
             return 0 if sync_once(args.data_dir, config) else 1
+        if args.command == "reconcile":
+            # Manual / one-off backfill of anything GoFile has that the branch
+            # does not. The daemon does this on its own at every start; this is
+            # for "do it now" and for reading what it found.
+            result = reconcile_gofile_to_github(args.data_dir, config)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0 if result["status"] != "failed" else 1
         run_daemon(args.data_dir, config)
         return 0
     except GitStateError as exc:

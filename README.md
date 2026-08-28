@@ -637,18 +637,60 @@ mirror from scratch each time rather than adding to it, so a memory you delete
 does not quietly live on in the backup. (Older *versions* still exist in git
 history until the next squash — see below.)
 
-`.env` is the exception. It usually holds API keys, and a private repo is not
-the same as an encrypted one — anyone who later gains read access to the repo,
-or any token with access to it, can read a plaintext `.env`. So:
+**`.env` is included, config files and all.** The point of the backup is a
+copy you can restart from, and a state branch without the dotenv is missing
+the keys the agent runs on. `GIT_STATE_ENV_MODE` decides how it is stored:
 
-- If `GIT_STATE_AGE_RECIPIENT` is set to an `age` public key, `.env` is
-  encrypted to that key before being committed, as `.env.enc`.
-- If it is not set, `.env` is **left out of the backup** and a warning is
-  logged. It is never committed in the clear.
+| `GIT_STATE_ENV_MODE` | What lands in the branch |
+|---|---|
+| `plaintext` (default) | `.env` committed verbatim |
+| `encrypt` | `.env` sealed to `GIT_STATE_AGE_RECIPIENT` with `age`, stored as `.env.enc` |
+| `omit` | `.env` left out of the backup entirely |
 
-Leaving it out is a perfectly good choice: your keys are already in Render's
-Environment tab, and this repo supports
-[committing them encrypted](#environment-variables-in-the-repo) too.
+The default is what it is because it is what makes the backup complete — and it
+is only ever pushed to a repository the backend has
+[confirmed is private](#configure-the-git-backup-recommended). Be deliberate
+about it anyway: a private
+repo is not an encrypted one. Anyone who later gains read access to the repo,
+or any token with access to it, can read a plaintext `.env` out of git history,
+and history survives deletion until the next squash. The backend logs a warning
+on every start that commits one.
+
+`encrypt` is the middle ground: the branch still carries your keys, but nobody
+who reads it can use them without the age private key (keep it in Render's
+Environment tab as `SOPS_AGE_KEY`). Under `encrypt`, if no recipient is
+configured or the `age` binary is missing, `.env` is **omitted rather than
+committed in the clear** — the one thing that never happens silently.
+
+#### Start-up reconciliation: GoFile → GitHub
+
+GoFile was the primary store before this backend existed, so its newest archive
+can hold files the state branch never received: state from an instance that only
+ever had GoFile configured, or a tree written before the first seed. **Once per
+start**, the sync daemon lists the newest GoFile archive, subtracts what the
+branch already has and what the local `/opt/data` is about to commit anyway, and
+pushes only the difference — `.env` and config files included.
+
+It is a backfill, never a restore: a path already on the branch keeps the copy
+that is there, even when the archive holds a different one. Local files win over
+the archive too, since they are what this instance actually booted from.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `GIT_STATE_GOFILE_RECONCILE` | `1` | Set `0` to skip the start-up check entirely |
+| `GIT_STATE_GOFILE_RECONCILE_MAX_MB` | `100` | How much of the archive one start may read into memory before committing |
+
+The check costs one archive download per start, which is the reason it runs in
+the daemon rather than in the boot wrapper: everything before the container
+binds its port has to fit inside Render's scan window, and a slow download there
+fails the deploy with "no open ports detected". A failure is logged and retried
+on the next start; it never blocks boot.
+
+To see what it would do right now, without waiting for a start:
+
+```bash
+docker exec <container> /opt/render-tools/git-storage.py reconcile /opt/data
+```
 
 #### Keeping the repo from growing forever
 
@@ -844,6 +886,7 @@ What it does:
 - Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, the full MCP tool catalog available to your API key, and conservative Free-tier concurrency/cache defaults, without overwriting explicit edits.
 - Backs up every regular file under `/opt/data` to a private GitHub repo within seconds of any change, uploading only the bytes that changed, and restores from it at boot.
 - Keeps GoFile as a second, slower copy, and uses it as the restore source on a first launch when the GitHub state branch is still empty — then pushes that state to GitHub so git is primary from then on.
+- Reconciles the two at every start: anything the newest GoFile archive holds that the state branch does not — `.env` and config files included — is pushed to GitHub, without ever overwriting what the branch already has.
 - Refuses to seed a state branch it could not confirm was empty, and refuses to push a GoFile-restored tree over GitHub state it never restored from, so an older backup cannot silently replace a newer one.
 - Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GOFILE_API_TOKEN`, and `GOFILE_FOLDER_ID` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
