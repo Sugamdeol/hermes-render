@@ -150,7 +150,7 @@ command.
 > **Keys:** prefer `key_env` over pasting an inline API key. Render
 > environment variables survive restarts and redeploys; an inline key lives
 > only in the (ephemeral) `config.yaml` unless you have [GoFile
-> sync](#keeping-files-on-free-with-gofile) enabled. The card lists which
+> sync](#keeping-files-between-restarts) enabled. The card lists which
 > source each provider uses and never echoes a stored key back to the browser.
 
 The plugin is image-managed: [`scripts/bootstrap.sh`](scripts/bootstrap.sh)
@@ -256,6 +256,211 @@ The dashboard's **Chat** tab is optional on Free because the full TUI creates a 
 
 The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
 
+## Run it locally
+
+[`run-local.sh`](./run-local.sh) is a single self-contained script that runs the
+same agent on your own machine: the same `Dockerfile` (same pinned Hermes tag
+and `render-oss/skills` commit), the same boot patcher, the same overlay skill
+and dashboard plugin, and the same environment variables `render.yaml`
+declares. It needs only Docker (or Podman).
+
+```bash
+OPENROUTER_API_KEY=sk-or-... ./run-local.sh      # build + start on http://127.0.0.1:10000
+./run-local.sh logs -f                            # follow the gateway
+./run-local.sh cli                                # interactive hermes CLI in the container
+./run-local.sh down                               # stop (data volume kept)
+./run-local.sh --help                             # all commands and flags
+```
+
+Secrets come from a local `.env` (copy `.env.example`) or from exported shell
+variables; nothing is written back into the repo. Two deliberate differences
+from Render Free: `/opt/data` is a persistent Docker volume, so config,
+sessions, memories, and skills survive restarts (add `--data-dir ./hermes-data`
+to bind-mount a directory instead), and the dashboard binds to `127.0.0.1`
+because it has no authentication. Use `--free-limits` to reproduce Free's
+512MB/0.5-CPU squeeze, `--tui` to enable the in-browser chat TUI, and
+`--rebuild` after changing anything in `scripts/`, `skills/`, or
+`dashboard-plugins/`.
+
+### Running local and Render at the same time
+
+There are two ways to do this. **Coordinated** is the one you want.
+
+#### Coordinated handoff (`--takeover`)
+
+Both instances point at the same GoFile folder and publish a tiny *lease* file
+there. The highest-priority instance with a fresh lease is **active**; everyone
+else is **standby**.
+
+```bash
+./run-local.sh --takeover      # local is priority 100, Render is 50
+```
+
+What happens:
+
+1. Local starts and claims the lease. Within ~30s Render notices, uploads its
+   state one last time, and restarts as standby: its chat tokens are stripped
+   at boot, so Telegram/Discord messages come only to your laptop. Its
+   dashboard stays up.
+2. While local runs, **Render never uploads**, so it cannot clobber your state.
+3. `./run-local.sh down` sends SIGTERM and waits up to 60s. Local uploads a
+   final archive and *then* releases its lease — that order matters, so Render
+   restores complete state rather than a stale snapshot.
+4. Render sees the lease vanish, restarts as active, restores from GoFile, and
+   carries on answering messages.
+
+Failover **fails open**: if GoFile is unreachable or the lease can't be read,
+an instance stays active. A coordination outage can leave you with two agents
+answering, never zero.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERMES_FAILOVER` | `1` on Render | Enable lease coordination |
+| `HERMES_INSTANCE_PRIORITY` | `50` Render / `100` local | Higher wins |
+| `HERMES_LEASE_TTL_SECONDS` | `600` | How long a lease stays valid without a heartbeat |
+| `HERMES_LEASE_HEARTBEAT_SECONDS` | `120` | How often the active instance refreshes it |
+| `HERMES_LEASE_POLL_SECONDS` | `30` | How often a standby re-checks |
+| `HERMES_ROLE_SWITCH_MIN_SECONDS` | `300` | Hysteresis, to stop restart flapping |
+
+Checking costs one folder listing and no downloads — priority and identity are
+encoded in the lease *filename*, freshness is its timestamp — so coordination
+adds essentially nothing to bandwidth.
+
+#### Uncoordinated (what happens if you don't)
+
+Two agents that only look like one:
+
+| Shared value | Result |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Telegram allows one poller per token. The second takes over and the other gets HTTP 409; messages land wherever, unpredictably. |
+| `DISCORD_BOT_TOKEN` | Both connections get every event, so users get **two replies**. |
+| `SLACK_*` / IMAP | Events split across connections, or races decide who claims each message. |
+| `GOFILE_API_TOKEN` | Each sync uploads a full snapshot and deletes older ones. Last writer wins; the other's sessions and `.env` are gone. |
+
+`/opt/data` is per-instance regardless, so the two have separate session
+databases, memories, and configs. `run-local.sh up` warns when it is about to
+claim a shared identity without `--takeover`; `--isolate` drops those values
+entirely and gives you a local-only agent.
+
+### Backup bandwidth
+
+Backing up state is the part of this template that spends bandwidth, because
+it happens over and over while the agent runs. There are two backends and the
+difference between them is large.
+
+**The git backend (recommended) uploads only what changed.** GoFile has no
+concept of a partial update: every save re-uploads the whole `/opt/data`
+archive. Git does, so a save costs a few kilobytes instead of tens of
+megabytes. Measured on a 412 KB SQLite session database with 20 new messages
+added between saves:
+
+| | First save | Each later save |
+|---|---|---|
+| GoFile (whole archive) | ~100 KB | ~100 KB, every time |
+| Git (only the changes) | 30 KB | **0.6 KB** |
+
+Two things make that work, and both matter if you are tempted to "improve" it:
+git compares each save against the previous one and ships only the difference,
+and a real SQLite file is mostly unchanged pages between saves, so that
+difference is tiny. (Random or already-compressed data does not compress or
+diff, so it would transfer in full — agent state is neither.)
+
+The practical effect on a 5 GB/month allowance: GoFile at its old cadence could
+spend that in a day or two, while git syncing every 5 minutes costs on the
+order of tens of megabytes a month. See
+[Keeping files between restarts](#keeping-files-between-restarts) for setup.
+
+If you stay on GoFile, four brakes keep it survivable, all tunable:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `GOFILE_EXCLUDE` | logs, caches, `__pycache__`, tmp, `*.log` | Excluded from the archive *and* the change check, so log churn no longer triggers uploads |
+| `GOFILE_MIN_UPLOAD_INTERVAL_SECONDS` | `1800` | Minimum spacing between uploads |
+| `GOFILE_MONTHLY_BUDGET_MB` | `2048` | Sync pauses for the month instead of eating bandwidth |
+| `GOFILE_CONTENT_CHECK_SECONDS` | `3600` | Periodic full content hash |
+
+Change detection is now two-tier: a cheap metadata scan, then a content hash
+before spending an upload — so a file rewritten with identical contents costs
+nothing. The content check also closes a real bug: a same-size edit within one
+mtime tick (a rotated API key in `.env` is the realistic case) was invisible to
+the old metadata-only fingerprint and would never have been backed up.
+
+Shutdown always forces a final upload, ignoring the interval and the budget, so
+stopping an instance never loses state. Set `GOFILE_EXCLUDE_REPLACE=1` to
+replace the default exclude list rather than extend it.
+
+When the git backend is enabled it becomes primary and GoFile drops to an
+occasional second copy, every `GOFILE_FALLBACK_INTERVAL_SECONDS` (6 hours by
+default), so the two together still fit a small allowance.
+
+The script also works away from the repo: it carries a self-extracting copy of
+the build context, so a single copied `run-local.sh` can build and run on its
+own. Maintainers refresh that copy with `./run-local.sh update-embed` after
+changing the baked-in files.
+
+## Environment variables in the repo
+
+Secrets can live in this repo instead of only in Render's Environment tab —
+encrypted, never in plaintext. Two files under [`env/`](./env) hold everything:
+
+| File | Contents | Committed |
+|---|---|---|
+| `env/common.env` | Non-secret config (`HERMES_*`, `PORT`, resource guardrails, GoFile defaults) | Plaintext |
+| `env/secrets.enc.env` | API keys and tokens, values encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) | Encrypted |
+
+The encrypted file is a dotenv whose **keys stay readable and whose values are
+ciphertext**, so `git diff` shows *which* variable changed without leaking it.
+
+### Setup
+
+```bash
+./run-local.sh secrets init     # generate an age key, record the public recipient
+./run-local.sh secrets edit     # opens $EDITOR; saves re-encrypted
+git add .sops.yaml env/secrets.enc.env && git commit
+```
+
+`secrets init` writes the private key to `~/.config/sops/age/keys.txt` and puts
+only the **public** recipient in `.sops.yaml`. To let the deployed service
+decrypt, paste the `AGE-SECRET-KEY-...` line into Render → **Environment** as
+`SOPS_AGE_KEY` (or mount it as a Secret File at `/etc/secrets/age.key`). That
+one variable replaces pasting every individual key into the dashboard.
+
+`run-local.sh` needs no extra flags: it decrypts `env/secrets.enc.env`
+automatically when the age key is present, and warns and carries on when it
+isn't, so a collaborator without the key can still run the agent from their own
+`.env`.
+
+### Precedence
+
+Identical locally and on Render, highest first:
+
+1. **The process environment** — Render's Environment tab, or your shell. The
+   repo never overrides a live deploy knob, so the dashboard stays the
+   emergency override.
+2. **An existing `$HERMES_HOME/.env`** — written by the dashboard's API Keys tab
+   or restored from GoFile. A key set from the UI is not reverted to the
+   committed one.
+3. **`env/secrets.enc.env`** — fills in whatever is still missing.
+
+Set `RENDER_TOOLS_SECRETS_FORCE=1` to swap 2 and 3, which is what you want after
+rotating a key in git. On boot, [`scripts/seed-env.py`](scripts/seed-env.py)
+merges the decrypted values into `$HERMES_HOME/.env` insert-only and exports the
+ones the process environment lacks, so `config.yaml`'s `${RENDER_MCP_API_KEY}`
+substitution resolves from a committed secret too. Only variable *names* are
+logged, never values.
+
+### What this does and does not protect
+
+Committing encrypted secrets means the ciphertext is in git history forever. It
+is safe against the repo being read — by a collaborator, a fork, or an
+accidental public flip — and it is *not* safe against the age private key
+leaking, which retroactively exposes every version of every secret ever
+committed. Rotate the key by re-running `secrets init` after deleting
+`~/.config/sops/age/keys.txt`, re-encrypting, and updating `SOPS_AGE_KEY`.
+
+Never commit: `~/.config/sops/age/keys.txt`, anything matching `*.key`, or a
+decrypted copy of the secrets file. `.gitignore` covers the usual names.
+
 ## Cost expectations
 
 This Blueprint uses Render's **Free** web-service instance. It has no service charge, but Free usage is subject to Render's monthly instance-hour allowance and the service spins down after inactivity. The next request may wait for a cold start. There is no persistent-disk charge because Free services cannot attach persistent disks.
@@ -268,15 +473,109 @@ This Blueprint uses Render's **Free** web-service instance. It has no service ch
 
 LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
 
-## Keeping files on Free with GoFile
+## Keeping files between restarts
 
-Render Free cannot attach a persistent disk. This repo includes an optional
-GoFile state sync that backs up and restores every regular file under
-`/opt/data`, including Hermes sessions, memories, config, dashboard settings,
-installed skills, `.env`, and runtime logs. The sync is disabled unless
-`GOFILE_API_TOKEN` is configured.
+Render Free cannot attach a persistent disk: when the service restarts, the
+container is rebuilt from the image and everything the agent wrote —
+conversations, memories, dashboard settings, installed skills — is gone. So the
+state has to be copied somewhere else while the agent runs, and copied back at
+boot.
 
-### Configure GoFile
+Two backends do that. Both are optional and off by default.
+
+| | Git (primary) | GoFile (fallback) |
+|---|---|---|
+| Uploads | only the bytes that changed | the whole archive, every time |
+| Typical save | a few KB | tens of MB |
+| Deletions | mirrored | mirrored (whole archive is replaced) |
+| Needs | a private GitHub repo + token | a GoFile account token |
+
+Enable git and it becomes primary automatically; GoFile stays on as an
+infrequent second copy. Enable neither and the agent runs with disposable
+state, which is fine for trying the template out.
+
+### Configure the git backup (recommended)
+
+**1. Create a private repository for the state.** On GitHub, make a new repo —
+`hermes-storage` is a good name — and set it to **Private**. It must hold
+nothing else: this backend force-pushes and rewrites the branch, so it is not a
+repo you also commit to by hand.
+
+> The backup contains your agent's chat history, memories, and potentially API
+> keys. The backend refuses to push at all unless GitHub confirms the repo is
+> private, so a mistake here stops the backup rather than publishing your data.
+
+**2. Create a token.** A *fine-grained personal access token* is a password
+scoped to specific repositories, so it cannot touch the rest of your account.
+Go to **GitHub → Settings → Developer settings → Personal access tokens →
+Fine-grained tokens → Generate new token**, then:
+
+- **Repository access:** Only select repositories → your `hermes-storage`.
+- **Permissions:** Repository permissions → **Contents: Read and write**.
+  Nothing else is needed.
+- Set an expiry you are willing to renew, and copy the token once — GitHub
+  will not show it again.
+
+**3. Add two variables in Render → Environment:**
+
+```
+GIT_STATE_REPO   = yourname/hermes-storage
+GIT_STATE_TOKEN  = github_pat_...
+```
+
+That is the whole setup. On the next deploy the boot log will show
+`started git state sync (primary, delta uploads)`.
+
+#### What gets backed up, and what deliberately does not
+
+Everything under `/opt/data` is mirrored into a `data/` folder in the repo,
+minus logs and caches (the same exclude list the GoFile sync uses), plus a
+`MANIFEST.json` recording what was saved and when.
+
+**Deleting a file locally deletes it from the repo.** The backend rebuilds the
+mirror from scratch each time rather than adding to it, so a memory you delete
+does not quietly live on in the backup. (Older *versions* still exist in git
+history until the next squash — see below.)
+
+`.env` is the exception. It usually holds API keys, and a private repo is not
+the same as an encrypted one — anyone who later gains read access to the repo,
+or any token with access to it, can read a plaintext `.env`. So:
+
+- If `GIT_STATE_AGE_RECIPIENT` is set to an `age` public key, `.env` is
+  encrypted to that key before being committed, as `.env.enc`.
+- If it is not set, `.env` is **left out of the backup** and a warning is
+  logged. It is never committed in the clear.
+
+Leaving it out is a perfectly good choice: your keys are already in Render's
+Environment tab, and this repo supports
+[committing them encrypted](#environment-variables-in-the-repo) too.
+
+#### Keeping the repo from growing forever
+
+Git never forgets, which is usually the point and here is a liability: every
+version of every file stays in history, and GitHub starts complaining past
+about 5 GB. After `GIT_STATE_MAX_COMMITS` saves (200 by default) the backend
+squashes the branch down to a single commit containing only the current state
+and force-pushes it. Old versions are discarded; the latest state is untouched.
+
+That squash re-uploads everything, so it is a deliberate trade: 200 cheap saves,
+then one expensive one. Raising the number makes the repo bigger between
+squashes; lowering it makes the expensive save more frequent.
+
+#### Failover
+
+If you run a second instance (say a laptop with `./run-local.sh --takeover`),
+the two coordinate through the git repo instead of GoFile — see
+[Running local and Render at the same time](#running-local-and-render-at-the-same-time).
+Checking who is in charge is a single `git ls-remote`, a few hundred bytes, so
+polling for it is not what costs you bandwidth.
+
+### Configure GoFile (fallback)
+
+Keep this configured if you already have state in GoFile, or as a second copy
+in case GitHub is unreachable. It backs up and restores every regular file
+under `/opt/data`, including `.env` and runtime logs. The sync is disabled
+unless `GOFILE_API_TOKEN` is configured.
 
 1. Create or sign in to a GoFile account and copy its API token from
    [My Profile](https://gofile.io/myprofile). Use an account token rather than

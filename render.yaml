@@ -65,7 +65,39 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
 
-      # Optional GoFile state backup for Free. Leave the token blank to run
+      # PRIMARY state backup: a private GitHub repository. Each save pushes
+      # only the bytes that changed (typically a few KB) instead of the whole
+      # archive, which is what keeps this inside a small monthly transfer
+      # allowance. Leave GIT_STATE_REPO blank to stay on GoFile only.
+      #
+      # GIT_STATE_TOKEN wants a fine-grained personal access token scoped to
+      # that one repository with Contents: read and write. The backend refuses
+      # to push unless the GitHub API confirms the repo is private, because
+      # /opt/data holds .env, chat history and memories.
+      - key: GIT_STATE_REPO
+        sync: false
+      - key: GIT_STATE_TOKEN
+        sync: false
+      - key: GIT_STATE_BRANCH
+        value: state
+      - key: GIT_STATE_INTERVAL_SECONDS
+        value: "300"
+      # History is squashed to a single commit after this many state commits,
+      # so the repository cannot grow without bound.
+      - key: GIT_STATE_MAX_COMMITS
+        value: "200"
+      # age public key. If set, /opt/data/.env is encrypted to it before being
+      # committed. If unset, .env is simply left out of the backup -- it is
+      # never committed in the clear.
+      - key: GIT_STATE_AGE_RECIPIENT
+        sync: false
+      # How often the GoFile fallback runs once git is primary. Every GoFile
+      # run re-uploads the whole archive, so it is deliberately infrequent.
+      - key: GOFILE_FALLBACK_INTERVAL_SECONDS
+        value: "21600"
+
+      # FALLBACK state backup. Retained because it holds earlier snapshots and
+      # still works if GitHub is unreachable. Leave the token blank to run
       # with disposable local state. The service can create/find its own
       # private state folder; an existing folder UUID may be supplied.
       - key: GOFILE_API_TOKEN
@@ -80,6 +112,30 @@ services:
         value: "300"
       - key: GOFILE_MAX_ARCHIVE_MB
         value: "100"
+      # Bandwidth brakes. The sync used to re-upload the whole tree whenever
+      # any mtime moved, which on a busy agent meant a full upload every 5
+      # minutes. Now: logs/caches are excluded from the archive, uploads are
+      # spaced by at least this interval, and the monthly byte budget stops
+      # the sync rather than eating a bandwidth allowance. Shutdown always
+      # forces a final upload regardless of these.
+      - key: GOFILE_MIN_UPLOAD_INTERVAL_SECONDS
+        value: "1800"
+      - key: GOFILE_MONTHLY_BUDGET_MB
+        value: "2048"
+
+      # Failover. With HERMES_FAILOVER=1 and a shared state backend (the git
+      # repo when configured, otherwise the GoFile folder), the
+      # highest-priority instance holding a fresh lease handles chat; the
+      # others keep their dashboard but have their chat tokens stripped at
+      # boot and never upload state. Leave this service at the lower priority
+      # so a laptop started with `run-local.sh --takeover` wins, and this one
+      # resumes automatically once the laptop stops and flushes its state.
+      - key: HERMES_FAILOVER
+        value: "1"
+      - key: HERMES_INSTANCE_ID
+        value: render
+      - key: HERMES_INSTANCE_PRIORITY
+        value: "50"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
@@ -136,4 +192,15 @@ services:
       # `render` CLI. This is the same kind of Render API key; the Render
       # account role behind the key determines what the agent can do.
       - key: RENDER_MCP_API_KEY
+        sync: false
+
+      # Private age key that decrypts env/secrets.enc.env at boot. Paste the
+      # AGE-SECRET-KEY-... line produced by `./run-local.sh secrets init`.
+      # This single value replaces pasting every API key into this tab: the
+      # rest travel with the repo, encrypted. Leave it blank to ignore the
+      # committed secrets and configure everything from this tab instead.
+      #
+      # A Render Secret File mounted at /etc/secrets/age.key works too, and
+      # bootstrap.sh picks it up automatically.
+      - key: SOPS_AGE_KEY
         sync: false
