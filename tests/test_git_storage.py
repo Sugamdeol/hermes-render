@@ -277,6 +277,342 @@ class SafetyTests(unittest.TestCase):
         self.storage.ensure_safe_to_push(config)
 
 
+class LocalRemoteTests(unittest.TestCase):
+    """Shared plumbing: point the backend at a throwaway bare repo."""
+
+    def setUp(self):
+        self.storage = load_storage()
+        if not self._git_available():
+            self.skipTest("git is not installed")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.remote = self.root / "remote"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.remote)], check=True)
+        self._saved = (self.storage.GitConfig.remote_url,
+                       self.storage.GitConfig.api_repo)
+        remote = str(self.remote)
+        self.storage.GitConfig.remote_url = property(lambda self, _r=remote: _r)
+        self.storage.GitConfig.api_repo = property(lambda self: "local/test")
+
+    def tearDown(self):
+        self.storage.GitConfig.remote_url = self._saved[0]
+        self.storage.GitConfig.api_repo = self._saved[1]
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _git_available():
+        try:
+            subprocess.run(["git", "--version"], capture_output=True, check=True)
+            return True
+        except (OSError, subprocess.CalledProcessError):
+            return False
+
+    def make_config(self, **overrides):
+        defaults = dict(repo="owner/repo", token="ghp_secret", branch="state",
+                        instance_id="tester", workdir=self.root / "work")
+        defaults.update(overrides)
+        config = self.storage.GitConfig(**defaults)
+        config._visibility_checked = True
+        return config
+
+    def remote_tree(self):
+        proc = subprocess.run(
+            ["git", f"--git-dir={self.remote}", "ls-tree", "-r", "--name-only",
+             "state"],
+            capture_output=True, text=True)
+        return set(proc.stdout.split())
+
+
+class RemoteProbeTests(LocalRemoteTests):
+    """`empty` and `unreachable` must never be confused: only empty is seeded."""
+
+    def test_a_fresh_repo_is_empty(self):
+        self.assertEqual(self.storage.probe_state(self.make_config()),
+                         self.storage.REMOTE_EMPTY)
+
+    def test_a_repo_with_state_reports_has_state(self):
+        storage = self.storage
+        data_dir = self.root / "data"
+        data_dir.mkdir()
+        (data_dir / "config.yaml").write_text("model: x\n")
+        storage.sync_once(data_dir, self.make_config())
+        self.assertEqual(storage.probe_state(self.make_config(workdir=self.root / "w2")),
+                         storage.REMOTE_HAS_STATE)
+
+    def test_an_unreachable_repo_is_unknown_rather_than_empty(self):
+        config = self.make_config(workdir=self.root / "w3")
+        config.repo = "file:///nonexistent/definitely-not-here.git"
+        self.storage.GitConfig.remote_url = property(
+            lambda self: "file:///nonexistent/definitely-not-here.git")
+        self.assertEqual(self.storage.probe_state(config),
+                         self.storage.REMOTE_UNKNOWN)
+
+    def test_a_branch_without_a_data_tree_is_empty(self):
+        # A branch can exist (from a lease anchor commit) and still hold no
+        # state. That is an empty repo for our purposes: safe to seed.
+        storage = self.storage
+        workdir = self.root / "seed-work"
+        workdir.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "state", "."], cwd=workdir,
+                       check=True, capture_output=True)
+        subprocess.run(["git", "remote", "add", "origin", str(self.remote)],
+                       cwd=workdir, check=True, capture_output=True)
+        (workdir / "MANIFEST.json").write_text("{}\n")
+        subprocess.run(["git", "add", "-A"], cwd=workdir, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                        "commit", "-q", "-m", "anchor"], cwd=workdir, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "push", "-q", "origin", "state"], cwd=workdir,
+                       check=True, capture_output=True)
+        self.assertEqual(storage.probe_state(self.make_config(workdir=self.root / "w4")),
+                         storage.REMOTE_EMPTY)
+
+
+class SeedTests(LocalRemoteTests):
+    """First launch: the GitHub branch is empty and has to be filled."""
+
+    def _data_dir(self, contents="restored from gofile"):
+        data_dir = self.root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "config.yaml").write_text("model: x\n")
+        (data_dir / "memories").mkdir(exist_ok=True)
+        (data_dir / "memories" / "note.md").write_text(contents)
+        return data_dir
+
+    def test_seed_fills_an_empty_branch_from_restored_state(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+
+        # What bootstrap.sh does on a first launch: git has nothing, GoFile
+        # (here: the pre-existing directory) is the only copy.
+        self.assertFalse(storage.restore(self.root / "empty-dir", config))
+        self.assertTrue(storage.seed(data_dir, config))
+
+        self.assertIn("data/memories/note.md", self.remote_tree())
+        self.assertEqual(storage.probe_state(self.make_config(workdir=self.root / "w2")),
+                         storage.REMOTE_HAS_STATE)
+
+    def test_state_restored_from_github_on_the_second_launch(self):
+        storage = self.storage
+        storage.seed(self._data_dir(), self.make_config())
+
+        # Next boot: the branch has state, so restore comes from GitHub.
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        self.assertTrue(storage.restore(fresh, self.make_config(workdir=self.root / "w2")))
+        self.assertEqual((fresh / "memories" / "note.md").read_text(),
+                         "restored from gofile")
+
+    def test_seed_refuses_to_overwrite_state_that_is_already_there(self):
+        storage = self.storage
+        storage.seed(self._data_dir("newer github state"), self.make_config())
+        # A second boot that somehow still thinks it is seeding must not
+        # replace what is on the branch.
+        with self.assertRaises(storage.GitStateError):
+            storage.seed(self._data_dir("older gofile copy"),
+                         self.make_config(workdir=self.root / "w2"))
+        restored = self.root / "restored"
+        restored.mkdir()
+        storage.restore(restored, self.make_config(workdir=self.root / "w3"))
+        self.assertEqual((restored / "memories" / "note.md").read_text(),
+                         "newer github state")
+
+    def test_seed_force_allows_a_deliberate_overwrite(self):
+        storage = self.storage
+        storage.seed(self._data_dir("github copy"), self.make_config())
+        self.assertTrue(
+            storage.seed(self._data_dir("operator says this wins"),
+                         self.make_config(workdir=self.root / "w2", seed_force=True)))
+        restored = self.root / "restored"
+        restored.mkdir()
+        storage.restore(restored, self.make_config(workdir=self.root / "w3"))
+        self.assertEqual((restored / "memories" / "note.md").read_text(),
+                         "operator says this wins")
+
+    def test_seed_refuses_when_the_repo_cannot_be_reached(self):
+        self.storage.GitConfig.remote_url = property(
+            lambda self: "file:///nonexistent/nope.git")
+        with self.assertRaises(self.storage.GitStateError):
+            self.storage.seed(self._data_dir(), self.make_config())
+
+    def test_a_gofile_booted_instance_does_not_overwrite_github_state(self):
+        """The guard bootstrap.sh arms when GitHub was unreachable at boot."""
+        storage = self.storage
+        storage.seed(self._data_dir("state already in github"), self.make_config())
+
+        # This instance booted from GoFile, so its tree is not derived from
+        # GitHub. Pushing would clobber the newer copy.
+        config = self.make_config(workdir=self.root / "w2", seed_from_gofile=True)
+        with self.assertRaises(storage.GitStateError):
+            storage.sync_once(self._data_dir("older gofile copy"), config)
+
+        restored = self.root / "restored"
+        restored.mkdir()
+        storage.restore(restored, self.make_config(workdir=self.root / "w3"))
+        self.assertEqual((restored / "memories" / "note.md").read_text(),
+                         "state already in github")
+
+    def test_the_guard_lets_an_empty_branch_be_filled(self):
+        """The guard must not block the very case it exists for."""
+        self.assertTrue(
+            self.storage.seed(self._data_dir(),
+                              self.make_config(seed_from_gofile=True)))
+
+    def test_successful_seed_disarms_the_guard(self):
+        config = self.make_config(seed_from_gofile=True)
+        self.storage.seed(self._data_dir(), config)
+        self.assertFalse(config.seed_from_gofile)
+        # Later saves go through normally.
+        self.assertTrue(self.storage.sync_once(self._data_dir("second save"), config))
+
+
+class ChangeWatcherTests(unittest.TestCase):
+    """Change-driven saves: debounce a burst into one push."""
+
+    def setUp(self):
+        self.storage = load_storage()
+
+    def _watcher(self, debounce=10, sampler=None):
+        storage = self.storage
+        clock = self.clock = _FakeClock()
+        config = make_config(storage, debounce_seconds=debounce)
+        return storage.ChangeWatcher(Path("/tmp/does-not-matter"), config,
+                                     clock=clock, sampler=sampler or _FakeSampler())
+
+    def test_an_unchanged_tree_never_demands_a_push(self):
+        watcher = self._watcher()
+        for _ in range(5):
+            self.clock.advance(5)
+            self.assertFalse(watcher.poll())
+
+    def test_a_change_is_pushed_once_the_tree_settles(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(debounce=10, sampler=sampler)
+
+        self.clock.advance(1)
+        sampler.value = "changed"
+        self.assertFalse(watcher.poll(), "a fresh change must not push instantly")
+
+        self.clock.advance(9)
+        self.assertFalse(watcher.poll(), "still inside the debounce window")
+
+        self.clock.advance(1)
+        self.assertTrue(watcher.poll(), "quiet for the debounce: push now")
+
+    def test_a_burst_of_changes_collapses_into_one_push(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(debounce=10, sampler=sampler)
+
+        for tick in range(1, 5):
+            self.clock.advance(2)
+            sampler.value = f"change-{tick}"
+            self.assertFalse(watcher.poll())
+
+        self.clock.advance(10)
+        self.assertTrue(watcher.poll(), "one push for the whole burst")
+        watcher.mark_pushed()
+        self.assertFalse(watcher.poll(), "and not a second one")
+
+    def test_a_later_change_is_pushed_too(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(debounce=10, sampler=sampler)
+
+        self.clock.advance(1)
+        sampler.value = "first"
+        self.assertFalse(watcher.poll(), "noticed on this tick")
+        self.clock.advance(10)
+        self.assertTrue(watcher.poll(), "pushed once it settled")
+        watcher.mark_pushed()
+
+        self.clock.advance(1)
+        sampler.value = "second"
+        self.assertFalse(watcher.poll())
+        self.clock.advance(10)
+        self.assertTrue(watcher.poll(), "the next change still gets pushed")
+
+    def test_a_failed_push_is_retried_after_the_backoff(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(debounce=10, sampler=sampler)
+
+        self.clock.advance(1)
+        sampler.value = "changed"
+        self.assertFalse(watcher.poll())
+        self.clock.advance(10)
+        self.assertTrue(watcher.poll())
+
+        watcher.defer(30)
+        self.clock.advance(10)
+        self.assertFalse(watcher.poll(), "backing off, not hammering the remote")
+        self.clock.advance(21)
+        self.assertTrue(watcher.poll(), "and retried once the backoff expires")
+
+    def test_debounce_can_be_zero_for_immediate_pushes(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(debounce=0, sampler=sampler)
+        self.clock.advance(1)
+        sampler.value = "changed"
+        self.assertTrue(watcher.poll())
+
+    def test_fingerprint_changes_when_a_state_file_changes(self):
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "config.yaml").write_text("model: x\n")
+            before = storage.state_fingerprint(data_dir)
+            (data_dir / "config.yaml").write_text("model: y\n")
+            after = storage.state_fingerprint(data_dir)
+            self.assertNotEqual(before, after)
+
+    def test_fingerprint_ignores_excluded_churn(self):
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "config.yaml").write_text("model: x\n")
+            before = storage.state_fingerprint(data_dir)
+            (data_dir / "gateway.log").write_text("line one\n")
+            (data_dir / "gateway.log").write_text("line one\nline two\n")
+            self.assertEqual(before, storage.state_fingerprint(data_dir))
+
+
+class _FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def __call__(self):
+        return self.now
+
+
+class _FakeSampler:
+    def __init__(self, value="baseline"):
+        self.value = value
+
+    def __call__(self):
+        return self.value
+
+
+class LeaseOnEmptyRepoTests(LocalRemoteTests):
+    def test_claiming_a_lease_creates_the_first_commit(self):
+        """Regression: `git rev-parse HEAD` prints "HEAD" with no commits.
+
+        That read like a valid refspec and every lease push on a fresh repo
+        failed with "src refspec HEAD does not match any".
+        """
+        storage = self.storage
+        config = self.make_config(failover=True, priority=50)
+
+        role = storage.claim_lease(config)
+
+        self.assertEqual(role, storage.ROLE_ACTIVE)
+        leases = storage.read_leases(config)
+        self.assertEqual([instance for _, instance, _ in leases],
+                         [config.instance_id])
+
+
 class MirrorRoundTripTests(unittest.TestCase):
     """End-to-end against a real local git remote: deletes must propagate."""
 

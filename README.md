@@ -366,8 +366,9 @@ difference is tiny. (Random or already-compressed data does not compress or
 diff, so it would transfer in full — agent state is neither.)
 
 The practical effect on a 5 GB/month allowance: GoFile at its old cadence could
-spend that in a day or two, while git syncing every 5 minutes costs on the
-order of tens of megabytes a month. See
+spend that in a day or two, while git syncing on every change costs on the
+order of tens of megabytes a month — a save is only a few KB, so saving more
+often is not what costs you. See
 [Keeping files between restarts](#keeping-files-between-restarts) for setup.
 
 If you stay on GoFile, four brakes keep it survivable, all tunable:
@@ -389,9 +390,12 @@ Shutdown always forces a final upload, ignoring the interval and the budget, so
 stopping an instance never loses state. Set `GOFILE_EXCLUDE_REPLACE=1` to
 replace the default exclude list rather than extend it.
 
-When the git backend is enabled it becomes primary and GoFile drops to an
-occasional second copy, every `GOFILE_FALLBACK_INTERVAL_SECONDS` (6 hours by
-default), so the two together still fit a small allowance.
+When the git backend is enabled it becomes primary — saving within seconds of
+any change — and GoFile drops to an occasional second copy, every
+`GOFILE_FALLBACK_INTERVAL_SECONDS` (6 hours by default), so the two together
+still fit a small allowance. On a first launch, when the state branch is still
+empty, that order is reversed for one boot: GoFile restores, and its state is
+pushed straight to GitHub.
 
 The script also works away from the repo: it carries a self-extracting copy of
 the build context, so a single copied `run-local.sh` can build and run on its
@@ -487,12 +491,26 @@ Two backends do that. Both are optional and off by default.
 |---|---|---|
 | Uploads | only the bytes that changed | the whole archive, every time |
 | Typical save | a few KB | tens of MB |
+| When it saves | seconds after anything changes | every 6 hours |
 | Deletions | mirrored | mirrored (whole archive is replaced) |
 | Needs | a private GitHub repo + token | a GoFile account token |
 
 Enable git and it becomes primary automatically; GoFile stays on as an
 infrequent second copy. Enable neither and the agent runs with disposable
 state, which is fine for trying the template out.
+
+**Boot order, and the one exception.** At boot the agent restores from GitHub
+whenever the state branch already holds anything. The exception is the very
+first launch: that branch is empty, so the GoFile archive (if you have one) is
+the only copy that exists. The boot wrapper restores from GoFile and then
+immediately pushes that state to GitHub, which is primary from then on. GoFile
+keeps running either way as a slower second copy.
+
+That handoff is guarded, because the GoFile archive can be older than what
+GitHub holds: the wrapper only seeds a branch it has confirmed is empty, and
+never one it simply could not reach. If GitHub is unreachable at boot, GoFile
+stays the live copy and the git daemon waits rather than overwriting state it
+never restored from.
 
 ### Configure the git backup (recommended)
 
@@ -524,7 +542,50 @@ GIT_STATE_TOKEN  = github_pat_...
 ```
 
 That is the whole setup. On the next deploy the boot log will show
-`started git state sync (primary, delta uploads)`.
+`started git state sync (primary, delta uploads on change)`.
+
+#### First launch: filling an empty repo from GoFile
+
+The state repo starts out empty, so there is nothing in it to restore. On that
+first boot the wrapper restores the GoFile archive instead (if you have one)
+and then seeds the branch with it, so a deployment that already has GoFile
+state does not lose it when it moves to git:
+
+```
+[hermes-git-state] state branch state does not exist yet; starting a new one
+[render-tools] github state branch is empty (first launch); will seed it
+[hermes-gofile] restored Hermes state from GoFile folder 4a31c4bf-...
+[render-tools] seeded github state from gofile; github is now primary
+```
+
+Every later boot restores from GitHub and never touches the GoFile archive
+unless GitHub is unreachable. The seed refuses to run against a branch that
+already holds state, so an old GoFile copy can never overwrite newer GitHub
+state — `GIT_STATE_SEED_FORCE=1` is the deliberate override if you ever want
+the local copy to win.
+
+#### Saving on change instead of on a timer
+
+Saves are driven by what the agent does, not by a clock. The daemon
+fingerprints `/opt/data` every few seconds and pushes once the tree has been
+quiet for `GIT_STATE_DEBOUNCE_SECONDS`, so a new message or a dashboard edit
+reaches GitHub within seconds. One message can touch the session database, the
+memory index and the config within a second, so the debounce turns that burst
+into a single commit rather than four half-written ones.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `GIT_STATE_WATCH_SECONDS` | `5` | How often the tree is fingerprinted |
+| `GIT_STATE_DEBOUNCE_SECONDS` | `10` | How long state must stay quiet before it is pushed |
+| `GIT_STATE_MIN_PUSH_INTERVAL_SECONDS` | `20` | Hard floor between two pushes, so a frantic agent cannot churn commits |
+| `GIT_STATE_INTERVAL_SECONDS` | `300` | Safety-net sync, in case a change slips past the fingerprint |
+| `GIT_STATE_WATCH` | `1` | Set to `0` for interval-only saves |
+
+Lower `GIT_STATE_DEBOUNCE_SECONDS` (and the min gap) for near-instant saves;
+raise them if you would rather trade freshness for fewer commits. The
+`GIT_STATE_INTERVAL_SECONDS` sync is deliberately still there: a fingerprint
+is metadata-based, so an edit that rewrites a file to the same size within one
+mtime tick can slip past it.
 
 #### What gets backed up, and what deliberately does not
 
@@ -573,9 +634,10 @@ polling for it is not what costs you bandwidth.
 ### Configure GoFile (fallback)
 
 Keep this configured if you already have state in GoFile, or as a second copy
-in case GitHub is unreachable. It backs up and restores every regular file
-under `/opt/data`, including `.env` and runtime logs. The sync is disabled
-unless `GOFILE_API_TOKEN` is configured.
+in case GitHub is unreachable. It is also what seeds GitHub on a first launch,
+when the state branch is still empty. It backs up and restores every regular
+file under `/opt/data`, including `.env` and runtime logs. The sync is
+disabled unless `GOFILE_API_TOKEN` is configured.
 
 1. Create or sign in to a GoFile account and copy its API token from
    [My Profile](https://gofile.io/myprofile). Use an account token rather than
@@ -740,7 +802,9 @@ What it does:
 - Uses the upstream-default `HERMES_HOME` path (`/opt/data`) on the Free service's ephemeral filesystem.
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
 - Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, the full MCP tool catalog available to your API key, and conservative Free-tier concurrency/cache defaults, without overwriting explicit edits.
-- Restores and change-aware backs up every regular file under `/opt/data` through optional low-priority GoFile storage, including `.env`, logs, dashboard settings, sessions, and user files.
+- Backs up every regular file under `/opt/data` to a private GitHub repo within seconds of any change, uploading only the bytes that changed, and restores from it at boot.
+- Keeps GoFile as a second, slower copy, and uses it as the restore source on a first launch when the GitHub state branch is still empty — then pushes that state to GitHub so git is primary from then on.
+- Refuses to seed a state branch it could not confirm was empty, and refuses to push a GoFile-restored tree over GitHub state it never restored from, so an older backup cannot silently replace a newer one.
 - Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GOFILE_API_TOKEN`, and `GOFILE_FOLDER_ID` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
