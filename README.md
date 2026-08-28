@@ -502,12 +502,24 @@ state, which is fine for trying the template out.
 **Boot order, and the one exception.** At boot the agent restores from GitHub
 whenever the state branch already holds anything. The exception is the very
 first launch: that branch is empty, so the GoFile archive (if you have one) is
-the only copy that exists. The boot wrapper restores from GoFile and then
-immediately pushes that state to GitHub, which is primary from then on. GoFile
-keeps running either way as a slower second copy.
+the only copy that exists. The boot wrapper restores from GoFile and hands the
+branch to the git sync daemon, which seeds it with that state once the gateway
+is up. GitHub is primary from then on. GoFile keeps running either way as a
+slower second copy.
+
+The seed runs in the daemon rather than in the boot wrapper on purpose. A
+first state push is the largest upload this service ever makes, and everything
+the wrapper does happens before the container binds a port — Render fails a
+deploy whose service never opens one (`Port scan timeout reached, no open
+ports detected`). A slow GitHub response during that push used to be enough to
+push the dashboard past the scan window and take the deploy with it. Now the
+port binds first and the seed follows a few seconds later, and a failed attempt
+costs a retry on the daemon's next tick rather than a redeploy. The trade is
+that GoFile stays at its normal cadence for that one first boot; GitHub takes
+over as primary, and GoFile slows down, from the next restart onwards.
 
 That handoff is guarded, because the GoFile archive can be older than what
-GitHub holds: the wrapper only seeds a branch it has confirmed is empty, and
+GitHub holds: only a branch the daemon has confirmed is empty gets seeded, and
 never one it simply could not reach. If GitHub is unreachable at boot, GoFile
 stays the live copy and the git daemon waits rather than overwriting state it
 never restored from.
@@ -548,21 +560,48 @@ That is the whole setup. On the next deploy the boot log will show
 
 The state repo starts out empty, so there is nothing in it to restore. On that
 first boot the wrapper restores the GoFile archive instead (if you have one)
-and then seeds the branch with it, so a deployment that already has GoFile
-state does not lose it when it moves to git:
+and leaves the branch to the sync daemon, which seeds it with that state once
+the gateway is up — so a deployment that already has GoFile state does not lose
+it when it moves to git:
 
 ```
-[hermes-git-state] state branch state does not exist yet; starting a new one
-[render-tools] github state branch is empty (first launch); will seed it
+[render-tools] github state branch is empty (first launch); the sync daemon seeds it after boot
 [hermes-gofile] restored Hermes state from GoFile folder 4a31c4bf-...
-[render-tools] seeded github state from gofile; github is now primary
+[render-tools] state restore finished in 166s (source=gofile)
+[render-tools] github has no state yet; the sync daemon seeds it from gofile after boot
+[render-tools] started git state sync (primary, delta uploads on change)
+...
+[hermes-git-state] state branch state does not exist yet; starting a new one
+[hermes-git-state] seeded yourname/hermes-storage@state; github is now the primary state store
 ```
+
+The last two lines land a few seconds after the dashboard starts rather than
+before it, which is the point: the port is already bound, so a slow first push
+cannot fail the deploy.
 
 Every later boot restores from GitHub and never touches the GoFile archive
 unless GitHub is unreachable. The seed refuses to run against a branch that
 already holds state, so an old GoFile copy can never overwrite newer GitHub
 state — `GIT_STATE_SEED_FORCE=1` is the deliberate override if you ever want
 the local copy to win.
+
+#### When a push does not get through
+
+A state push is one HTTP request, and GitHub's front end drops big ones:
+
+```
+[hermes-git-state] git push failed (attempt 1/3); retrying in 5s: error: RPC failed; HTTP 408 curl 22 ...
+```
+
+Three things keep that from becoming a lost backup. The request is sent
+unchunked, with a `http.postBuffer` large enough for a whole state tree
+(`GIT_STATE_HTTP_POST_BUFFER_MB`, 250 by default), because git chunks anything
+bigger and chunked uploads are what draw the 408. A stalled transfer is
+abandoned after `GIT_STATE_HTTP_LOW_SPEED_TIME` seconds instead of hanging, and
+no git command may run longer than `GIT_STATE_GIT_TIMEOUT_SECONDS`. And because
+a cut-off response often means the push *did* land, the backend asks the remote
+where the branch points before believing the failure — which is what the
+`Everything up-to-date` in that same error message is telling you.
 
 #### Saving on change instead of on a timer
 
@@ -719,6 +758,7 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 |------------------------------------------------------|------------------------------------------------------------------------------|
 | `Refusing to start: binding to 0.0.0.0 requires API_SERVER_KEY` | You set `API_SERVER_ENABLED=true` and `API_SERVER_HOST=0.0.0.0` without an `API_SERVER_KEY`. Set the key or flip back to `127.0.0.1`. |
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
+| `Port scan timeout reached, no open ports detected`  | The container never bound `$PORT` inside Render's scan window, because the boot wrapper was still working when it expired. `[render-tools] state restore finished in Ns (source=...)` in the logs says how long the blocking part took; `HERMES_RESTORE_TIMEOUT_SECONDS` (240) caps it. The GitHub state seed is no longer part of it — a slow first push there used to eat the whole window, so it now runs in the sync daemon after the dashboard is up. |
 | Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
 | API keys or sessions disappear                      | Render's **Environment** tab is the durable fallback. If dashboard-managed keys, sessions, logs, and files must survive a cold start/redeploy, configure GoFile sync and check that the complete archive stays below `GOFILE_MAX_ARCHIVE_MB`. |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |

@@ -4,7 +4,8 @@
 # Runs as root (PID-1 child of tini). On every boot it:
 #   1. Ensures /opt/data exists and is owned by hermes:hermes.
 #   2. Restores state from GitHub, or from GoFile on a first launch (the
-#      state branch is empty then) — and seeds GitHub with it.
+#      state branch is empty then). Seeding GitHub with that restored state is
+#      left to the git sync daemon, so nothing here can delay the port bind.
 #   3. Seeds the upstream config template when this is a fresh instance.
 #   4. Runs the config patcher as the hermes user. On a fresh template it
 #      lowers known upstream resource defaults; later boots preserve edits.
@@ -63,8 +64,8 @@ fi
 # GitHub is the primary store as soon as the state branch holds anything. The
 # one exception is the very first launch, when that branch is still empty: the
 # only copy that exists is the GoFile archive (if you have one), so we restore
-# from GoFile and then immediately push it back to GitHub with `seed`. After
-# that GitHub is primary and GoFile drops to a slow backup.
+# from GoFile and the git sync daemon seeds GitHub with it once the gateway is
+# up. After that GitHub is primary and GoFile drops to a slow backup.
 #
 # `state` is what makes this safe rather than a guess: it answers
 # "has-state" / "empty" / "unknown", and only an *empty* branch is seeded --
@@ -72,6 +73,36 @@ fi
 # could otherwise overwrite newer GitHub state with an older GoFile archive.
 #
 # Run the helpers as hermes so restored files already have the right owner.
+#
+# Every step below runs before the container binds a port, and Render fails a
+# deploy whose service never opens one ("Port scan timeout reached, no open
+# ports detected"). So each one is bounded and timed: a slow backend is allowed
+# to cost this boot its restored state, never the deploy itself.
+BOOT_START="$(date +%s)"
+elapsed_boot_seconds() {
+  echo $(( $(date +%s) - BOOT_START ))
+}
+
+# A hung download would otherwise hold the boot open indefinitely. Set to 0 to
+# wait for the backend no matter how long it takes.
+RESTORE_TIMEOUT="${HERMES_RESTORE_TIMEOUT_SECONDS:-240}"
+
+run_bounded() {
+  # $@ = command, run under `timeout` when one is configured and available.
+  case "${RESTORE_TIMEOUT}" in
+    ""|0|"0")
+      "$@"
+      ;;
+    *)
+      if command -v timeout >/dev/null 2>&1; then
+        timeout "${RESTORE_TIMEOUT}" "$@"
+      else
+        "$@"
+      fi
+      ;;
+  esac
+}
+
 STATE_SOURCE="fresh"
 GIT_HAS_STATE=0
 GIT_STATE_SEED_FROM_GOFILE=""
@@ -82,14 +113,14 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
   case "${git_state}" in
     has-state)
       GIT_HAS_STATE=1
-      if gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
+      if run_bounded gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
         STATE_SOURCE="github"
       else
         echo "[render-tools] warning: github restore failed; trying GoFile" >&2
       fi
       ;;
     empty)
-      echo "[render-tools] github state branch is empty (first launch); will seed it" >&2
+      echo "[render-tools] github state branch is empty (first launch); the sync daemon seeds it after boot" >&2
       ;;
     *)
       # Either the repo is unreachable, or the helper itself could not run.
@@ -100,38 +131,45 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
 fi
 
 if [ "${STATE_SOURCE}" != "github" ] && [ -x "${STORAGE_SYNC}" ]; then
-  if gosu hermes "${STORAGE_SYNC}" restore "${DATA_DIR}"; then
+  if run_bounded gosu hermes "${STORAGE_SYNC}" restore "${DATA_DIR}"; then
     STATE_SOURCE="gofile"
   else
+    # $? is the status of the condition, so 124 means `timeout` stopped it.
+    restore_status=$?
     STORAGE_RESTORE_OK=0
+    if [ "${restore_status}" -eq 124 ]; then
+      echo "[render-tools] warning: state restore ran past ${RESTORE_TIMEOUT}s and was stopped," >&2
+      echo "[render-tools] warning: so the port binds in time. Raise HERMES_RESTORE_TIMEOUT_SECONDS if this repeats." >&2
+    fi
     echo "[render-tools] warning: remote state restore failed; continuing without state sync" >&2
   fi
 fi
 
-# Seed GitHub with whatever we just restored, so it is the primary store from
-# this boot onwards rather than from the daemon's first tick. Harmless on a
-# truly fresh instance: it just turns the empty branch into a first commit.
+echo "[render-tools] state restore finished in $(elapsed_boot_seconds)s (source=${STATE_SOURCE})"
+
+# Whatever we just restored is not in GitHub yet: the state branch is empty, or
+# GitHub could not be reached. Hand that to the sync daemon instead of pushing
+# from here.
+#
+# This used to be a blocking `${GIT_SYNC} seed`. A first state push is the
+# biggest upload this service ever makes, and when GitHub stalls on it --
+# "RPC failed; HTTP 408 ... send-pack: unexpected disconnect", then a forced
+# retry -- the boot sat there for minutes. That is exactly how a deploy dies
+# with "Port scan timeout reached, no open ports detected": the dashboard never
+# got to bind. The daemon seeds the branch ~15s after the gateway is up, and a
+# failed attempt costs a retry on its next tick rather than a redeploy.
+#
+# The flag below is also the promise not to push a GoFile-restored tree over
+# GitHub state this instance never restored from.
 if [ "${GIT_BACKEND}" -eq 1 ] && [ "${STATE_SOURCE}" != "github" ]; then
+  GIT_STATE_SEED_FROM_GOFILE=1
+  export GIT_STATE_SEED_FROM_GOFILE
   if [ "${GIT_HAS_STATE}" -eq 0 ]; then
-    seed_source="${STATE_SOURCE}"
-    if gosu hermes "${GIT_SYNC}" seed "${DATA_DIR}"; then
-      GIT_HAS_STATE=1
-      STATE_SOURCE="github"
-      echo "[render-tools] seeded github state from ${seed_source}; github is now primary"
-    else
-      # GoFile (or nothing) stays the live copy until GitHub is reachable and
-      # provably empty. The flag tells the git daemon not to push over state
-      # it never restored from.
-      GIT_STATE_SEED_FROM_GOFILE=1
-      export GIT_STATE_SEED_FROM_GOFILE
-      echo "[render-tools] warning: could not seed github state; GoFile stays the live backup for now" >&2
-    fi
+    echo "[render-tools] github has no state yet; the sync daemon seeds it from ${STATE_SOURCE} after boot"
   else
     # GitHub holds state we could not read, so this instance's /opt/data is not
     # derived from it. Pushing would replace the backup with a partial tree,
     # so hold off until a boot that restores cleanly.
-    GIT_STATE_SEED_FROM_GOFILE=1
-    export GIT_STATE_SEED_FROM_GOFILE
     echo "[render-tools] warning: github holds state but it could not be restored;" >&2
     echo "[render-tools] warning: not pushing until a restart that restores it cleanly" >&2
   fi
@@ -344,8 +382,10 @@ if [ -x "${STORAGE_SYNC}" ] && [ "${STORAGE_RESTORE_OK}" -eq 1 ]; then
     HERMES_FAILOVER=0 gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
     echo "[render-tools] started GoFile state sync (backup, every ${GOFILE_MIN_UPLOAD_INTERVAL_SECONDS}s)"
   else
-    # GitHub has no state yet (unreachable, or the seed failed), so GoFile is
-    # the only backup there is: keep it at its normal cadence.
+    # GitHub has no state yet, so GoFile is the only backup there is: keep it
+    # at its normal cadence. On a first launch this covers the whole boot --
+    # the seed is deferred to the git daemon, so GitHub only becomes primary
+    # (and GoFile only slows down) from the next restart onwards.
     gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
     echo "[render-tools] started GoFile state sync (live copy until github is seeded)"
   fi
