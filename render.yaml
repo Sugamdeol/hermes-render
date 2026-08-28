@@ -70,6 +70,10 @@ services:
       # archive, which is what keeps this inside a small monthly transfer
       # allowance. Leave GIT_STATE_REPO blank to stay on GoFile only.
       #
+      # On a first launch the state branch is empty, so the GoFile archive is
+      # restored and pushed straight back here; after that this repo is the
+      # source of truth and GoFile is only a slow second copy.
+      #
       # GIT_STATE_TOKEN wants a fine-grained personal access token scoped to
       # that one repository with Contents: read and write. The backend refuses
       # to push unless the GitHub API confirms the repo is private, because
@@ -80,6 +84,20 @@ services:
         sync: false
       - key: GIT_STATE_BRANCH
         value: state
+      # Saves are change-driven: the tree is fingerprinted every
+      # GIT_STATE_WATCH_SECONDS and pushed once it has been quiet for
+      # GIT_STATE_DEBOUNCE_SECONDS, so a change reaches GitHub within seconds.
+      # GIT_STATE_MIN_PUSH_INTERVAL_SECONDS is the hard floor between two
+      # pushes; GIT_STATE_INTERVAL_SECONDS is only the safety net for a change
+      # the fingerprint might miss. GIT_STATE_WATCH=0 disables the watcher.
+      - key: GIT_STATE_WATCH
+        value: "1"
+      - key: GIT_STATE_WATCH_SECONDS
+        value: "5"
+      - key: GIT_STATE_DEBOUNCE_SECONDS
+        value: "10"
+      - key: GIT_STATE_MIN_PUSH_INTERVAL_SECONDS
+        value: "20"
       - key: GIT_STATE_INTERVAL_SECONDS
         value: "300"
       # History is squashed to a single commit after this many state commits,

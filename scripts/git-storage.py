@@ -17,12 +17,30 @@ Deletions are mirrored. The working tree is rebuilt from the data directory on
 every sync, so ``git add -A`` records removals as well as additions and the
 repo never accumulates files you deleted locally.
 
+GitHub is the primary store and GoFile is the backup. The one wrinkle is the
+very first launch, when the state repo is still empty: there is nothing to
+restore from it, so bootstrap.sh falls back to the GoFile archive and then
+calls ``seed`` to push that restored state straight back to GitHub. From that
+moment GitHub is primary and GoFile drops to a slow second copy. ``seed``
+refuses to write over a branch that already holds state, so an old GoFile
+archive can never be pushed on top of newer GitHub state.
+
+Saves are change-driven rather than clock-driven: the daemon fingerprints
+``/opt/data`` every GIT_STATE_WATCH_SECONDS and pushes as soon as the tree has
+been quiet for GIT_STATE_DEBOUNCE_SECONDS, so a new message or a dashboard edit
+lands in GitHub within seconds instead of waiting for the next interval. The
+interval (GIT_STATE_INTERVAL_SECONDS) stays as a safety net, and
+GIT_STATE_MIN_PUSH_INTERVAL_SECONDS stops a very chatty agent from turning one
+busy minute into dozens of commits.
+
 Safety rules this module enforces rather than documents:
 
   * It refuses to push to a public repository. /opt/data contains .env, chat
     history, and memories.
   * It refuses to commit .env in plaintext. Either an age recipient is
     configured and .env is encrypted, or .env is left out of the backup.
+  * It refuses to seed GitHub from a GoFile restore when the branch already
+    holds state, unless GIT_STATE_SEED_FORCE=1 says the operator meant it.
   * Tokens are stripped from every log line and exception message.
 
 History is bounded: after GIT_STATE_MAX_COMMITS commits the branch is squashed
@@ -59,6 +77,13 @@ MANIFEST_NAME = "MANIFEST.json"
 ENCRYPTED_SUFFIX = ".enc"
 ROLE_ACTIVE = "active"
 ROLE_STANDBY = "standby"
+
+# What the remote state branch looks like to us. "unknown" is the answer for
+# a repo we could not reach at all, which is deliberately NOT the same as
+# "empty": only an empty branch is safe to seed.
+REMOTE_HAS_STATE = "has-state"
+REMOTE_EMPTY = "empty"
+REMOTE_UNKNOWN = "unknown"
 
 # Files that must never be committed in the clear. Matched on the data-dir
 # relative path.
@@ -121,6 +146,13 @@ class GitConfig:
         role_switch_min: int = 300,
         allow_public: bool = False,
         workdir: "Path | None" = None,
+        watch: bool = True,
+        watch_seconds: int = 5,
+        debounce_seconds: int = 10,
+        min_push_interval: int = 20,
+        retry_seconds: int = 30,
+        seed_from_gofile: bool = False,
+        seed_force: bool = False,
     ) -> None:
         self.repo = repo
         self.token = token
@@ -140,8 +172,19 @@ class GitConfig:
         self.workdir = workdir or Path(
             os.environ.get("GIT_STATE_WORKDIR", "/tmp/hermes-git-state")
         )
+        self.watch = watch
+        self.watch_seconds = watch_seconds
+        self.debounce_seconds = debounce_seconds
+        self.min_push_interval = min_push_interval
+        self.retry_seconds = retry_seconds
+        # Set when this instance booted from the GoFile archive because GitHub
+        # was empty or unreachable. Until the seed succeeds, it is a promise
+        # not to overwrite GitHub state we never restored from.
+        self.seed_from_gofile = seed_from_gofile
+        self.seed_force = seed_force
         self.role = ROLE_ACTIVE
         self._visibility_checked = False
+        self._last_push_at = 0.0
 
     @classmethod
     def from_env(cls) -> "GitConfig | None":
@@ -161,8 +204,23 @@ class GitConfig:
                 LOG.warning("invalid %s; using %s", name, default)
                 return default
 
+        def non_negative_int(name: str, default: int) -> int:
+            """Like positive_int, but 0 is a meaningful value ("no wait")."""
+            try:
+                return max(0, int(os.environ.get(name, str(default))))
+            except (TypeError, ValueError):
+                LOG.warning("invalid %s; using %s", name, default)
+                return default
+
         def flag(name: str) -> bool:
             return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+        def flag_on(name: str) -> bool:
+            """On unless explicitly turned off."""
+            raw = os.environ.get(name, "").strip().lower()
+            if not raw:
+                return True
+            return raw in ("1", "true", "yes", "on")
 
         free_storage = _load_free_storage()
         return cls(
@@ -183,6 +241,17 @@ class GitConfig:
             poll_interval=positive_int("HERMES_LEASE_POLL_SECONDS", 30),
             role_switch_min=positive_int("HERMES_ROLE_SWITCH_MIN_SECONDS", 300),
             allow_public=flag("GIT_STATE_ALLOW_PUBLIC"),
+            watch=flag_on("GIT_STATE_WATCH"),
+            # How often the tree is fingerprinted, how long it has to stay
+            # quiet before that change is pushed, and the hard floor between
+            # two pushes. Defaults put a change in GitHub within ~20s while
+            # capping a frantic agent at ~3 commits a minute.
+            watch_seconds=positive_int("GIT_STATE_WATCH_SECONDS", 5),
+            debounce_seconds=non_negative_int("GIT_STATE_DEBOUNCE_SECONDS", 10),
+            min_push_interval=non_negative_int("GIT_STATE_MIN_PUSH_INTERVAL_SECONDS", 20),
+            retry_seconds=positive_int("GIT_STATE_RETRY_SECONDS", 30),
+            seed_from_gofile=flag("GIT_STATE_SEED_FROM_GOFILE"),
+            seed_force=flag("GIT_STATE_SEED_FORCE"),
         )
 
     @property
@@ -322,6 +391,151 @@ def ensure_clone(config: GitConfig) -> Path:
         run_git(["init", "-q", "-b", config.branch, "."], cwd=workdir, config=config)
         run_git(["remote", "add", "origin", config.remote_url], cwd=workdir, config=config)
     return workdir
+
+
+def head_commit(workdir: Path, config: GitConfig) -> str:
+    """The checked-out commit, or "" when the branch has no commits yet.
+
+    ``git rev-parse HEAD`` cannot answer that question on its own: in a repo
+    with no commits it prints the literal string "HEAD" and exits non-zero,
+    which reads like a perfectly good (and completely unusable) refspec.
+    ``--verify`` prints nothing instead, which is what callers actually want.
+    """
+    proc = run_git(["rev-parse", "--verify", "HEAD"], cwd=workdir,
+                   check=False, config=config)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def ensure_initial_commit(workdir: Path, config: GitConfig) -> str:
+    """Create a first commit when the branch is empty. Returns the sha."""
+    existing = head_commit(workdir, config)
+    if existing:
+        return existing
+    (workdir / MANIFEST_NAME).write_text("{}\n", encoding="utf-8")
+    run_git(["add", "-A"], cwd=workdir, config=config)
+    run_git(["commit", "-q", "-m", "initialise state branch"], cwd=workdir,
+            check=False, config=config)
+    run_git(["push", "origin", config.branch], cwd=workdir, check=False, config=config)
+    return head_commit(workdir, config)
+
+
+def remote_has_data(workdir: Path) -> bool:
+    """Does the checked-out branch carry a state tree?"""
+    source_root = workdir / DATA_SUBDIR
+    if not source_root.is_dir():
+        return False
+    return any(path.is_file() for path in source_root.rglob("*"))
+
+
+def remote_branch_state(config: GitConfig) -> str:
+    """Is the state branch on the remote? "present", "absent" or "unknown".
+
+    One `git ls-remote --heads`, so a few hundred bytes: cheap enough to run
+    on every boot before deciding where to restore from.
+    """
+    proc = run_git(
+        ["ls-remote", "--exit-code", "--heads", config.remote_url, config.branch],
+        check=False, config=config,
+    )
+    if proc.returncode == 0:
+        return "present"
+    if proc.returncode == 2:
+        # --exit-code: "no matching refs", i.e. the branch really is absent.
+        return "absent"
+    LOG.debug("ls-remote failed (%s): %s", proc.returncode,
+              redact(proc.stderr.strip()))
+    return "unknown"
+
+
+def probe_state(config: GitConfig) -> str:
+    """REMOTE_HAS_STATE, REMOTE_EMPTY or REMOTE_UNKNOWN.
+
+    "Empty" and "unreachable" must never be confused: only a branch we can see
+    is empty is safe to seed, because seeding force-pushes.
+    """
+    branch = remote_branch_state(config)
+    if branch == "absent":
+        return REMOTE_EMPTY
+    if branch == "unknown":
+        return REMOTE_UNKNOWN
+    try:
+        workdir = ensure_clone(config)
+    except GitStateError as exc:
+        LOG.warning("could not read the state branch: %s", redact(str(exc)))
+        return REMOTE_UNKNOWN
+    return REMOTE_HAS_STATE if remote_has_data(workdir) else REMOTE_EMPTY
+
+
+def state_fingerprint(data_dir: Path) -> str:
+    """Cheap metadata fingerprint of the state directory.
+
+    Borrowed from the GoFile backend so both agree on what counts as a change:
+    metadata only (paths, sizes, mtimes), with volatile paths excluded. It is
+    what lets the daemon notice a change in a few milliseconds instead of
+    copying the whole tree to find out.
+    """
+    excludes, _ = excludes_and_matcher()
+    free_storage = _load_free_storage()
+    return free_storage._state_fingerprint(data_dir, excludes)
+
+
+class ChangeWatcher:
+    """Decides when a change is old enough to be worth pushing.
+
+    Agent state changes in bursts: one message can touch the session database,
+    the memory index and a config file within a second. Pushing on the first
+    write would commit a half-finished burst, so the watcher waits for the tree
+    to stay quiet for `debounce` seconds and then pushes once -- close enough
+    to "immediately" to be useful, and one commit instead of five.
+
+    The clock and the fingerprint sampler are injectable so this is testable
+    without sleeping or writing real files.
+    """
+
+    def __init__(self, data_dir: Path, config: GitConfig, *,
+                 clock=time.time, sampler=None) -> None:
+        self.data_dir = data_dir
+        self.debounce = max(0, config.debounce_seconds)
+        self._clock = clock
+        self._sampler = sampler or (lambda: state_fingerprint(data_dir))
+        self.baseline = self._sample()
+        self.pending_since: "float | None" = None
+        self.not_before = 0.0
+
+    def _sample(self) -> "str | None":
+        try:
+            return self._sampler()
+        except OSError as exc:  # a directory vanished mid-scan
+            LOG.warning("could not fingerprint %s: %s", self.data_dir, exc)
+            return None
+
+    def poll(self) -> bool:
+        """Call once per watch tick. True means "push now".
+
+        A change is noticed on one tick and pushed on a later one, once the
+        tree has held still for `debounce` seconds -- so the delay between the
+        last write and the push is roughly `watch_seconds + debounce`.
+        """
+        now = self._clock()
+        current = self._sample()
+        if current is not None and current != self.baseline:
+            self.baseline = current
+            self.pending_since = now
+        if self.pending_since is None or now < self.not_before:
+            return False
+        return now - self.pending_since >= self.debounce
+
+    def mark_pushed(self) -> None:
+        """Re-baseline after a push so an unchanged tree stays quiet."""
+        self.baseline = self._sample()
+        self.pending_since = None
+        self.not_before = 0.0
+
+    def defer(self, seconds: float) -> None:
+        """A push failed: leave the change pending and back off before retrying."""
+        self.not_before = self._clock() + max(0.0, seconds)
 
 
 # ---------------------------------------------------------------------------
@@ -537,13 +751,29 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
     run_git(["push", "--force", "origin", config.branch], cwd=workdir, config=config)
 
 
-def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False) -> bool:
+def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
+              seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
         LOG.debug("standby instance; not pushing state")
         return True
 
     ensure_safe_to_push(config)
     workdir = ensure_clone(config)
+
+    # This instance booted from the GoFile archive because GitHub was empty or
+    # unreachable. If GitHub has since turned out to hold state we never
+    # restored from, pushing would replace it with an older copy. Refuse and
+    # say what to do about it.
+    if config.seed_from_gofile and not config.seed_force and remote_has_data(workdir):
+        raise GitStateError(
+            f"{config.api_repo}@{config.branch} already holds state, but this "
+            "instance booted from the GoFile archive, so pushing would "
+            "overwrite it with an older copy. GoFile stays the live backup "
+            "here. To adopt the GitHub copy instead, restart once it is the "
+            "branch you want restored; to push this copy anyway, set "
+            "GIT_STATE_SEED_FORCE=1."
+        )
+
     manifest = build_worktree(data_dir, workdir, config)
 
     run_git(["add", "-A"], cwd=workdir, config=config)
@@ -592,6 +822,41 @@ def restore(data_dir: Path, config: GitConfig) -> bool:
     restored = materialize(workdir, data_dir, config)
     LOG.info("restored %d file(s) from %s@%s", restored, config.api_repo, config.branch)
     return restored > 0
+
+
+def seed(data_dir: Path, config: GitConfig) -> bool:
+    """First launch: put the state we just restored from GoFile into GitHub.
+
+    The branch is empty on the first boot, so there is nothing to restore from
+    it and GitHub would stay empty until the daemon's first tick. Seeding
+    closes that gap: whatever this instance restored (from GoFile, or from
+    nothing at all) becomes the first commit, and GitHub is primary from then
+    on.
+
+    It refuses to run against a branch that already holds state unless
+    GIT_STATE_SEED_FORCE=1, because seeding force-pushes and the GoFile copy
+    may be older than what GitHub already has.
+    """
+    state = probe_state(config)
+    if state == REMOTE_HAS_STATE and not config.seed_force:
+        raise GitStateError(
+            f"{config.api_repo}@{config.branch} already holds state; refusing "
+            "to overwrite it. Seeding is only for an empty branch. Set "
+            "GIT_STATE_SEED_FORCE=1 if you really want this copy to win."
+        )
+    if state == REMOTE_UNKNOWN:
+        raise GitStateError(
+            f"could not reach {config.api_repo}@{config.branch}, so it is not "
+            "safe to assume it is empty; not seeding. GoFile stays the live "
+            "backup and the daemon will retry."
+        )
+
+    pushed = sync_once(data_dir, config, force=True, seed=True)
+    if pushed:
+        config.seed_from_gofile = False
+        LOG.info("seeded %s@%s; github is now the primary state store",
+                 config.api_repo, config.branch)
+    return pushed
 
 
 # ---------------------------------------------------------------------------
@@ -650,16 +915,14 @@ def claim_lease(config: GitConfig) -> str:
     now = int(time.time())
     ref = lease_ref(config.priority, config.instance_id, now)
     workdir = ensure_clone(config)
-    head = run_git(["rev-parse", "HEAD"], cwd=workdir, check=False, config=config)
-    target = head.stdout.strip()
+    # On a first launch there is no commit yet, and a lease ref has to point at
+    # one, so make the initial commit if needed.
+    target = ensure_initial_commit(workdir, config)
     if not target:
-        # An empty history has no commit to point a ref at; make one.
-        (workdir / MANIFEST_NAME).write_text("{}\n", encoding="utf-8")
-        run_git(["add", "-A"], cwd=workdir, config=config)
-        run_git(["commit", "-q", "-m", "initialise state branch"], cwd=workdir,
-                check=False, config=config)
-        run_git(["push", "origin", config.branch], cwd=workdir, check=False, config=config)
-        target = run_git(["rev-parse", "HEAD"], cwd=workdir, config=config).stdout.strip()
+        raise GitStateError(
+            "no commit to anchor a failover lease on; the state branch could "
+            "not be initialised"
+        )
 
     stale = [
         lease_ref(priority, instance, updated)
@@ -719,8 +982,11 @@ def run_daemon(data_dir: Path, config: GitConfig) -> None:
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
     LOG.info(
-        "git state sync enabled; repo=%s branch=%s interval=%ss",
+        "git state sync enabled; repo=%s branch=%s interval=%ss%s",
         config.api_repo, config.branch, config.interval,
+        "" if not config.watch else
+        f" watch={config.watch_seconds}s debounce={config.debounce_seconds}s"
+        f" min-gap={config.min_push_interval}s",
     )
 
     last_heartbeat = 0.0
@@ -734,10 +1000,31 @@ def run_daemon(data_dir: Path, config: GitConfig) -> None:
         except GitStateError as exc:
             LOG.warning("could not claim lease; assuming active: %s", redact(str(exc)))
 
+    # Let the upstream entrypoint finish its first-boot directory setup before
+    # the first upload. bootstrap.sh has already seeded an empty branch by now.
     if stop.wait(min(15, config.interval)):
         return
 
+    # Change-driven saves. The interval below is only the safety net: a change
+    # is normally pushed within `debounce` seconds of the last write, not at
+    # the next interval boundary.
+    watcher = ChangeWatcher(data_dir, config) if config.watch else None
+
+    def push(reason: str) -> None:
+        try:
+            sync_once(data_dir, config)
+        except GitStateError as exc:
+            LOG.warning("git state push failed (%s); will retry: %s",
+                        reason, redact(str(exc)))
+            if watcher is not None:
+                watcher.defer(config.retry_seconds)
+            return
+        config._last_push_at = time.time()
+        if watcher is not None:
+            watcher.mark_pushed()
+
     next_sync = 0.0
+    last_scan = 0.0
     while not stop.is_set():
         now = time.time()
         if config.failover:
@@ -763,15 +1050,23 @@ def run_daemon(data_dir: Path, config: GitConfig) -> None:
                 stop.wait(5)
                 continue
 
+        if watcher is not None and now - last_scan >= config.watch_seconds:
+            last_scan = now
+            # A burst of writes should become one commit, so wait for quiet
+            # before pushing -- then respect the minimum gap so a very chatty
+            # agent cannot turn one minute into dozens of commits.
+            if watcher.poll() and now - config._last_push_at >= config.min_push_interval:
+                push("change detected")
+
         if now >= next_sync:
             next_sync = now + config.interval
-            try:
-                sync_once(data_dir, config)
-            except GitStateError as exc:
-                LOG.warning("git state push failed; will retry: %s", redact(str(exc)))
+            push("safety-net interval")
 
-        stop.wait(min(config.poll_interval if config.failover else config.interval,
-                      config.interval))
+        stop.wait(min(
+            config.watch_seconds,
+            config.poll_interval if config.failover else config.interval,
+            config.interval,
+        ))
 
     try:
         sync_once(data_dir, config, force=True)
@@ -791,7 +1086,10 @@ def _request_restart(reason: str) -> bool:
 
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("restore", "sync", "daemon", "role", "release"))
+    parser.add_argument(
+        "command",
+        choices=("restore", "sync", "seed", "state", "daemon", "role", "release"),
+    )
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args(argv)
     logging.basicConfig(
@@ -813,6 +1111,16 @@ def main(argv: "list[str] | None" = None) -> int:
         if args.command == "release":
             release_lease(config)
             return 0
+        if args.command == "state":
+            # bootstrap.sh branches on this to decide where to restore from,
+            # so it is printed even when the answer is a non-zero exit code.
+            found = probe_state(config)
+            print(found)
+            if found == REMOTE_HAS_STATE:
+                return 0
+            return 3 if found == REMOTE_EMPTY else 4
+        if args.command == "seed":
+            return 0 if seed(args.data_dir, config) else 1
         if args.command == "restore":
             return 0 if restore(args.data_dir, config) else 2
         if args.command == "sync":
