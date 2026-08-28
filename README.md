@@ -325,6 +325,69 @@ the build context, so a single copied `run-local.sh` can build and run on its
 own. Maintainers refresh that copy with `./run-local.sh update-embed` after
 changing the baked-in files.
 
+## Environment variables in the repo
+
+Secrets can live in this repo instead of only in Render's Environment tab —
+encrypted, never in plaintext. Two files under [`env/`](./env) hold everything:
+
+| File | Contents | Committed |
+|---|---|---|
+| `env/common.env` | Non-secret config (`HERMES_*`, `PORT`, resource guardrails, GoFile defaults) | Plaintext |
+| `env/secrets.enc.env` | API keys and tokens, values encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) | Encrypted |
+
+The encrypted file is a dotenv whose **keys stay readable and whose values are
+ciphertext**, so `git diff` shows *which* variable changed without leaking it.
+
+### Setup
+
+```bash
+./run-local.sh secrets init     # generate an age key, record the public recipient
+./run-local.sh secrets edit     # opens $EDITOR; saves re-encrypted
+git add .sops.yaml env/secrets.enc.env && git commit
+```
+
+`secrets init` writes the private key to `~/.config/sops/age/keys.txt` and puts
+only the **public** recipient in `.sops.yaml`. To let the deployed service
+decrypt, paste the `AGE-SECRET-KEY-...` line into Render → **Environment** as
+`SOPS_AGE_KEY` (or mount it as a Secret File at `/etc/secrets/age.key`). That
+one variable replaces pasting every individual key into the dashboard.
+
+`run-local.sh` needs no extra flags: it decrypts `env/secrets.enc.env`
+automatically when the age key is present, and warns and carries on when it
+isn't, so a collaborator without the key can still run the agent from their own
+`.env`.
+
+### Precedence
+
+Identical locally and on Render, highest first:
+
+1. **The process environment** — Render's Environment tab, or your shell. The
+   repo never overrides a live deploy knob, so the dashboard stays the
+   emergency override.
+2. **An existing `$HERMES_HOME/.env`** — written by the dashboard's API Keys tab
+   or restored from GoFile. A key set from the UI is not reverted to the
+   committed one.
+3. **`env/secrets.enc.env`** — fills in whatever is still missing.
+
+Set `RENDER_TOOLS_SECRETS_FORCE=1` to swap 2 and 3, which is what you want after
+rotating a key in git. On boot, [`scripts/seed-env.py`](scripts/seed-env.py)
+merges the decrypted values into `$HERMES_HOME/.env` insert-only and exports the
+ones the process environment lacks, so `config.yaml`'s `${RENDER_MCP_API_KEY}`
+substitution resolves from a committed secret too. Only variable *names* are
+logged, never values.
+
+### What this does and does not protect
+
+Committing encrypted secrets means the ciphertext is in git history forever. It
+is safe against the repo being read — by a collaborator, a fork, or an
+accidental public flip — and it is *not* safe against the age private key
+leaking, which retroactively exposes every version of every secret ever
+committed. Rotate the key by re-running `secrets init` after deleting
+`~/.config/sops/age/keys.txt`, re-encrypting, and updating `SOPS_AGE_KEY`.
+
+Never commit: `~/.config/sops/age/keys.txt`, anything matching `*.key`, or a
+decrypted copy of the secrets file. `.gitignore` covers the usual names.
+
 ## Cost expectations
 
 This Blueprint uses Render's **Free** web-service instance. It has no service charge, but Free usage is subject to Render's monthly instance-hour allowance and the service spins down after inactivity. The next request may wait for a cold start. There is no persistent-disk charge because Free services cannot attach persistent disks.

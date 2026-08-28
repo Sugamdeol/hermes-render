@@ -1,0 +1,18 @@
+# SOPS rules for this repo.
+#
+# `env/secrets.enc.env` is a dotenv file whose VALUES are encrypted and whose
+# KEYS stay in plaintext, so a diff shows which variables changed without
+# revealing any of them.
+#
+# The age recipient below is a PUBLIC key: it is safe to commit. The matching
+# private key must never be committed. Generate the pair with:
+#
+#     ./run-local.sh secrets init
+#
+# which writes the private key to ~/.config/sops/age/keys.txt and fills in the
+# recipient here. To let the Render service decrypt, paste that private key
+# into Render's Environment tab as SOPS_AGE_KEY.
+creation_rules:
+  - path_regex: env/secrets\.enc\.env$
+    # Replaced by `./run-local.sh secrets init`.
+    age: REPLACE_WITH_AGE_RECIPIENT

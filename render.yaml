@@ -137,3 +137,14 @@ services:
       # account role behind the key determines what the agent can do.
       - key: RENDER_MCP_API_KEY
         sync: false
+
+      # Private age key that decrypts env/secrets.enc.env at boot. Paste the
+      # AGE-SECRET-KEY-... line produced by `./run-local.sh secrets init`.
+      # This single value replaces pasting every API key into this tab: the
+      # rest travel with the repo, encrypted. Leave it blank to ignore the
+      # committed secrets and configure everything from this tab instead.
+      #
+      # A Render Secret File mounted at /etc/secrets/age.key works too, and
+      # bootstrap.sh picks it up automatically.
+      - key: SOPS_AGE_KEY
+        sync: false

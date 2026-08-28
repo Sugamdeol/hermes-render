@@ -54,6 +54,76 @@ if [ ! -f "${CONFIG_FILE}" ] && [ -f "${UPSTREAM_CONFIG}" ]; then
   fi
 fi
 
+# Merge repo-managed environment into the runtime environment before the
+# patcher runs, so config.yaml substitutions like ${RENDER_MCP_API_KEY} can
+# resolve from a committed secret as well as from Render's Environment tab.
+#
+# Precedence (highest first): the live process environment, then the existing
+# $HERMES_HOME/.env, then the repo. Set RENDER_TOOLS_SECRETS_FORCE=1 to let the
+# repo win over .env, which is what a key rotation in git wants.
+#
+# Values are never echoed. The decrypted file lives in a private tmpfs-ish
+# temp dir owned by hermes and is removed immediately after the merge.
+SEEDER="/opt/render-tools/seed-env.py"
+COMMON_ENV="/opt/render-tools/env/common.env"
+SECRETS_ENC="/opt/render-tools/env/secrets.enc.env"
+
+seed_from_file() {
+  # $1 = plaintext dotenv path. Emits exports on stdout for eval by the caller.
+  seed_args="--secrets $1 --env-file ${DATA_DIR}/.env --print-exports"
+  if [ "${RENDER_TOOLS_SECRETS_FORCE:-0}" = "1" ]; then
+    seed_args="${seed_args} --force"
+  fi
+  # shellcheck disable=SC2086
+  gosu hermes "${SEEDER}" ${seed_args}
+}
+
+if [ -x "${SEEDER}" ] && [ -f "${COMMON_ENV}" ]; then
+  if exports="$(seed_from_file "${COMMON_ENV}" 2>/dev/null)"; then
+    eval "${exports}"
+    unset exports
+  else
+    echo "[render-tools] warning: could not merge env/common.env; continuing" >&2
+  fi
+fi
+
+if [ -x "${SEEDER}" ] && [ -f "${SECRETS_ENC}" ]; then
+  if [ -z "${SOPS_AGE_KEY:-}" ] && [ -z "${SOPS_AGE_KEY_FILE:-}" ] \
+     && [ ! -f /etc/secrets/age.key ]; then
+    echo "[render-tools] encrypted secrets present but no age key (SOPS_AGE_KEY);" >&2
+    echo "[render-tools] skipping decryption and using the process environment only" >&2
+  elif ! command -v sops >/dev/null 2>&1; then
+    echo "[render-tools] warning: sops not installed; skipping encrypted secrets" >&2
+  else
+    # A Render Secret File is the other supported way to supply the key.
+    if [ -z "${SOPS_AGE_KEY:-}" ] && [ -z "${SOPS_AGE_KEY_FILE:-}" ] \
+       && [ -f /etc/secrets/age.key ]; then
+      SOPS_AGE_KEY_FILE=/etc/secrets/age.key
+      export SOPS_AGE_KEY_FILE
+    fi
+    SECRETS_TMP="$(mktemp -d)"
+    chown hermes:hermes "${SECRETS_TMP}"
+    chmod 0700 "${SECRETS_TMP}"
+    if gosu hermes env \
+         SOPS_AGE_KEY="${SOPS_AGE_KEY:-}" \
+         SOPS_AGE_KEY_FILE="${SOPS_AGE_KEY_FILE:-}" \
+         sops --decrypt --input-type dotenv --output-type dotenv \
+           --output "${SECRETS_TMP}/secrets.env" "${SECRETS_ENC}" 2>/dev/null; then
+      if exports="$(seed_from_file "${SECRETS_TMP}/secrets.env")"; then
+        eval "${exports}"
+        unset exports
+      else
+        echo "[render-tools] warning: could not merge decrypted secrets; continuing" >&2
+      fi
+    else
+      echo "[render-tools] warning: sops could not decrypt ${SECRETS_ENC}" >&2
+      echo "[render-tools] check that SOPS_AGE_KEY matches the recipient in .sops.yaml" >&2
+    fi
+    rm -rf "${SECRETS_TMP}"
+    unset SECRETS_TMP
+  fi
+fi
+
 # Apply the resource profile once per data tree. The marker is restored along
 # with GoFile state, so later dashboard edits are not repeatedly overwritten.
 RESOURCE_MARKER="${DATA_DIR}/.render-tools-free-profile-v1"

@@ -3,6 +3,16 @@
 .env.local
 .env.*.local
 
+# age / SOPS private keys, and any DECRYPTED copy of the repo secrets.
+# env/secrets.enc.env is the encrypted file and IS meant to be committed;
+# anything that looks like its plaintext is not.
+keys.txt
+*.agekey
+age-key.txt
+env/secrets.env
+env/*.plain.env
+env/*.dec.env
+
 # SSH keys, certificates, anything secret-shaped. Never commit.
 *.pem
 *.key

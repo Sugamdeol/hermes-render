@@ -108,6 +108,44 @@ COPY --chown=hermes:hermes skills/ /opt/render-tools/skills-local/
 # hand-editing config.yaml.
 COPY --chown=hermes:hermes dashboard-plugins/ /opt/render-tools/dashboard-plugins/
 
+# Repo-managed environment: non-secret defaults plus the SOPS-encrypted
+# secrets file. Both are decrypted/merged at boot by bootstrap.sh. The
+# encrypted file is optional -- the directory is copied whether or not
+# `secrets.enc.env` has been created, so a fresh clone still builds.
+COPY --chown=hermes:hermes env/ /opt/render-tools/env/
+COPY --chown=root:root scripts/seed-env.py /opt/render-tools/seed-env.py
+
+# SOPS decrypts env/secrets.enc.env at boot using the age key supplied as
+# SOPS_AGE_KEY. Pinned by version; the checksum is verified against the
+# release's own checksums.txt. Set SOPS_SHA256 at build time to pin the exact
+# digest instead, which is stronger:
+#   docker build --build-arg SOPS_SHA256=<digest> ...
+ARG SOPS_VERSION=v3.13.3
+ARG SOPS_SHA256=
+ARG TARGETARCH
+RUN set -eu; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "${arch}" in \
+      amd64|arm64) ;; \
+      *) echo "unsupported TARGETARCH=${arch} for sops" >&2; exit 1 ;; \
+    esac; \
+    tmp="$(mktemp -d)"; \
+    base="https://github.com/getsops/sops/releases/download/${SOPS_VERSION}"; \
+    curl -fsSL --retry 3 -o "${tmp}/sops" "${base}/sops-${SOPS_VERSION}.linux.${arch}"; \
+    if [ -n "${SOPS_SHA256}" ]; then \
+      echo "${SOPS_SHA256}  ${tmp}/sops" | sha256sum -c -; \
+    else \
+      curl -fsSL --retry 3 -o "${tmp}/checksums.txt" \
+        "${base}/sops-${SOPS_VERSION}.checksums.txt"; \
+      expected="$(grep " sops-${SOPS_VERSION}.linux.${arch}\$" "${tmp}/checksums.txt" \
+        | head -n 1 | cut -d' ' -f1)"; \
+      test -n "${expected}" || { echo "no checksum for sops linux.${arch}" >&2; exit 1; }; \
+      echo "${expected}  ${tmp}/sops" | sha256sum -c -; \
+    fi; \
+    install -o root -g root -m 0755 "${tmp}/sops" /usr/local/bin/sops; \
+    rm -rf "${tmp}"; \
+    sops --version --disable-version-check
+
 # Boot-time wrapper: restores optional remote state, patches
 # /opt/data/config.yaml, starts optional state sync, then hands off to the
 # upstream entrypoint chain (tini → docker/entrypoint.sh).
@@ -115,7 +153,7 @@ COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
 COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
 RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
-             /opt/render-tools/free-storage.py
+             /opt/render-tools/free-storage.py /opt/render-tools/seed-env.py
 
 # Pre-create the dir the patcher writes to so chown works cleanly on
 # first boot. Render Free has no persistent disk, so this image directory
