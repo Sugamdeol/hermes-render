@@ -555,15 +555,29 @@ class ChangeWatcherTests(unittest.TestCase):
         sampler.value = "changed"
         self.assertTrue(watcher.poll())
 
-    def test_fingerprint_changes_when_a_state_file_changes(self):
+    def test_fingerprint_notices_a_new_file(self):
         storage = self.storage
         with tempfile.TemporaryDirectory() as directory:
             data_dir = Path(directory)
             (data_dir / "config.yaml").write_text("model: x\n")
             before = storage.state_fingerprint(data_dir)
-            (data_dir / "config.yaml").write_text("model: y\n")
-            after = storage.state_fingerprint(data_dir)
-            self.assertNotEqual(before, after)
+            (data_dir / "memories").mkdir()
+            (data_dir / "memories" / "new.md").write_text("a thought")
+            self.assertNotEqual(before, storage.state_fingerprint(data_dir))
+
+    def test_fingerprint_notices_a_size_change(self):
+        # Size is part of the fingerprint, so a longer write is always seen.
+        # A same-size rewrite is not asserted on: on filesystems with coarse
+        # mtime granularity it is indistinguishable from no change at the
+        # metadata level, which is exactly what the interval sync covers --
+        # it compares contents against the remote, not metadata.
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = Path(directory)
+            (data_dir / "config.yaml").write_text("model: x\n")
+            before = storage.state_fingerprint(data_dir)
+            (data_dir / "config.yaml").write_text("model: x\nmodel: y\n")
+            self.assertNotEqual(before, storage.state_fingerprint(data_dir))
 
     def test_fingerprint_ignores_excluded_churn(self):
         storage = self.storage
