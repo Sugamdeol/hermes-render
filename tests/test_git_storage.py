@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
+import shutil
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -217,35 +220,107 @@ class MirrorPlanTests(unittest.TestCase):
 
 
 class SecretHandlingTests(unittest.TestCase):
+    """GIT_STATE_ENV_MODE decides how .env reaches the branch."""
+
     def setUp(self):
         self.storage = load_storage()
+        self._saved_age_encrypt = self.storage.age_encrypt
 
-    def test_env_is_omitted_rather_than_committed_in_the_clear(self):
-        """No age recipient must mean .env is skipped, never pushed plaintext."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            data_dir = root / "data"
-            data_dir.mkdir()
-            (data_dir / ".env").write_text("HERMES_API_KEY=super-secret\n")
-            (data_dir / "config.yaml").write_text("model: x\n")
-            workdir = root / "work"
-            workdir.mkdir()
+    def tearDown(self):
+        self.storage.age_encrypt = self._saved_age_encrypt
 
-            config = make_config(self.storage, age_recipient="")
-            manifest = self.storage.build_worktree(data_dir, workdir, config)
+    def _mirror(self, env_mode=None, **overrides):
+        """Build a worktree over a data dir holding a .env, return the result."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        data_dir = root / "data"
+        data_dir.mkdir()
+        (data_dir / ".env").write_text("HERMES_API_KEY=super-secret\n")
+        (data_dir / "config.yaml").write_text("model: x\n")
+        workdir = root / "work"
+        workdir.mkdir()
 
-            mirrored = {
-                p.relative_to(workdir).as_posix()
-                for p in workdir.rglob("*") if p.is_file()
-            }
-            self.assertIn("data/config.yaml", mirrored)
-            self.assertNotIn("data/.env", mirrored)
-            self.assertIn(".env", manifest["omitted"])
-            blob = "\n".join(
-                p.read_text(errors="ignore")
-                for p in workdir.rglob("*") if p.is_file()
-            )
-            self.assertNotIn("super-secret", blob)
+        if env_mode is not None:
+            overrides.setdefault("env_mode", env_mode)
+        config = make_config(self.storage, **overrides)
+        manifest = self.storage.build_worktree(data_dir, workdir, config)
+        mirrored = {
+            p.relative_to(workdir).as_posix()
+            for p in workdir.rglob("*") if p.is_file()
+        }
+        blob = "\n".join(
+            p.read_text(errors="ignore") for p in workdir.rglob("*") if p.is_file()
+        )
+        return manifest, mirrored, blob
+
+    def test_env_is_committed_in_the_clear_by_default(self):
+        """The point of the change: the dotenv is part of the backup."""
+        manifest, mirrored, blob = self._mirror()
+        self.assertIn("data/config.yaml", mirrored)
+        self.assertIn("data/.env", mirrored)
+        self.assertIn("super-secret", blob)
+        self.assertEqual(manifest["omitted"], [])
+        self.assertEqual(manifest["plaintext_env"], [".env"])
+
+    def test_the_plaintext_mode_says_so_in_the_log(self):
+        """Live keys going into git should never be a silent decision."""
+        with self.assertLogs("hermes-git-storage", level="WARNING") as logged:
+            self._mirror()
+        self.assertTrue(any("in the clear" in line for line in logged.output),
+                        logged.output)
+
+    def test_encrypt_mode_seals_the_dotenv(self):
+        # A fake that says what it sealed without echoing the plaintext back,
+        # so the "no secret in the tree" assertion below has teeth.
+        self.storage.age_encrypt = lambda payload, config: (
+            b"SEALED(" + str(len(payload)).encode() + b")")
+        manifest, mirrored, blob = self._mirror(env_mode="encrypt",
+                                                age_recipient="age1test")
+        self.assertIn("data/.env.enc", mirrored)
+        self.assertNotIn("data/.env", mirrored)
+        self.assertNotIn("super-secret", blob)
+        self.assertIn("SEALED(28)", blob)
+        self.assertEqual(manifest["encrypted"], [".env"])
+        self.assertEqual(manifest["plaintext_env"], [])
+
+    def test_encrypt_mode_omits_rather_than_falling_back_to_plaintext(self):
+        """No working age setup must never quietly mean "in the clear"."""
+        self.storage.age_encrypt = lambda payload, config: None
+        manifest, mirrored, blob = self._mirror(env_mode="encrypt",
+                                                age_recipient="")
+        self.assertNotIn("data/.env", mirrored)
+        self.assertNotIn("super-secret", blob)
+        self.assertIn(".env", manifest["omitted"])
+
+    def test_omit_mode_leaves_the_dotenv_out(self):
+        manifest, mirrored, blob = self._mirror(env_mode="omit")
+        self.assertNotIn("data/.env", mirrored)
+        self.assertNotIn("super-secret", blob)
+        self.assertIn(".env", manifest["omitted"])
+
+    def test_an_unrecognised_mode_falls_back_to_the_default(self):
+        config = make_config(self.storage, env_mode="encrypt-ish")
+        self.assertEqual(config.env_mode, self.storage.DEFAULT_ENV_MODE)
+
+    def test_recovered_env_files_are_committed_too(self):
+        """A .env that only exists in the GoFile archive is not left behind."""
+        manifest = self._mirror()[0]
+        self.assertEqual(manifest["reconciled"], [])
+
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        data_dir = root / "data"
+        data_dir.mkdir()
+        (data_dir / "config.yaml").write_text("model: x\n")
+        workdir = root / "work"
+        workdir.mkdir()
+        manifest = self.storage.build_worktree(
+            data_dir, workdir, make_config(self.storage),
+            extra={".env": b"HERMES_API_KEY=from-the-archive\n"})
+        self.assertEqual(manifest["reconciled"], [".env"])
+        self.assertIn(".env", manifest["plaintext_env"])
+        self.assertEqual((workdir / "data" / ".env").read_text(),
+                         "HERMES_API_KEY=from-the-archive\n")
 
 
 class SafetyTests(unittest.TestCase):
@@ -1079,6 +1154,273 @@ class BootstrapOrderTests(unittest.TestCase):
         daemon = (Path(__file__).resolve().parents[1]
                   / "scripts" / "git-storage.py").read_text(encoding="utf-8")
         self.assertIn("seed_on_startup(data_dir, config)", daemon)
+
+    def test_the_daemon_runs_the_gofile_reconcile_after_boot(self):
+        daemon = (Path(__file__).resolve().parents[1]
+                  / "scripts" / "git-storage.py").read_text(encoding="utf-8")
+        self.assertIn("reconcile_on_startup(data_dir, config)", daemon)
+
+    def test_bootstrap_never_reconciles_inline(self):
+        """The archive download must sit behind the port bind, not in front."""
+        for line in self.source.splitlines():
+            code = line.split("#", 1)[0]
+            self.assertNotRegex(code, r"reconcile",
+                                f"bootstrap.sh reconciles inline: {line.strip()}")
+
+
+class GofileReconcileTests(LocalRemoteTests):
+    """Once per start: whatever GoFile has and GitHub does not gets pushed."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_fetch = self.storage.latest_gofile_archive
+        self.archive = self.root / "gofile-state.tar.gz"
+
+    def tearDown(self):
+        self.storage.latest_gofile_archive = self._saved_fetch
+        super().tearDown()
+
+    def write_archive(self, members, *, unsafe=(), links=()):
+        """Build a tar.gz shaped like the one the GoFile backend uploads."""
+        with tarfile.open(self.archive, "w:gz") as tar:
+            for name, content in members.items():
+                payload = content.encode()
+                info = tarfile.TarInfo("./" + name)
+                info.size = len(payload)
+                tar.addfile(info, io.BytesIO(payload))
+            for name in unsafe:
+                tar.addfile(tarfile.TarInfo(name))
+            for name, target in links:
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = target
+                tar.addfile(info)
+        return self.archive
+
+    def use_archive(self, archive=None):
+        source = archive or self.archive
+        self.storage.latest_gofile_archive = lambda destination: (
+            shutil.copyfile(source, destination) or destination)
+
+    def data_dir(self, **files):
+        data_dir = self.root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        for name, content in files.items():
+            path = data_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        return data_dir
+
+    def remote_file(self, relative):
+        proc = subprocess.run(
+            ["git", f"--git-dir={self.remote}", "show", f"state:data/{relative}"],
+            capture_output=True, text=True)
+        return proc.stdout if proc.returncode == 0 else None
+
+    def test_files_missing_from_github_are_pushed_from_the_archive(self):
+        storage = self.storage
+        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
+        self.write_archive({
+            "config.yaml": "model: local\n",
+            ".env": "HERMES_API_KEY=from-the-archive\n",
+            "memories/note.md": "remembered\n",
+        })
+        self.use_archive()
+
+        result = storage.reconcile_gofile_to_github(data_dir, self.make_config())
+
+        self.assertEqual(result["status"], "pushed")
+        self.assertEqual(result["added"], [".env", "memories/note.md"])
+        self.assertIn("data/.env", self.remote_tree())
+        self.assertIn("data/memories/note.md", self.remote_tree())
+        self.assertEqual(self.remote_file(".env"), "HERMES_API_KEY=from-the-archive\n")
+
+    def test_excluded_archive_members_are_not_pushed(self):
+        """Logs and caches are not state, even when the archive carries them."""
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({
+            "config.yaml": "model: x\n",
+            "logs/gateway.log": "chatter\n",
+            "memories/note.md": "remembered\n",
+        })
+        self.use_archive()
+
+        self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
+
+        self.assertIn("data/memories/note.md", self.remote_tree())
+        self.assertNotIn("data/logs/gateway.log", self.remote_tree())
+
+    def test_a_file_already_on_the_branch_keeps_its_own_contents(self):
+        """This is a backfill: it never overwrites what GitHub already has."""
+        storage = self.storage
+        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
+        storage.sync_once(data_dir, self.make_config())
+        self.write_archive({
+            "config.yaml": "model: STALE COPY FROM THE ARCHIVE\n",
+            "memories/note.md": "remembered\n",
+        })
+        self.use_archive()
+
+        result = storage.reconcile_gofile_to_github(
+            data_dir, self.make_config(workdir=self.root / "work2"))
+
+        self.assertEqual(result["added"], ["memories/note.md"])
+        self.assertEqual(self.remote_file("config.yaml"), "model: local\n")
+
+    def test_a_file_present_locally_is_pushed_from_disk_not_the_archive(self):
+        """The on-disk copy is what this instance booted from; it wins."""
+        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
+        self.write_archive({"config.yaml": "model: from-the-archive\n"})
+        self.use_archive()
+
+        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
+
+        self.assertEqual(result["added"], [])
+        self.assertEqual(self.remote_file("config.yaml"), "model: local\n")
+
+    def test_an_encrypted_copy_on_the_branch_counts_as_present(self):
+        """.env.enc on the branch and .env in the archive are the same file."""
+        storage = self.storage
+        saved = storage.age_encrypt
+        storage.age_encrypt = lambda payload, config: b"SEALED:" + payload
+        try:
+            # Put a branch on the remote whose dotenv was sealed by encrypt
+            # mode, from an instance that had a .env.
+            with_env = self.data_dir(**{"config.yaml": "model: x\n",
+                                        ".env": "HERMES_API_KEY=sealed\n"})
+            storage.sync_once(with_env, self.make_config(env_mode="encrypt",
+                                                         age_recipient="age1test"))
+            self.assertIn("data/.env.enc", self.remote_tree())
+        finally:
+            storage.age_encrypt = saved
+
+        # This instance no longer has a .env on disk, but the archive does.
+        # The branch already holds it (sealed), so it must not be re-added.
+        (self.root / "data" / ".env").unlink()
+        data_dir = self.root / "data"
+        self.write_archive({"config.yaml": "model: x\n", ".env": "KEY=plain\n"})
+        self.use_archive()
+
+        result = storage.reconcile_gofile_to_github(
+            data_dir, self.make_config(workdir=self.root / "work2"))
+
+        self.assertEqual(result["status"], "in-sync")
+        self.assertEqual(result["added"], [])
+        self.assertNotIn("data/.env", self.remote_tree())
+
+    def test_local_state_is_pushed_even_when_the_archive_adds_nothing(self):
+        """The goal is everything on GitHub, not only the GoFile difference."""
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({"config.yaml": "model: x\n"})
+        self.use_archive()
+
+        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
+
+        self.assertEqual(result["status"], "in-sync")
+        self.assertEqual(result["added"], [])
+        self.assertIn("data/config.yaml", self.remote_tree())
+
+    def test_disabled_by_flag(self):
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({"memories/note.md": "remembered\n"})
+        self.use_archive()
+
+        result = self.storage.reconcile_gofile_to_github(
+            data_dir, self.make_config(gofile_reconcile=False))
+
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(self.remote_tree(), set())
+
+    def test_a_standby_does_not_reconcile(self):
+        """A standby's tree is a stale copy; it has no business backfilling."""
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({"memories/note.md": "remembered\n"})
+        self.use_archive()
+        config = self.make_config(failover=True)
+        config.role = self.storage.ROLE_STANDBY
+
+        result = self.storage.reconcile_gofile_to_github(data_dir, config)
+
+        self.assertEqual(result["status"], "standby")
+        self.assertEqual(self.remote_tree(), set())
+
+    def test_no_gofile_archive_is_not_an_error(self):
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.storage.latest_gofile_archive = lambda destination: None
+
+        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
+
+        self.assertEqual(result["status"], "empty")
+        self.assertEqual(result["added"], [])
+        # No archive means no diff, but the local tree still belongs on GitHub.
+        self.assertIn("data/config.yaml", self.remote_tree())
+
+    def test_members_over_the_budget_are_reported_and_skipped(self):
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({"memories/note.md": "remembered\n"})
+        self.use_archive()
+
+        result = self.storage.reconcile_gofile_to_github(
+            data_dir, self.make_config(gofile_reconcile_max_bytes=2))
+
+        self.assertEqual(result["status"], "oversize")
+        self.assertEqual(result["skipped"], ["memories/note.md"])
+        self.assertEqual(result["added"], [])
+        self.assertNotIn("data/memories/note.md", self.remote_tree())
+
+    def test_a_public_repo_is_still_refused_in_plaintext_mode(self):
+        """Plaintext .env makes the private-repo guard matter more, not less."""
+        self.storage.repo_is_private = lambda cfg: False
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        self.write_archive({"memories/note.md": "remembered\n"})
+        self.use_archive()
+        config = self.make_config(allow_public=False)
+        config._visibility_checked = False  # force the check to actually run
+
+        with self.assertRaises(self.storage.GitStateError):
+            self.storage.reconcile_gofile_to_github(data_dir, config)
+        self.assertEqual(self.remote_tree(), set())
+
+    def test_on_startup_swallows_a_failed_reconcile(self):
+        """A backfill must never take the sync daemon down with it."""
+        self.storage.latest_gofile_archive = lambda destination: (_ for _ in ()).throw(
+            RuntimeError("gofile is down"))
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+
+        result = self.storage.reconcile_on_startup(data_dir, self.make_config())
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("gofile is down", result["error"])
+
+    def test_unsafe_archive_paths_are_never_pushed(self):
+        self.write_archive(
+            {"memories/note.md": "remembered\n"},
+            unsafe=("../escape.txt", "/etc/passwd", "logs/../escape2.txt"),
+            links=(("memories/link", "/etc/passwd"),),
+        )
+        self.assertEqual(self.storage.gofile_archive_paths(self.archive),
+                         ["memories/note.md"])
+
+    def test_the_daemon_reconciles_once_after_boot(self):
+        storage = self.storage
+        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
+        seen: list = []
+        stop = threading.Event()
+
+        def fake_reconcile(seen_dir, _config):
+            seen.append(seen_dir)
+            stop.set()
+            return {"status": "in-sync", "added": []}
+
+        saved = (storage.reconcile_on_startup, storage.seed_on_startup)
+        storage.reconcile_on_startup = fake_reconcile
+        storage.seed_on_startup = lambda d, c: False
+        try:
+            storage.run_daemon(data_dir, self.make_config(interval=1), stop)
+        finally:
+            storage.reconcile_on_startup, storage.seed_on_startup = saved
+
+        self.assertEqual(seen, [data_dir])
 
 
 if __name__ == "__main__":
