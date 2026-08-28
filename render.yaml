@@ -80,6 +80,29 @@ services:
         value: "300"
       - key: GOFILE_MAX_ARCHIVE_MB
         value: "100"
+      # Bandwidth brakes. The sync used to re-upload the whole tree whenever
+      # any mtime moved, which on a busy agent meant a full upload every 5
+      # minutes. Now: logs/caches are excluded from the archive, uploads are
+      # spaced by at least this interval, and the monthly byte budget stops
+      # the sync rather than eating a bandwidth allowance. Shutdown always
+      # forces a final upload regardless of these.
+      - key: GOFILE_MIN_UPLOAD_INTERVAL_SECONDS
+        value: "1800"
+      - key: GOFILE_MONTHLY_BUDGET_MB
+        value: "2048"
+
+      # Failover. With HERMES_FAILOVER=1 and a shared GoFile folder, the
+      # highest-priority instance holding a fresh lease handles chat; the
+      # others keep their dashboard but have their chat tokens stripped at
+      # boot and never upload state. Leave this service at the lower priority
+      # so a laptop started with `run-local.sh --takeover` wins, and this one
+      # resumes automatically once the laptop stops and flushes its state.
+      - key: HERMES_FAILOVER
+        value: "1"
+      - key: HERMES_INSTANCE_ID
+        value: render
+      - key: HERMES_INSTANCE_PRIORITY
+        value: "50"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.

@@ -182,6 +182,37 @@ if [ -d "${PLUGINS_SRC}" ]; then
   fi
 fi
 
+# Failover role. When several instances share a GoFile folder (typically this
+# Render service plus a laptop), the highest-priority one with a fresh lease is
+# ACTIVE and the others are STANDBY. A standby keeps its dashboard, but must
+# not talk to chat platforms -- otherwise both agents answer the same Telegram
+# message -- so we strip the channel tokens from its environment here, before
+# the gateway ever sees them.
+#
+# Failing open is deliberate: any error leaves the instance ACTIVE, so a
+# coordination outage can never leave you with no agent answering at all.
+HERMES_ROLE=active
+if [ "${HERMES_FAILOVER:-0}" = "1" ] && [ -x "${STORAGE_SYNC}" ]; then
+  if role_output="$(gosu hermes "${STORAGE_SYNC}" role "${DATA_DIR}" 2>/dev/null)"; then
+    case "${role_output}" in
+      standby) HERMES_ROLE=standby ;;
+      *) HERMES_ROLE=active ;;
+    esac
+  else
+    echo "[render-tools] warning: could not determine failover role; staying active" >&2
+  fi
+  export HERMES_ROLE
+  if [ "${HERMES_ROLE}" = "standby" ]; then
+    echo "[render-tools] role=standby: another instance holds the lease." >&2
+    echo "[render-tools] chat platforms disabled here; dashboard stays available" >&2
+    unset TELEGRAM_BOT_TOKEN DISCORD_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN \
+          SIGNAL_PHONE_NUMBER EMAIL_ADDRESS EMAIL_PASSWORD EMAIL_IMAP_HOST \
+          EMAIL_SMTP_HOST 2>/dev/null || true
+  else
+    echo "[render-tools] role=active: this instance handles messages" >&2
+  fi
+fi
+
 # Keep a remote snapshot up to date in the background. The worker is started
 # as hermes so it cannot read files outside the data directory. It is fully
 # optional and exits cleanly when storage credentials are not configured.

@@ -284,41 +284,89 @@ because it has no authentication. Use `--free-limits` to reproduce Free's
 
 ### Running local and Render at the same time
 
-The two instances are separate agents that share nothing except the identities
-you hand both of them. Three of those identities are single-consumer:
+There are two ways to do this. **Coordinated** is the one you want.
 
-| Shared value | What happens with two live instances |
+#### Coordinated handoff (`--takeover`)
+
+Both instances point at the same GoFile folder and publish a tiny *lease* file
+there. The highest-priority instance with a fresh lease is **active**; everyone
+else is **standby**.
+
+```bash
+./run-local.sh --takeover      # local is priority 100, Render is 50
+```
+
+What happens:
+
+1. Local starts and claims the lease. Within ~30s Render notices, uploads its
+   state one last time, and restarts as standby: its chat tokens are stripped
+   at boot, so Telegram/Discord messages come only to your laptop. Its
+   dashboard stays up.
+2. While local runs, **Render never uploads**, so it cannot clobber your state.
+3. `./run-local.sh down` sends SIGTERM and waits up to 60s. Local uploads a
+   final archive and *then* releases its lease — that order matters, so Render
+   restores complete state rather than a stale snapshot.
+4. Render sees the lease vanish, restarts as active, restores from GoFile, and
+   carries on answering messages.
+
+Failover **fails open**: if GoFile is unreachable or the lease can't be read,
+an instance stays active. A coordination outage can leave you with two agents
+answering, never zero.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERMES_FAILOVER` | `1` on Render | Enable lease coordination |
+| `HERMES_INSTANCE_PRIORITY` | `50` Render / `100` local | Higher wins |
+| `HERMES_LEASE_TTL_SECONDS` | `600` | How long a lease stays valid without a heartbeat |
+| `HERMES_LEASE_HEARTBEAT_SECONDS` | `120` | How often the active instance refreshes it |
+| `HERMES_LEASE_POLL_SECONDS` | `30` | How often a standby re-checks |
+| `HERMES_ROLE_SWITCH_MIN_SECONDS` | `300` | Hysteresis, to stop restart flapping |
+
+Checking costs one folder listing and no downloads — priority and identity are
+encoded in the lease *filename*, freshness is its timestamp — so coordination
+adds essentially nothing to bandwidth.
+
+#### Uncoordinated (what happens if you don't)
+
+Two agents that only look like one:
+
+| Shared value | Result |
 |---|---|
-| `TELEGRAM_BOT_TOKEN` | Telegram allows one `getUpdates` poller per token. The second poller takes over and the other gets HTTP 409; messages land on whichever instance currently holds the connection, unpredictably. |
-| `DISCORD_BOT_TOKEN` | Both gateway connections receive every event, so the user gets two replies to each message. |
-| `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` / IMAP mailboxes | Events are split across connections, or races decide who claims each message. |
-| `GOFILE_API_TOKEN` (+ same folder) | Each sync uploads a full `/opt/data` snapshot and deletes the older archives with the same prefix. Last writer wins; the other instance's sessions and `.env` are lost, and its next boot restores the winner's tree. |
+| `TELEGRAM_BOT_TOKEN` | Telegram allows one poller per token. The second takes over and the other gets HTTP 409; messages land wherever, unpredictably. |
+| `DISCORD_BOT_TOKEN` | Both connections get every event, so users get **two replies**. |
+| `SLACK_*` / IMAP | Events split across connections, or races decide who claims each message. |
+| `GOFILE_API_TOKEN` | Each sync uploads a full snapshot and deletes older ones. Last writer wins; the other's sessions and `.env` are gone. |
 
-Everything else diverges quietly: `/opt/data` is per-instance, so the two
-agents have separate session databases, memories, `config.yaml`, cron jobs, and
-installed skills. The same user talking to "the bot" gets answers from two
-different heads with different context. Cron jobs defined in a config that both
-instances hold will fire twice. A shared `RENDER_MCP_API_KEY` works fine
-technically — the MCP server is stateless — but both agents can then mutate the
-same Render resources.
+`/opt/data` is per-instance regardless, so the two have separate session
+databases, memories, and configs. `run-local.sh up` warns when it is about to
+claim a shared identity without `--takeover`; `--isolate` drops those values
+entirely and gives you a local-only agent.
 
-The safe patterns:
+### Backup bandwidth
 
-- **Local for development, Render for real use** — start with
-  `./run-local.sh --isolate`, which drops the chat-platform tokens and the
-  GoFile token, and chat through the dashboard or `./run-local.sh cli`.
-- **Both on chat** — register a second bot with @BotFather (or a second Discord
-  app) and give the local instance its own token, with the same
-  `TELEGRAM_ALLOWED_USERS`.
-- **Both with remote state** — give the local instance a distinct
-  `GOFILE_FOLDER_NAME` (or `GOFILE_FOLDER_ID`), or leave GoFile off locally;
-  the Docker volume already persists state.
-- **Failover, not parallel** — suspend the Render service before pointing the
-  local instance at the production token. Note that a Free service does not
-  stop polling while it is awake; spinning down is not immediate.
+The GoFile sync was the expensive part of this template: it re-archived and
+re-uploaded **the entire** `/opt/data` — logs included — whenever any file's
+mtime moved, up to every 5 minutes. On a busy agent that is a full upload every
+interval, which is how a bandwidth allowance disappears.
 
-`run-local.sh up` prints a warning listing exactly which shared identities it is
-about to claim, so you find out before a duplicated reply or a clobbered backup.
+Four brakes, all tunable:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `GOFILE_EXCLUDE` | logs, caches, `__pycache__`, tmp, `*.log` | Excluded from the archive *and* the change check, so log churn no longer triggers uploads |
+| `GOFILE_MIN_UPLOAD_INTERVAL_SECONDS` | `1800` | Minimum spacing between uploads |
+| `GOFILE_MONTHLY_BUDGET_MB` | `2048` | Sync pauses for the month instead of eating bandwidth |
+| `GOFILE_CONTENT_CHECK_SECONDS` | `3600` | Periodic full content hash |
+
+Change detection is now two-tier: a cheap metadata scan, then a content hash
+before spending an upload — so a file rewritten with identical contents costs
+nothing. The content check also closes a real bug: a same-size edit within one
+mtime tick (a rotated API key in `.env` is the realistic case) was invisible to
+the old metadata-only fingerprint and would never have been backed up.
+
+Shutdown always forces a final upload, ignoring the interval and the budget, so
+stopping an instance never loses state. Set `GOFILE_EXCLUDE_REPLACE=1` to
+replace the default exclude list rather than extend it.
 
 The script also works away from the repo: it carries a self-extracting copy of
 the build context, so a single copied `run-local.sh` can build and run on its
