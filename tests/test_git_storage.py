@@ -5,6 +5,8 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -727,6 +729,356 @@ class MirrorRoundTripTests(unittest.TestCase):
                 capture_output=True, text=True).stdout.strip()
 
             self.assertEqual(first, second, "an idle sync should not push a commit")
+
+
+class StartupSeedTests(LocalRemoteTests):
+    """The daemon seeds an empty branch after boot, not the boot wrapper.
+
+    A first state push is the largest upload this service makes. Doing it
+    inline delayed the port bind until Render's scan expired and the deploy
+    failed with "no open ports detected", so the seed moved into the daemon.
+    """
+
+    def _data_dir(self, contents="restored from gofile"):
+        data_dir = self.root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "config.yaml").write_text("model: x\n")
+        (data_dir / "memories").mkdir(exist_ok=True)
+        (data_dir / "memories" / "note.md").write_text(contents)
+        return data_dir
+
+    def test_an_empty_branch_is_seeded_from_the_restored_tree(self):
+        storage = self.storage
+        config = self.make_config(seed_from_gofile=True, push_retry_seconds=0)
+
+        self.assertTrue(storage.seed_on_startup(self._data_dir(), config))
+
+        self.assertIn("data/memories/note.md", self.remote_tree())
+        self.assertFalse(config.seed_from_gofile,
+                         "a landed seed must disarm the push guard")
+
+    def test_nothing_is_pushed_when_the_flag_is_not_set(self):
+        """A boot that restored from GitHub has no business seeding."""
+        storage = self.storage
+        config = self.make_config(seed_from_gofile=False)
+
+        self.assertFalse(storage.seed_on_startup(self._data_dir(), config))
+
+        self.assertEqual(self.remote_tree(), set())
+
+    def test_existing_github_state_is_never_seeded_over(self):
+        storage = self.storage
+        storage.seed(self._data_dir("newer github state"), self.make_config())
+
+        # This instance booted from GoFile, so its tree is older than what the
+        # branch holds. The seed has to stand down and leave the guard armed.
+        config = self.make_config(workdir=self.root / "w2", seed_from_gofile=True)
+        self.assertFalse(storage.seed_on_startup(self._data_dir("older gofile copy"),
+                                                 config))
+
+        self.assertTrue(config.seed_from_gofile,
+                        "the guard must stay armed when the seed stands down")
+        restored = self.root / "restored"
+        restored.mkdir()
+        storage.restore(restored, self.make_config(workdir=self.root / "w3"))
+        self.assertEqual((restored / "memories" / "note.md").read_text(),
+                         "newer github state")
+
+    def test_an_unreachable_branch_is_left_for_a_later_tick(self):
+        self.storage.GitConfig.remote_url = property(
+            lambda self: "file:///nonexistent/nope.git")
+        config = self.make_config(seed_from_gofile=True)
+
+        self.assertFalse(self.storage.seed_on_startup(self._data_dir(), config))
+
+        self.assertTrue(config.seed_from_gofile)
+
+    def test_a_standby_instance_does_not_seed(self):
+        storage = self.storage
+        config = self.make_config(seed_from_gofile=True, failover=True)
+        config.role = storage.ROLE_STANDBY
+
+        self.assertFalse(storage.seed_on_startup(self._data_dir(), config))
+
+        self.assertEqual(self.remote_tree(), set())
+
+
+class DaemonStartupSeedTests(LocalRemoteTests):
+    """The seed really happens inside a running daemon, after the wait."""
+
+    def test_a_running_daemon_seeds_the_branch_once_the_gateway_is_up(self):
+        storage = self.storage
+        data_dir = self.root / "data"
+        data_dir.mkdir()
+        (data_dir / "config.yaml").write_text("model: x\n")
+        (data_dir / "memories").mkdir()
+        (data_dir / "memories" / "note.md").write_text("restored from gofile")
+
+        config = self.make_config(seed_from_gofile=True, interval=1,
+                                  watch_seconds=1, push_retry_seconds=0)
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=storage.run_daemon, args=(data_dir, config, stop), daemon=True)
+        thread.start()
+        try:
+            deadline = time.time() + 45
+            while time.time() < deadline and "data/memories/note.md" not in self.remote_tree():
+                time.sleep(0.5)
+        finally:
+            stop.set()
+            thread.join(timeout=30)
+
+        self.assertFalse(thread.is_alive(), "the daemon did not stop when asked")
+        self.assertIn("data/memories/note.md", self.remote_tree())
+        self.assertFalse(config.seed_from_gofile,
+                         "a landed seed must disarm the push guard")
+
+
+class PushRobustnessTests(LocalRemoteTests):
+    """GitHub drops large pushes often enough that one attempt is not an answer."""
+
+    def _workdir_with_a_second_commit(self, config):
+        storage = self.storage
+        workdir = storage.ensure_clone(config)
+        storage.ensure_initial_commit(workdir, config)
+        (workdir / "MANIFEST.json").write_text('{"generation": 2}\n', encoding="utf-8")
+        storage.run_git(["add", "-A"], cwd=workdir, config=config)
+        storage.run_git(["commit", "-q", "-m", "second"], cwd=workdir, config=config)
+        return workdir
+
+    def test_a_transient_push_failure_is_retried_until_it_lands(self):
+        storage = self.storage
+        config = self.make_config(push_attempts=3, push_retry_seconds=0)
+        workdir = self._workdir_with_a_second_commit(config)
+
+        real_run_git = storage.run_git
+        attempts = []
+
+        def flaky(args, **kwargs):
+            if args[0] == "push":
+                attempts.append(args)
+                if len(attempts) == 1:
+                    return subprocess.CompletedProcess(
+                        args, 1, "",
+                        "error: RPC failed; HTTP 408 curl 22 The requested URL "
+                        "returned error: 408")
+            return real_run_git(args, **kwargs)
+
+        storage.run_git = flaky
+        try:
+            storage.push_branch(workdir, config)
+        finally:
+            storage.run_git = real_run_git
+
+        self.assertEqual(len(attempts), 2, "one retry should have been enough")
+        self.assertEqual(storage.remote_ref_sha(config),
+                         storage.head_commit(workdir, config))
+
+    def test_a_push_that_landed_but_reported_failure_is_not_lost(self):
+        """The 408 in the incident log came with "Everything up-to-date".
+
+        The ref had already moved server-side; believing the exit code would
+        have reported a missing backup that was in fact safe, and retried a
+        force-push over it.
+        """
+        storage = self.storage
+        config = self.make_config(push_attempts=3, push_retry_seconds=0)
+        workdir = self._workdir_with_a_second_commit(config)
+
+        real_run_git = storage.run_git
+        attempts = []
+
+        def lied_about(args, **kwargs):
+            proc = real_run_git(args, **kwargs)
+            if args[0] == "push":
+                attempts.append(args)
+                return subprocess.CompletedProcess(
+                    args, 1,
+                    "error: RPC failed; HTTP 408 curl 22\n"
+                    "send-pack: unexpected disconnect while reading sideband packet\n"
+                    "fatal: the remote end hung up unexpectedly\n"
+                    "Everything up-to-date",
+                    proc.stdout)
+            return proc
+
+        storage.run_git = lied_about
+        try:
+            storage.push_branch(workdir, config)
+        finally:
+            storage.run_git = real_run_git
+
+        self.assertEqual(len(attempts), 1, "the remote already had it: no retry")
+        self.assertEqual(storage.remote_ref_sha(config),
+                         storage.head_commit(workdir, config))
+
+    def test_a_push_that_never_lands_gives_up_after_every_attempt(self):
+        storage = self.storage
+        config = self.make_config(push_attempts=2, push_retry_seconds=0)
+        workdir = self._workdir_with_a_second_commit(config)
+
+        real_run_git = storage.run_git
+        attempts = []
+
+        def never(args, **kwargs):
+            if args[0] == "push":
+                attempts.append(args)
+                return subprocess.CompletedProcess(args, 1, "",
+                                                   "error: RPC failed; HTTP 408")
+            return real_run_git(args, **kwargs)
+
+        storage.run_git = never
+        try:
+            with self.assertRaises(storage.GitStateError):
+                storage.push_branch(workdir, config)
+        finally:
+            storage.run_git = real_run_git
+
+        self.assertEqual(len(attempts), 2)
+
+    def test_the_token_never_reaches_a_push_failure_message(self):
+        storage = self.storage
+        config = self.make_config(push_attempts=1, push_retry_seconds=0)
+        workdir = self._workdir_with_a_second_commit(config)
+
+        real_run_git = storage.run_git
+
+        def leaky(args, **kwargs):
+            if args[0] == "push":
+                return subprocess.CompletedProcess(
+                    args, 1,
+                    f"fatal: unable to access '{config.remote_url}': HTTP 408", "")
+            return real_run_git(args, **kwargs)
+
+        storage.run_git = leaky
+        try:
+            with self.assertRaises(storage.GitStateError) as caught:
+                storage.push_branch(workdir, config)
+        finally:
+            storage.run_git = real_run_git
+
+        self.assertNotIn("ghp_secret", str(caught.exception))
+
+
+class _RecordingSubprocess:
+    """Stands in for the subprocess module so run_git can be inspected."""
+
+    TimeoutExpired = subprocess.TimeoutExpired
+    CompletedProcess = subprocess.CompletedProcess
+
+    def __init__(self, raises=None):
+        self.calls = []
+        self._raises = raises
+
+    def run(self, cmd, **kwargs):
+        self.calls.append((cmd, kwargs))
+        if self._raises is not None:
+            raise self._raises
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+
+class TransportTuningTests(unittest.TestCase):
+    """The git transport settings that stop GitHub answering 408."""
+
+    def setUp(self):
+        self.storage = load_storage()
+        self._saved = self.storage.subprocess
+
+    def tearDown(self):
+        self.storage.subprocess = self._saved
+
+    def test_a_large_push_is_sent_unchunked_over_http_1_1(self):
+        fake = _RecordingSubprocess()
+        self.storage.subprocess = fake
+        config = make_config(self.storage)
+
+        self.storage.run_git(["--version"], config=config)
+
+        cmd = fake.calls[0][0]
+        self.assertIn(f"http.postBuffer={config.http_post_buffer}", cmd)
+        self.assertIn("http.version=HTTP/1.1", cmd)
+        self.assertIn(f"http.lowSpeedLimit={config.http_low_speed_limit}", cmd)
+        self.assertIn(f"http.lowSpeedTime={config.http_low_speed_time}", cmd)
+
+    def test_the_post_buffer_defaults_big_enough_for_a_whole_state_tree(self):
+        config = make_config(self.storage)
+        self.assertGreaterEqual(config.http_post_buffer, 100 * 1024 * 1024,
+                                "git chunks the body above this and GitHub 408s")
+
+    def test_every_git_call_is_bounded_by_a_timeout(self):
+        fake = _RecordingSubprocess()
+        self.storage.subprocess = fake
+        config = make_config(self.storage, git_timeout_seconds=42)
+
+        self.storage.run_git(["status"], config=config)
+
+        self.assertEqual(fake.calls[0][1]["timeout"], 42)
+
+    def test_a_hung_git_raises_instead_of_blocking_the_boot(self):
+        fake = _RecordingSubprocess(
+            raises=subprocess.TimeoutExpired(cmd=["git", "push"], timeout=1))
+        self.storage.subprocess = fake
+
+        with self.assertRaises(self.storage.GitStateError) as caught:
+            self.storage.run_git(["push", "origin", "state"],
+                                 config=make_config(self.storage))
+
+        self.assertIn("timed out", str(caught.exception))
+
+    def test_the_push_knobs_come_from_the_environment(self):
+        saved = dict(os.environ)
+        try:
+            os.environ.update({
+                "GIT_STATE_REPO": "owner/repo",
+                "GIT_STATE_TOKEN": "t",
+                "GIT_STATE_PUSH_ATTEMPTS": "5",
+                "GIT_STATE_PUSH_RETRY_SECONDS": "2",
+                "GIT_STATE_HTTP_POST_BUFFER_MB": "64",
+                "GIT_STATE_GIT_TIMEOUT_SECONDS": "90",
+            })
+            config = self.storage.GitConfig.from_env()
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+        self.assertEqual(config.push_attempts, 5)
+        self.assertEqual(config.push_retry_seconds, 2)
+        self.assertEqual(config.git_timeout_seconds, 90)
+        self.assertEqual(config.http_post_buffer, 64 * 1024 * 1024)
+
+
+class BootstrapOrderTests(unittest.TestCase):
+    """The boot wrapper must not block the port bind on a state push."""
+
+    def setUp(self):
+        bootstrap = Path(__file__).resolve().parents[1] / "scripts" / "bootstrap.sh"
+        self.source = bootstrap.read_text(encoding="utf-8")
+
+    def test_bootstrap_never_runs_the_seed_inline(self):
+        """An inline seed is what pushed the dashboard past Render's port scan."""
+        inline_seed = r"\$\{GIT_SYNC\}\"?\s+seed\b"
+        # Prove the pattern catches the form it guards against. Without this,
+        # the assertion below passes just as happily against a pattern that
+        # matches nothing at all.
+        self.assertRegex('gosu hermes "${GIT_SYNC}" seed "${DATA_DIR}"', inline_seed)
+
+        for line in self.source.splitlines():
+            code = line.split("#", 1)[0]
+            self.assertNotRegex(
+                code, inline_seed,
+                f"bootstrap.sh still seeds inline: {line.strip()}")
+
+    def test_bootstrap_flags_the_seed_for_the_daemon_instead(self):
+        self.assertIn("GIT_STATE_SEED_FROM_GOFILE=1", self.source)
+
+    def test_the_restore_cannot_run_past_its_budget(self):
+        """A hung download has to cost the state, not the deploy."""
+        self.assertIn("HERMES_RESTORE_TIMEOUT_SECONDS", self.source)
+        self.assertIn("run_bounded", self.source)
+
+    def test_the_daemon_seeds_what_bootstrap_defers(self):
+        daemon = (Path(__file__).resolve().parents[1]
+                  / "scripts" / "git-storage.py").read_text(encoding="utf-8")
+        self.assertIn("seed_on_startup(data_dir, config)", daemon)
 
 
 if __name__ == "__main__":

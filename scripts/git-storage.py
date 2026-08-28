@@ -19,11 +19,20 @@ repo never accumulates files you deleted locally.
 
 GitHub is the primary store and GoFile is the backup. The one wrinkle is the
 very first launch, when the state repo is still empty: there is nothing to
-restore from it, so bootstrap.sh falls back to the GoFile archive and then
-calls ``seed`` to push that restored state straight back to GitHub. From that
+restore from it, so bootstrap.sh falls back to the GoFile archive and the
+daemon then pushes that restored state back to GitHub with ``seed``. From that
 moment GitHub is primary and GoFile drops to a slow second copy. ``seed``
 refuses to write over a branch that already holds state, so an old GoFile
 archive can never be pushed on top of newer GitHub state.
+
+The seed belongs to the daemon, not to the boot wrapper. A first state push is
+the largest upload this service ever makes, and Render fails a deploy whose
+container has not bound a port within its scan window ("no open ports
+detected"). Running the seed inline meant one slow GitHub response -- an HTTP
+408 on a chunked upload, retried -- could push the dashboard past that window
+and take the whole deploy with it. In the daemon it runs after the gateway is
+up, so a slow or failed push costs a retry on the next tick instead of a
+redeploy.
 
 Saves are change-driven rather than clock-driven: the daemon fingerprints
 ``/opt/data`` every GIT_STATE_WATCH_SECONDS and pushes as soon as the tree has
@@ -84,6 +93,23 @@ ROLE_STANDBY = "standby"
 REMOTE_HAS_STATE = "has-state"
 REMOTE_EMPTY = "empty"
 REMOTE_UNKNOWN = "unknown"
+
+# git's http.postBuffer defaults to 1 MiB, and anything larger than that is
+# sent as a chunked request. GitHub's HTTP front end answers a big chunked
+# `git-receive-pack` with "RPC failed; HTTP 408 ... send-pack: unexpected
+# disconnect" -- which is exactly what a first state push (the whole restored
+# tree, tens of MB) looks like. A buffer big enough for one request makes git
+# send it with a Content-Length instead, in a single shot.
+DEFAULT_HTTP_POST_BUFFER_BYTES = 250 * 1024 * 1024
+# A transfer slower than this for this long is stalled, not slow. git gives up
+# and we retry, instead of the process sitting on a dead connection.
+DEFAULT_HTTP_LOW_SPEED_LIMIT = 1000
+DEFAULT_HTTP_LOW_SPEED_TIME = 60
+# No git command here should ever run forever: the boot wrapper and the daemon
+# both wait on them.
+DEFAULT_GIT_TIMEOUT_SECONDS = 600
+DEFAULT_PUSH_ATTEMPTS = 3
+DEFAULT_PUSH_RETRY_SECONDS = 5
 
 # Files that must never be committed in the clear. Matched on the data-dir
 # relative path.
@@ -153,6 +179,12 @@ class GitConfig:
         retry_seconds: int = 30,
         seed_from_gofile: bool = False,
         seed_force: bool = False,
+        push_attempts: int = DEFAULT_PUSH_ATTEMPTS,
+        push_retry_seconds: int = DEFAULT_PUSH_RETRY_SECONDS,
+        git_timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS,
+        http_post_buffer: int = DEFAULT_HTTP_POST_BUFFER_BYTES,
+        http_low_speed_limit: int = DEFAULT_HTTP_LOW_SPEED_LIMIT,
+        http_low_speed_time: int = DEFAULT_HTTP_LOW_SPEED_TIME,
     ) -> None:
         self.repo = repo
         self.token = token
@@ -182,6 +214,15 @@ class GitConfig:
         # not to overwrite GitHub state we never restored from.
         self.seed_from_gofile = seed_from_gofile
         self.seed_force = seed_force
+        # How hard a push is worth trying before the caller gives up on this
+        # round. GitHub's HTTP front end drops large uploads often enough that
+        # one attempt is not a real answer.
+        self.push_attempts = max(1, int(push_attempts))
+        self.push_retry_seconds = max(0, int(push_retry_seconds))
+        self.git_timeout_seconds = max(1, int(git_timeout_seconds))
+        self.http_post_buffer = max(1024 * 1024, int(http_post_buffer))
+        self.http_low_speed_limit = max(0, int(http_low_speed_limit))
+        self.http_low_speed_time = max(1, int(http_low_speed_time))
         self.role = ROLE_ACTIVE
         self._visibility_checked = False
         self._last_push_at = 0.0
@@ -252,6 +293,24 @@ class GitConfig:
             retry_seconds=positive_int("GIT_STATE_RETRY_SECONDS", 30),
             seed_from_gofile=flag("GIT_STATE_SEED_FROM_GOFILE"),
             seed_force=flag("GIT_STATE_SEED_FORCE"),
+            # Push robustness. A first state push is the biggest upload this
+            # service makes and GitHub answers an oversized or slow one with
+            # "RPC failed; HTTP 408", so the request is sent unchunked, a
+            # stalled transfer is abandoned instead of waited on, and the push
+            # itself is retried a couple of times before the round is lost.
+            push_attempts=positive_int("GIT_STATE_PUSH_ATTEMPTS",
+                                       DEFAULT_PUSH_ATTEMPTS),
+            push_retry_seconds=non_negative_int("GIT_STATE_PUSH_RETRY_SECONDS",
+                                                DEFAULT_PUSH_RETRY_SECONDS),
+            git_timeout_seconds=positive_int("GIT_STATE_GIT_TIMEOUT_SECONDS",
+                                             DEFAULT_GIT_TIMEOUT_SECONDS),
+            http_post_buffer=positive_int("GIT_STATE_HTTP_POST_BUFFER_MB",
+                                          DEFAULT_HTTP_POST_BUFFER_BYTES
+                                          // (1024 * 1024)) * 1024 * 1024,
+            http_low_speed_limit=non_negative_int("GIT_STATE_HTTP_LOW_SPEED_LIMIT",
+                                                  DEFAULT_HTTP_LOW_SPEED_LIMIT),
+            http_low_speed_time=positive_int("GIT_STATE_HTTP_LOW_SPEED_TIME",
+                                             DEFAULT_HTTP_LOW_SPEED_TIME),
         )
 
     @property
@@ -284,20 +343,44 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
     env.setdefault("HOME", str(Path(tempfile.gettempdir())))
+    post_buffer = (config.http_post_buffer if config
+                   else DEFAULT_HTTP_POST_BUFFER_BYTES)
+    low_speed_limit = (config.http_low_speed_limit if config
+                       else DEFAULT_HTTP_LOW_SPEED_LIMIT)
+    low_speed_time = (config.http_low_speed_time if config
+                      else DEFAULT_HTTP_LOW_SPEED_TIME)
     base = [
         "git",
         "-c", "user.name=hermes-state",
         "-c", "user.email=hermes-state@localhost",
         "-c", "core.autocrlf=false",
         "-c", "gc.auto=0",
+        # Transport tuning for the large pushes this backend makes. See
+        # DEFAULT_HTTP_POST_BUFFER_BYTES: without it git chunks the request
+        # body and GitHub's front end answers "RPC failed; HTTP 408".
+        "-c", f"http.postBuffer={post_buffer}",
+        "-c", "http.version=HTTP/1.1",
+        "-c", f"http.lowSpeedLimit={low_speed_limit}",
+        "-c", f"http.lowSpeedTime={low_speed_time}",
     ]
-    proc = subprocess.run(
-        base + args,
-        cwd=str(cwd) if cwd else None,
-        env=env,
-        capture_output=True,
-        text=True,
-    )
+    timeout = (config.git_timeout_seconds if config
+               else DEFAULT_GIT_TIMEOUT_SECONDS)
+    try:
+        proc = subprocess.run(
+            base + args,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        # A hung git is worse than a failed one: the caller is either the boot
+        # wrapper or the daemon, and both have other work to do.
+        raise GitStateError(
+            f"git {' '.join(redact(a) for a in args[:3])} timed out "
+            f"after {timeout}s"
+        )
     if check and proc.returncode != 0:
         raise GitStateError(
             f"git {' '.join(redact(a) for a in args[:3])} failed: "
@@ -447,6 +530,63 @@ def remote_branch_state(config: GitConfig) -> str:
     LOG.debug("ls-remote failed (%s): %s", proc.returncode,
               redact(proc.stderr.strip()))
     return "unknown"
+
+
+def remote_ref_sha(config: GitConfig) -> str:
+    """The commit the state branch points at on the remote, or "" if none.
+
+    One `git ls-remote`, so a few hundred bytes. Used to answer "did that push
+    actually land?" after git itself reported a failure.
+    """
+    proc = run_git(
+        ["ls-remote", config.remote_url, f"refs/heads/{config.branch}"],
+        check=False, config=config,
+    )
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return ""
+    return proc.stdout.split()[0]
+
+
+def push_branch(workdir: Path, config: GitConfig, *, force: bool = False) -> None:
+    """Push the state branch, retrying, and trusting the remote over git.
+
+    Two things make a bare `git push` unreliable for the payload this backend
+    sends. First, GitHub's HTTP front end times out large uploads: the state
+    push that seeds a branch is the whole restored tree, and a single dropped
+    request is a normal event rather than a reason to give up on the backup.
+    Second, the failure is not always a failure. A push whose response was cut
+    off ("send-pack: unexpected disconnect", "Everything up-to-date" in the
+    same breath) often *did* move the ref server-side; retrying blind would
+    report a lost backup that is in fact safe. So after a failed attempt we ask
+    the remote where the branch is, and only call it lost when the answer
+    disagrees with our commit.
+    """
+    detail = ""
+    for attempt in range(1, config.push_attempts + 1):
+        args = ["push"]
+        if force:
+            args.append("--force")
+        args += ["origin", config.branch]
+        proc = run_git(args, cwd=workdir, check=False, config=config)
+        if proc.returncode == 0:
+            return
+        detail = redact((proc.stderr or proc.stdout).strip())
+        wanted = head_commit(workdir, config)
+        if wanted and remote_ref_sha(config) == wanted:
+            LOG.warning(
+                "git push reported a failure but %s@%s already points at our "
+                "commit %s; treating the push as landed (%s)",
+                config.api_repo, config.branch, wanted[:12],
+                detail.splitlines()[0] if detail else "no detail",
+            )
+            return
+        if attempt < config.push_attempts:
+            LOG.warning("git push failed (attempt %d/%d); retrying in %ds: %s",
+                        attempt, config.push_attempts, config.push_retry_seconds,
+                        detail.splitlines()[0] if detail else "no detail")
+            if config.push_retry_seconds:
+                time.sleep(config.push_retry_seconds)
+    raise GitStateError(f"git push origin {config.branch} failed: {detail}")
 
 
 def probe_state(config: GitConfig) -> str:
@@ -748,7 +888,7 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
     run_git(["commit", "-q", "-m", "Hermes state (squashed history)"],
             cwd=workdir, check=False, config=config)
     run_git(["branch", "-M", config.branch], cwd=workdir, config=config)
-    run_git(["push", "--force", "origin", config.branch], cwd=workdir, config=config)
+    push_branch(workdir, config, force=True)
 
 
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
@@ -801,14 +941,17 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
         compact_history(workdir, config)
         return True
 
-    push = run_git(["push", "origin", config.branch], cwd=workdir, check=False, config=config)
-    if push.returncode != 0:
-        # Someone else advanced the branch. Ours is a full mirror of local
-        # state, so taking our version is correct rather than merging.
-        LOG.info("push rejected; re-pushing with force after refetch")
+    try:
+        push_branch(workdir, config)
+    except GitStateError:
+        # Either someone else advanced the branch, or the transport gave up.
+        # Ours is a full mirror of local state, so taking our version is
+        # correct rather than merging -- and a force push also settles a ref
+        # that a half-landed attempt left pointing somewhere older.
+        LOG.info("push did not land; re-pushing with force after refetch")
         run_git(["fetch", "--depth", "1", "origin", config.branch], cwd=workdir,
                 check=False, config=config)
-        run_git(["push", "--force", "origin", config.branch], cwd=workdir, config=config)
+        push_branch(workdir, config, force=True)
     LOG.info("pushed state: %s", message)
     return True
 
@@ -857,6 +1000,50 @@ def seed(data_dir: Path, config: GitConfig) -> bool:
         LOG.info("seeded %s@%s; github is now the primary state store",
                  config.api_repo, config.branch)
     return pushed
+
+
+def seed_on_startup(data_dir: Path, config: GitConfig) -> bool:
+    """Seed an empty state branch from the tree this boot restored.
+
+    Called by the daemon once the gateway is up, which is what keeps the port
+    bind off the critical path: bootstrap.sh flags the situation with
+    GIT_STATE_SEED_FROM_GOFILE and moves on, and the seed happens here instead.
+    Returns True when the branch now carries this instance's state.
+
+    Every answer that is not "the branch is provably empty" leaves the seed for
+    a later tick, because the alternative -- guessing -- is how an old GoFile
+    archive ends up overwriting newer GitHub state.
+    """
+    if not config.seed_from_gofile:
+        return False
+    if config.failover and config.role == ROLE_STANDBY:
+        LOG.info("standby instance; not seeding the state branch")
+        return False
+
+    state = probe_state(config)
+    if state == REMOTE_UNKNOWN:
+        LOG.info("state branch unreachable; leaving the seed for a later tick")
+        return False
+    if state == REMOTE_HAS_STATE:
+        # GitHub holds state this instance never restored from, so its tree is
+        # not derived from it. The push guard stays armed and the operator's
+        # next clean boot is what settles the question.
+        LOG.warning(
+            "%s@%s already holds state this instance did not restore from; "
+            "not seeding, and not pushing over it",
+            config.api_repo, config.branch,
+        )
+        return False
+
+    try:
+        return bool(seed(data_dir, config))
+    except GitStateError as exc:
+        # Not fatal and not final: GoFile stays the live backup and the daemon
+        # retries on its next tick, which is the whole reason this runs here
+        # rather than in the boot wrapper.
+        LOG.warning("github seed failed; GoFile stays the live backup and the "
+                    "push is retried: %s", redact(str(exc)))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -973,14 +1160,18 @@ def current_role(config: GitConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_daemon(data_dir: Path, config: GitConfig) -> None:
-    stop = threading.Event()
+def run_daemon(data_dir: Path, config: GitConfig,
+               stop: "threading.Event | None" = None) -> None:
+    stop = stop if stop is not None else threading.Event()
 
     def request_stop(_signum, _frame):
         stop.set()
 
-    signal.signal(signal.SIGTERM, request_stop)
-    signal.signal(signal.SIGINT, request_stop)
+    # Only the main thread may install handlers, and a daemon embedded in
+    # someone else's process should not take over their signals anyway.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, request_stop)
+        signal.signal(signal.SIGINT, request_stop)
     LOG.info(
         "git state sync enabled; repo=%s branch=%s interval=%ss%s",
         config.api_repo, config.branch, config.interval,
@@ -1001,9 +1192,18 @@ def run_daemon(data_dir: Path, config: GitConfig) -> None:
             LOG.warning("could not claim lease; assuming active: %s", redact(str(exc)))
 
     # Let the upstream entrypoint finish its first-boot directory setup before
-    # the first upload. bootstrap.sh has already seeded an empty branch by now.
+    # the first upload. It is also what keeps this off the port-bind path: the
+    # dashboard has had its chance to come up before we start moving bytes.
     if stop.wait(min(15, config.interval)):
         return
+
+    # First launch: GitHub's state branch is empty and this instance's tree
+    # came from the GoFile archive. bootstrap.sh used to push it inline, before
+    # anything bound a port; a slow GitHub response then ate the whole boot and
+    # Render failed the deploy with "no open ports detected". The daemon owns
+    # the seed now, so a slow or failed push costs a retry instead of a
+    # redeploy.
+    seed_on_startup(data_dir, config)
 
     # Change-driven saves. The interval below is only the safety net: a change
     # is normally pushed within `debounce` seconds of the last write, not at
