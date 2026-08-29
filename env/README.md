@@ -24,8 +24,8 @@ Render's Environment tab, and logs that decryption was skipped.
 1. **The process environment** — Render's Environment tab, or your shell.
    Always wins; the repo never overrides a live deploy knob.
 2. **An existing `$HERMES_HOME/.env`** — written by the dashboard's API Keys
-   tab or restored from GoFile. Preserved, so a key set from the UI is not
-   reverted to the committed one.
+   tab or restored from the state repo. Preserved, so a key set from the UI is
+   not reverted to the committed one.
 3. **`secrets.enc.env`** — fills in whatever is still missing.
 
 Set `RENDER_TOOLS_SECRETS_FORCE=1` to swap 2 and 3, which is what you want

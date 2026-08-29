@@ -6,8 +6,8 @@
 #   - A bundle of Render-focused skills mounted via skills.external_dirs
 #   - A boot-time patcher that registers the Render MCP server and Bynara
 #     custom provider in config.yaml (idempotent; never overwrites user edits)
-#   - Free-tier resource guardrails for the gateway, dashboard, and GoFile sync
-#   - An optional GoFile state sync for Render's Free filesystem
+#   - Free-tier resource guardrails for the gateway, dashboard, and state sync
+#   - An optional git-backed state sync for Render's Free filesystem
 #
 # We deliberately do NOT install the `render` CLI. This image is configured
 # around the Render MCP server; installing extra CLIs should be a conscious
@@ -151,10 +151,9 @@ RUN set -eu; \
 # upstream entrypoint chain (tini → docker/entrypoint.sh).
 COPY --chown=root:root scripts/bootstrap.sh /opt/render-tools/bootstrap.sh
 COPY --chown=root:root scripts/patch-config.py /opt/render-tools/patch-config.py
-COPY --chown=root:root scripts/free-storage.py /opt/render-tools/free-storage.py
 COPY --chown=root:root scripts/git-storage.py /opt/render-tools/git-storage.py
 RUN chmod 0755 /opt/render-tools/bootstrap.sh /opt/render-tools/patch-config.py \
-             /opt/render-tools/free-storage.py /opt/render-tools/git-storage.py \
+             /opt/render-tools/git-storage.py \
              /opt/render-tools/seed-env.py
 
 # The git state backend shells out to `git`, so it must exist in the image.

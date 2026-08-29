@@ -41,8 +41,8 @@ services:
     envVars:
       # Free instances lose /opt/data when they spin down or redeploy. Keep
       # secrets in Render environment variables as the durable fallback. When
-      # GoFile sync is enabled, dashboard-managed .env settings are restored
-      # too, but the GoFile archive must then be treated as sensitive.
+      # git state sync is enabled, dashboard-managed .env settings are restored
+      # too, but the private state repo must then be treated as sensitive.
       - key: HERMES_HOME
         value: /opt/data
       - key: PORT
@@ -65,14 +65,14 @@ services:
       - key: OPENROUTER_API_KEY
         sync: false
 
-      # PRIMARY state backup: a private GitHub repository. Each save pushes
-      # only the bytes that changed (typically a few KB) instead of the whole
-      # archive, which is what keeps this inside a small monthly transfer
-      # allowance. Leave GIT_STATE_REPO blank to stay on GoFile only.
+      # State backup: a private GitHub repository. Each save pushes only the
+      # bytes that changed (typically a few KB) instead of a whole archive,
+      # which is what keeps this inside a small monthly transfer allowance.
+      # Leave GIT_STATE_REPO blank to run with disposable local state.
       #
-      # On a first launch the state branch is empty, so the GoFile archive is
-      # restored and pushed straight back here; after that this repo is the
-      # source of truth and GoFile is only a slow second copy.
+      # On a first launch the state branch is empty, so this instance's tree
+      # is seeded to it after the gateway is up; from then on this repo is the
+      # source of truth and every boot restores from it.
       #
       # GIT_STATE_TOKEN wants a fine-grained personal access token scoped to
       # that one repository with Contents: read and write. The backend refuses
@@ -109,45 +109,14 @@ services:
       # never committed in the clear.
       - key: GIT_STATE_AGE_RECIPIENT
         sync: false
-      # How often the GoFile fallback runs once git is primary. Every GoFile
-      # run re-uploads the whole archive, so it is deliberately infrequent.
-      - key: GOFILE_FALLBACK_INTERVAL_SECONDS
-        value: "21600"
-
-      # FALLBACK state backup. Retained because it holds earlier snapshots and
-      # still works if GitHub is unreachable. Leave the token blank to run
-      # with disposable local state. The service can create/find its own
-      # private state folder; an existing folder UUID may be supplied.
-      - key: GOFILE_API_TOKEN
-        sync: false
-      - key: GOFILE_FOLDER_ID
-        sync: false
-      - key: GOFILE_FOLDER_NAME
-        value: hermes-render-state
-      - key: GOFILE_STATE_PREFIX
-        value: hermes-state-
-      - key: GOFILE_SYNC_INTERVAL_SECONDS
-        value: "300"
-      - key: GOFILE_MAX_ARCHIVE_MB
-        value: "100"
-      # Bandwidth brakes. The sync used to re-upload the whole tree whenever
-      # any mtime moved, which on a busy agent meant a full upload every 5
-      # minutes. Now: logs/caches are excluded from the archive, uploads are
-      # spaced by at least this interval, and the monthly byte budget stops
-      # the sync rather than eating a bandwidth allowance. Shutdown always
-      # forces a final upload regardless of these.
-      - key: GOFILE_MIN_UPLOAD_INTERVAL_SECONDS
-        value: "1800"
-      - key: GOFILE_MONTHLY_BUDGET_MB
-        value: "2048"
 
       # Failover. With HERMES_FAILOVER=1 and a shared state backend (the git
-      # repo when configured, otherwise the GoFile folder), the
-      # highest-priority instance holding a fresh lease handles chat; the
-      # others keep their dashboard but have their chat tokens stripped at
-      # boot and never upload state. Leave this service at the lower priority
-      # so a laptop started with `run-local.sh --takeover` wins, and this one
-      # resumes automatically once the laptop stops and flushes its state.
+      # repo when configured), the highest-priority instance holding a fresh
+      # lease handles chat; the others keep their dashboard but have their
+      # chat tokens stripped at boot and never upload state. Leave this
+      # service at the lower priority so a laptop started with
+      # `run-local.sh --takeover` wins, and this one resumes automatically
+      # once the laptop stops and flushes its state.
       - key: HERMES_FAILOVER
         value: "1"
       - key: HERMES_INSTANCE_ID

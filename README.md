@@ -48,7 +48,7 @@ The Hermes release and the skills commit are both pinned in the `Dockerfile` for
 
 A single container runs both Hermes processes. The dashboard ([upstream docs](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/web-dashboard.md)) is a side-process that the upstream entrypoint backgrounds whenever `HERMES_DASHBOARD=1` is set; the gateway is the foreground PID. They share `/opt/data` and a PID namespace, which is required for the dashboard's gateway-liveness checks.
 
-The Free service has an ephemeral filesystem. `/opt/data` holds the config (`config.yaml`), FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs only for the current instance. Render environment variables are the default durable source for API keys and other secrets; when GoFile sync is enabled, the complete `/opt/data` tree, including `.env` and logs, is also restored and backed up. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy).
+The Free service has an ephemeral filesystem. `/opt/data` holds the config (`config.yaml`), FTS5 session database, installed skills, Honcho user models, agent memories, cron job definitions, and logs only for the current instance. Render environment variables are the default durable source for API keys and other secrets; when the git state sync is enabled, the complete `/opt/data` tree, including `.env` and logs, is also restored and backed up. The `render-oss/skills` bundle and the bootstrap that registers the Render MCP server are baked into the image (versioned with each deploy).
 
 ## What's pre-baked for Render
 
@@ -149,7 +149,7 @@ command.
 
 > **Keys:** prefer `key_env` over pasting an inline API key. Render
 > environment variables survive restarts and redeploys; an inline key lives
-> only in the (ephemeral) `config.yaml` unless you have [GoFile
+> only in the (ephemeral) `config.yaml` unless you have [git state
 > sync](#keeping-files-between-restarts) enabled. The card lists which
 > source each provider uses and never echoes a stored key back to the browser.
 
@@ -219,7 +219,7 @@ Read the **Security** section before you paste production API keys.
 
 Once the service is healthy (the **Events** tab shows "Deploy live"), open the URL Render assigned (it ends in `.onrender.com`). You'll see the Hermes dashboard.
 
-The Free instance has no persistent disk. The dashboard writes `/opt/data/.env`, which disappears on its own when Render spins the service down or redeploys it. Enable the optional GoFile sync to restore that file and the rest of `/opt/data`; Render's **Environment** tab remains the preferred source for secrets because it is injected on every boot even if GoFile is unavailable.
+The Free instance has no persistent disk. The dashboard writes `/opt/data/.env`, which disappears on its own when Render spins the service down or redeploys it. Enable the optional git state sync to restore that file and the rest of `/opt/data`; Render's **Environment** tab remains the preferred source for secrets because it is injected on every boot even if the state repo is unavailable.
 
 Walk through these tabs in order:
 
@@ -232,7 +232,7 @@ Walk through these tabs in order:
 3. **Status**. Confirm the gateway is running and the model is reachable. The "Connected platforms" list will be empty until you add a chat platform.
 4. **Chat**. The in-browser TUI is the easiest way to talk to the agent. Use the **Restart gateway** button on the Status tab after changing keys outside Render's Environment tab.
 
-The dashboard API Keys tab writes to `/opt/data/.env`. That file is durable across replacements only when GoFile sync is enabled; otherwise use Render's **Environment** tab for secrets. The `RENDER_MCP_API_KEY` exception is still important: set it from Render's Environment tab (not only the Hermes dashboard), since `config.yaml` reads `${RENDER_MCP_API_KEY}` from the gateway process environment.
+The dashboard API Keys tab writes to `/opt/data/.env`. That file is durable across replacements only when git state sync is enabled; otherwise use Render's **Environment** tab for secrets. The `RENDER_MCP_API_KEY` exception is still important: set it from Render's Environment tab (not only the Hermes dashboard), since `config.yaml` reads `${RENDER_MCP_API_KEY}` from the gateway process environment.
 
 ### Verify the Render tools are wired up
 
@@ -288,7 +288,7 @@ There are two ways to do this. **Coordinated** is the one you want.
 
 #### Coordinated handoff (`--takeover`)
 
-Both instances point at the same GoFile folder and publish a tiny *lease* file
+Both instances point at the same state repo and publish a tiny *lease* ref
 there. The highest-priority instance with a fresh lease is **active**; everyone
 else is **standby**.
 
@@ -298,20 +298,20 @@ else is **standby**.
 
 What happens:
 
-1. Local starts and claims the lease. Within ~30s Render notices, uploads its
+1. Local starts and claims the lease. Within ~30s Render notices, pushes its
    state one last time, and restarts as standby: its chat tokens are stripped
    at boot, so Telegram/Discord messages come only to your laptop. Its
    dashboard stays up.
-2. While local runs, **Render never uploads**, so it cannot clobber your state.
-3. `./run-local.sh down` sends SIGTERM and waits up to 60s. Local uploads a
-   final archive and *then* releases its lease — that order matters, so Render
+2. While local runs, **Render never pushes**, so it cannot clobber your state.
+3. `./run-local.sh down` sends SIGTERM and waits up to 60s. Local pushes a
+   final commit and *then* releases its lease — that order matters, so Render
    restores complete state rather than a stale snapshot.
-4. Render sees the lease vanish, restarts as active, restores from GoFile, and
-   carries on answering messages.
+4. Render sees the lease vanish, restarts as active, restores from the state
+   repo, and carries on answering messages.
 
-Failover **fails open**: if GoFile is unreachable or the lease can't be read,
-an instance stays active. A coordination outage can leave you with two agents
-answering, never zero.
+Failover **fails open**: if the state repo is unreachable or the lease can't be
+read, an instance stays active. A coordination outage can leave you with two
+agents answering, never zero.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -322,9 +322,9 @@ answering, never zero.
 | `HERMES_LEASE_POLL_SECONDS` | `30` | How often a standby re-checks |
 | `HERMES_ROLE_SWITCH_MIN_SECONDS` | `300` | Hysteresis, to stop restart flapping |
 
-Checking costs one folder listing and no downloads — priority and identity are
-encoded in the lease *filename*, freshness is its timestamp — so coordination
-adds essentially nothing to bandwidth.
+Checking costs one `git ls-remote` — priority, identity, and freshness are
+encoded in the lease *ref name* — so coordination adds essentially nothing to
+bandwidth.
 
 #### Uncoordinated (what happens if you don't)
 
@@ -335,7 +335,7 @@ Two agents that only look like one:
 | `TELEGRAM_BOT_TOKEN` | Telegram allows one poller per token. The second takes over and the other gets HTTP 409; messages land wherever, unpredictably. |
 | `DISCORD_BOT_TOKEN` | Both connections get every event, so users get **two replies**. |
 | `SLACK_*` / IMAP | Events split across connections, or races decide who claims each message. |
-| `GOFILE_API_TOKEN` | Each sync uploads a full snapshot and deletes older ones. Last writer wins; the other's sessions and `.env` are gone. |
+| `GIT_STATE_REPO` | Both instances push to the same state branch. Last writer wins; the other's sessions and `.env` can be overwritten. |
 
 `/opt/data` is per-instance regardless, so the two have separate session
 databases, memories, and configs. `run-local.sh up` warns when it is about to
@@ -345,19 +345,10 @@ entirely and gives you a local-only agent.
 ### Backup bandwidth
 
 Backing up state is the part of this template that spends bandwidth, because
-it happens over and over while the agent runs. There are two backends and the
-difference between them is large.
-
-**The git backend (recommended) uploads only what changed.** GoFile has no
-concept of a partial update: every save re-uploads the whole `/opt/data`
-archive. Git does, so a save costs a few kilobytes instead of tens of
-megabytes. Measured on a 412 KB SQLite session database with 20 new messages
-added between saves:
-
-| | First save | Each later save |
-|---|---|---|
-| GoFile (whole archive) | ~100 KB | ~100 KB, every time |
-| Git (only the changes) | 30 KB | **0.6 KB** |
+it happens over and over while the agent runs. The git backend uploads only
+what changed: a save costs a few kilobytes instead of a whole `/opt/data`
+archive. Measured on a 412 KB SQLite session database with 20 new messages
+added between saves, the first save is ~30 KB and each later one **0.6 KB**.
 
 Two things make that work, and both matter if you are tempted to "improve" it:
 git compares each save against the previous one and ships only the difference,
@@ -365,37 +356,11 @@ and a real SQLite file is mostly unchanged pages between saves, so that
 difference is tiny. (Random or already-compressed data does not compress or
 diff, so it would transfer in full — agent state is neither.)
 
-The practical effect on a 5 GB/month allowance: GoFile at its old cadence could
-spend that in a day or two, while git syncing on every change costs on the
-order of tens of megabytes a month — a save is only a few KB, so saving more
-often is not what costs you. See
-[Keeping files between restarts](#keeping-files-between-restarts) for setup.
-
-If you stay on GoFile, four brakes keep it survivable, all tunable:
-
-| Setting | Default | Effect |
-|---|---|---|
-| `GOFILE_EXCLUDE` | logs, caches, `__pycache__`, tmp, `*.log` | Excluded from the archive *and* the change check, so log churn no longer triggers uploads |
-| `GOFILE_MIN_UPLOAD_INTERVAL_SECONDS` | `1800` | Minimum spacing between uploads |
-| `GOFILE_MONTHLY_BUDGET_MB` | `2048` | Sync pauses for the month instead of eating bandwidth |
-| `GOFILE_CONTENT_CHECK_SECONDS` | `3600` | Periodic full content hash |
-
-Change detection is now two-tier: a cheap metadata scan, then a content hash
-before spending an upload — so a file rewritten with identical contents costs
-nothing. The content check also closes a real bug: a same-size edit within one
-mtime tick (a rotated API key in `.env` is the realistic case) was invisible to
-the old metadata-only fingerprint and would never have been backed up.
-
-Shutdown always forces a final upload, ignoring the interval and the budget, so
-stopping an instance never loses state. Set `GOFILE_EXCLUDE_REPLACE=1` to
-replace the default exclude list rather than extend it.
-
-When the git backend is enabled it becomes primary — saving within seconds of
-any change — and GoFile drops to an occasional second copy, every
-`GOFILE_FALLBACK_INTERVAL_SECONDS` (6 hours by default), so the two together
-still fit a small allowance. On a first launch, when the state branch is still
-empty, that order is reversed for one boot: GoFile restores, and its state is
-pushed straight to GitHub.
+The practical effect on a 5 GB/month allowance: git syncing on every change
+costs on the order of tens of megabytes a month — a save is only a few KB, so
+saving more often is not what costs you. Logs and caches are excluded from the
+backup and from the change fingerprint, so log churn never triggers an upload.
+See [Keeping files between restarts](#keeping-files-between-restarts) for setup.
 
 The script also works away from the repo: it carries a self-extracting copy of
 the build context, so a single copied `run-local.sh` can build and run on its
@@ -409,7 +374,7 @@ encrypted, never in plaintext. Two files under [`env/`](./env) hold everything:
 
 | File | Contents | Committed |
 |---|---|---|
-| `env/common.env` | Non-secret config (`HERMES_*`, `PORT`, resource guardrails, GoFile defaults) | Plaintext |
+| `env/common.env` | Non-secret config (`HERMES_*`, `PORT`, resource guardrails) | Plaintext |
 | `env/secrets.enc.env` | API keys and tokens, values encrypted with [SOPS](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) | Encrypted |
 
 The encrypted file is a dotenv whose **keys stay readable and whose values are
@@ -442,8 +407,8 @@ Identical locally and on Render, highest first:
    repo never overrides a live deploy knob, so the dashboard stays the
    emergency override.
 2. **An existing `$HERMES_HOME/.env`** — written by the dashboard's API Keys tab
-   or restored from GoFile. A key set from the UI is not reverted to the
-   committed one.
+   or restored from the state repo. A key set from the UI is not reverted to
+   the committed one.
 3. **`env/secrets.enc.env`** — fills in whatever is still missing.
 
 Set `RENDER_TOOLS_SECRETS_FORCE=1` to swap 2 and 3, which is what you want after
@@ -485,27 +450,25 @@ conversations, memories, dashboard settings, installed skills — is gone. So th
 state has to be copied somewhere else while the agent runs, and copied back at
 boot.
 
-Two backends do that. Both are optional and off by default.
+One backend does that: a private GitHub repository. It is optional and off
+by default — enable nothing and the agent runs with disposable state, which is
+fine for trying the template out.
 
-| | Git (primary) | GoFile (fallback) |
-|---|---|---|
-| Uploads | only the bytes that changed | the whole archive, every time |
-| Typical save | a few KB | tens of MB |
-| When it saves | seconds after anything changes | every 6 hours |
-| Deletions | mirrored | mirrored (whole archive is replaced) |
-| Needs | a private GitHub repo + token | a GoFile account token |
-
-Enable git and it becomes primary automatically; GoFile stays on as an
-infrequent second copy. Enable neither and the agent runs with disposable
-state, which is fine for trying the template out.
+| | Git state backend |
+|---|---|
+| Uploads | only the bytes that changed |
+| Typical save | a few KB |
+| When it saves | seconds after anything changes |
+| Deletions | mirrored |
+| Needs | a private GitHub repo + token |
 
 **Boot order, and the one exception.** At boot the agent restores from GitHub
 whenever the state branch already holds anything. The exception is the very
-first launch: that branch is empty, so the GoFile archive (if you have one) is
-the only copy that exists. The boot wrapper restores from GoFile and hands the
-branch to the git sync daemon, which seeds it with that state once the gateway
-is up. GitHub is primary from then on. GoFile keeps running either way as a
-slower second copy.
+first launch: that branch is empty, so there is nothing to restore and the
+tree this instance builds locally is the only copy that exists. The boot
+wrapper flags the situation and hands the branch to the git sync daemon, which
+seeds it with that state once the gateway is up. GitHub is the durable store
+from then on.
 
 The seed runs in the daemon rather than in the boot wrapper on purpose. A
 first state push is the largest upload this service ever makes, and everything
@@ -514,17 +477,14 @@ deploy whose service never opens one (`Port scan timeout reached, no open
 ports detected`). A slow GitHub response during that push used to be enough to
 push the dashboard past the scan window and take the deploy with it. Now the
 port binds first and the seed follows a few seconds later, and a failed attempt
-costs a retry on the daemon's next tick rather than a redeploy. The trade is
-that GoFile stays at its normal cadence for that one first boot; GitHub takes
-over as primary, and GoFile slows down, from the next restart onwards.
+costs a retry on the daemon's next tick rather than a redeploy.
 
-That handoff is guarded, because the GoFile archive can be older than what
-GitHub holds: only a branch the daemon has confirmed is empty gets seeded, and
-never one it simply could not reach. If GitHub is unreachable at boot, GoFile
-stays the live copy and the git daemon waits rather than overwriting state it
-never restored from.
+That handoff is guarded: only a branch the daemon has confirmed is empty gets
+seeded, and never one it simply could not reach. If GitHub is unreachable at
+boot, the local tree is not pushed over state this instance never restored
+from — the daemon waits for a boot that restores cleanly.
 
-### Configure the git backup (recommended)
+### Configure the git backup
 
 **1. Create a private repository for the state.** On GitHub, make a new repo —
 `hermes-storage` is a good name — and set it to **Private**. It must hold
@@ -554,22 +514,20 @@ GIT_STATE_TOKEN  = github_pat_...
 ```
 
 That is the whole setup. On the next deploy the boot log will show
-`started git state sync (primary, delta uploads on change)`.
+`started git state sync (delta uploads on change)`.
 
-#### First launch: filling an empty repo from GoFile
+#### First launch: filling an empty repo
 
 The state repo starts out empty, so there is nothing in it to restore. On that
-first boot the wrapper restores the GoFile archive instead (if you have one)
-and leaves the branch to the sync daemon, which seeds it with that state once
-the gateway is up — so a deployment that already has GoFile state does not lose
-it when it moves to git:
+first boot the wrapper notices, keeps whatever this instance builds locally,
+and leaves the branch to the sync daemon, which seeds it once the gateway is
+up:
 
 ```
 [render-tools] github state branch is empty (first launch); the sync daemon seeds it after boot
-[hermes-gofile] restored Hermes state from GoFile folder 4a31c4bf-...
-[render-tools] state restore finished in 166s (source=gofile)
-[render-tools] github has no state yet; the sync daemon seeds it from gofile after boot
-[render-tools] started git state sync (primary, delta uploads on change)
+[render-tools] state restore finished in 2s (source=fresh)
+[render-tools] github has no state yet; the sync daemon seeds it from this instance after boot
+[render-tools] started git state sync (delta uploads on change)
 ...
 [hermes-git-state] state branch state does not exist yet; starting a new one
 [hermes-git-state] seeded yourname/hermes-storage@state; github is now the primary state store
@@ -579,11 +537,10 @@ The last two lines land a few seconds after the dashboard starts rather than
 before it, which is the point: the port is already bound, so a slow first push
 cannot fail the deploy.
 
-Every later boot restores from GitHub and never touches the GoFile archive
-unless GitHub is unreachable. The seed refuses to run against a branch that
-already holds state, so an old GoFile copy can never overwrite newer GitHub
-state — `GIT_STATE_SEED_FORCE=1` is the deliberate override if you ever want
-the local copy to win.
+Every later boot restores from GitHub. The seed refuses to run against a
+branch that already holds state, so a stale local tree can never overwrite
+newer GitHub state — `GIT_STATE_SEED_FORCE=1` is the deliberate override if
+you ever want the local copy to win.
 
 #### When a push does not get through
 
@@ -629,8 +586,8 @@ mtime tick can slip past it.
 #### What gets backed up, and what deliberately does not
 
 Everything under `/opt/data` is mirrored into a `data/` folder in the repo,
-minus logs and caches (the same exclude list the GoFile sync uses), plus a
-`MANIFEST.json` recording what was saved and when.
+minus logs and caches (logs, `__pycache__`, `node_modules`, tmp files, and the
+like), plus a `MANIFEST.json` recording what was saved and when.
 
 **Deleting a file locally deletes it from the repo.** The backend rebuilds the
 mirror from scratch each time rather than adding to it, so a memory you delete
@@ -649,7 +606,7 @@ the keys the agent runs on. `GIT_STATE_ENV_MODE` decides how it is stored:
 
 The default is what it is because it is what makes the backup complete — and it
 is only ever pushed to a repository the backend has
-[confirmed is private](#configure-the-git-backup-recommended). Be deliberate
+[confirmed is private](#configure-the-git-backup). Be deliberate
 about it anyway: a private
 repo is not an encrypted one. Anyone who later gains read access to the repo,
 or any token with access to it, can read a plaintext `.env` out of git history,
@@ -661,36 +618,6 @@ who reads it can use them without the age private key (keep it in Render's
 Environment tab as `SOPS_AGE_KEY`). Under `encrypt`, if no recipient is
 configured or the `age` binary is missing, `.env` is **omitted rather than
 committed in the clear** — the one thing that never happens silently.
-
-#### Start-up reconciliation: GoFile → GitHub
-
-GoFile was the primary store before this backend existed, so its newest archive
-can hold files the state branch never received: state from an instance that only
-ever had GoFile configured, or a tree written before the first seed. **Once per
-start**, the sync daemon lists the newest GoFile archive, subtracts what the
-branch already has and what the local `/opt/data` is about to commit anyway, and
-pushes only the difference — `.env` and config files included.
-
-It is a backfill, never a restore: a path already on the branch keeps the copy
-that is there, even when the archive holds a different one. Local files win over
-the archive too, since they are what this instance actually booted from.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `GIT_STATE_GOFILE_RECONCILE` | `1` | Set `0` to skip the start-up check entirely |
-| `GIT_STATE_GOFILE_RECONCILE_MAX_MB` | `100` | How much of the archive one start may read into memory before committing |
-
-The check costs one archive download per start, which is the reason it runs in
-the daemon rather than in the boot wrapper: everything before the container
-binds its port has to fit inside Render's scan window, and a slow download there
-fails the deploy with "no open ports detected". A failure is logged and retried
-on the next start; it never blocks boot.
-
-To see what it would do right now, without waiting for a start:
-
-```bash
-docker exec <container> /opt/render-tools/git-storage.py reconcile /opt/data
-```
 
 #### Keeping the repo from growing forever
 
@@ -707,53 +634,10 @@ squashes; lowering it makes the expensive save more frequent.
 #### Failover
 
 If you run a second instance (say a laptop with `./run-local.sh --takeover`),
-the two coordinate through the git repo instead of GoFile — see
+the two coordinate through the state repo — see
 [Running local and Render at the same time](#running-local-and-render-at-the-same-time).
 Checking who is in charge is a single `git ls-remote`, a few hundred bytes, so
 polling for it is not what costs you bandwidth.
-
-### Configure GoFile (fallback)
-
-Keep this configured if you already have state in GoFile, or as a second copy
-in case GitHub is unreachable. It is also what seeds GitHub on a first launch,
-when the state branch is still empty. It backs up and restores every regular
-file under `/opt/data`, including `.env` and runtime logs. The sync is
-disabled unless `GOFILE_API_TOKEN` is configured.
-
-1. Create or sign in to a GoFile account and copy its API token from
-   [My Profile](https://gofile.io/myprofile). Use an account token rather than
-   anonymous uploads so the folder remains associated with your account. A
-   guest token works too, but it is the only way back to that guest account.
-2. In Render's **Environment** tab, add `GOFILE_API_TOKEN`. The service will
-   find or create a private `hermes-render-state` folder under that account.
-   To use an existing folder instead, also set `GOFILE_FOLDER_ID` to its UUID,
-   not only its public share code.
-3. Keep the default `GOFILE_STATE_PREFIX=hermes-state-`, five-minute sync
-   interval, and 100 MB compressed archive cap unless you have a reason to
-   change them. The worker skips the archive entirely when `/opt/data` has
-   not changed, so the interval is a safety check rather than a constant
-   compression workload. If the complete data tree exceeds the cap, increase
-   `GOFILE_MAX_ARCHIVE_MB`; the upload is otherwise refused rather than
-   silently producing a partial backup.
-
-The boot wrapper lists the folder, downloads the newest matching archive,
-and restores it before Hermes starts. While Hermes runs, a background worker
-checks for changed state every five minutes, then uploads a compressed
-snapshot only when needed and deletes older matching backups only after a
-successful upload. It also makes a best-effort upload on shutdown. The
-archive covers every regular file below `/opt/data`, including `.env` and
-`logs/`; sockets, device files, and symlinks are skipped because they cannot be
-safely restored into a replacement container. An archive can therefore contain
-`BYNARA_API_KEY`, provider keys, chat tokens, and dashboard credentials — treat
-the GoFile account/folder as highly sensitive and do not share its link.
-
-GoFile's free limits, retention/cold-storage behavior, rate limits, and
-account policies apply. Only one Hermes instance should write a given folder
-prefix. This is a backup/restore layer, not a replacement for a database or a
-high-concurrency shared filesystem. If GoFile rotates its website-token salt
-and restore logs show `error-notPremium`, set `GOFILE_WT_SALT` to the current
-value from GoFile's web client and restart; the default is kept in the image
-for the current API behavior.
 
 ## Updating
 
@@ -770,7 +654,7 @@ Bump either, commit, and push. Render won't auto-deploy (the Blueprint sets `aut
 render deploys create <service-id>
 ```
 
-Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Without the optional GoFile sync, sessions, memories, installed skills, and dashboard config are disposable. With GoFile configured, those files are restored from and periodically backed up to the selected folder. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep secrets outside the archive in Render environment variables.
+Free has no persistent disk: `/opt/data` is recreated from the image whenever the service is redeployed or restarted after a spin-down. Without the optional git state sync, sessions, memories, installed skills, and dashboard config are disposable. With the state repo configured, those files are restored from and backed up to it. The upstream entrypoint still runs its manifest-based `skills_sync.py` on each boot, and the `render-oss/skills` bundle plus the `render-on-hermes` overlay live under `/opt/render-tools/` (the image layer), so the bundled skills are restored on every boot. Keep secrets outside the backup in Render environment variables.
 
 Hermes ships fast: roughly weekly tagged releases, each with around 180 commits. Check [the upstream releases page](https://github.com/NousResearch/hermes-agent/releases) before bumping `HERMES_IMAGE`. The [skills repo's commit log](https://github.com/render-oss/skills/commits/main) is the source of truth for `RENDER_SKILLS_REF`.
 
@@ -802,7 +686,7 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
 | `Port scan timeout reached, no open ports detected`  | The container never bound `$PORT` inside Render's scan window, because the boot wrapper was still working when it expired. `[render-tools] state restore finished in Ns (source=...)` in the logs says how long the blocking part took; `HERMES_RESTORE_TIMEOUT_SECONDS` (240) caps it. The GitHub state seed is no longer part of it — a slow first push there used to eat the whole window, so it now runs in the sync daemon after the dashboard is up. |
 | Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
-| API keys or sessions disappear                      | Render's **Environment** tab is the durable fallback. If dashboard-managed keys, sessions, logs, and files must survive a cold start/redeploy, configure GoFile sync and check that the complete archive stays below `GOFILE_MAX_ARCHIVE_MB`. |
+| API keys or sessions disappear                      | Render's **Environment** tab is the durable fallback. If dashboard-managed keys, sessions, logs, and files must survive a cold start/redeploy, configure the git state sync (`GIT_STATE_REPO` + `GIT_STATE_TOKEN`). |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
 | `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
@@ -818,9 +702,9 @@ Set, change, or delete env vars under the service's **Environment** tab. Render 
 
 ### Forcing a clean rebuild
 
-Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. With GoFile disabled, the new instance starts with a clean `/opt/data` directory and reseeds defaults. With GoFile enabled, delete or replace the matching `hermes-state-*.tar.gz` object in the configured folder before redeploying if you also need to discard the saved state. Render Environment variables are re-injected automatically.
+Free instances are disposable by design. If the Hermes data directory gets into a bad state (corrupt session DB, partial skill install), trigger a new deploy from the Render Dashboard. With the state sync disabled, the new instance starts with a clean `/opt/data` directory and reseeds defaults. With it enabled, the bad state is restored again on boot — delete the `data/` tree on the state branch (or the whole branch) before redeploying if you also need to discard the saved state. Render Environment variables are re-injected automatically.
 
-There is no persistent-disk snapshot to restore on Free; the optional GoFile archive is the available backup.
+There is no persistent-disk snapshot to restore on Free; the private state repo is the available backup.
 
 ## Security
 
@@ -885,10 +769,9 @@ What it does:
 - Bakes the official Render skill bundle into the image, plus a small `render-on-hermes` overlay skill that tells the agent how to behave on this host.
 - Idempotently patches `config.yaml` on each boot to register the Render MCP server, the Bynara custom provider, the full MCP tool catalog available to your API key, and conservative Free-tier concurrency/cache defaults, without overwriting explicit edits.
 - Backs up every regular file under `/opt/data` to a private GitHub repo within seconds of any change, uploading only the bytes that changed, and restores from it at boot.
-- Keeps GoFile as a second, slower copy, and uses it as the restore source on a first launch when the GitHub state branch is still empty — then pushes that state to GitHub so git is primary from then on.
-- Reconciles the two at every start: anything the newest GoFile archive holds that the state branch does not — `.env` and config files included — is pushed to GitHub, without ever overwriting what the branch already has.
-- Refuses to seed a state branch it could not confirm was empty, and refuses to push a GoFile-restored tree over GitHub state it never restored from, so an older backup cannot silently replace a newer one.
-- Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GOFILE_API_TOKEN`, and `GOFILE_FOLDER_ID` as `sync: false` so secrets never sync from the repo.
+- Seeds an empty state branch from the tree the instance builds on a first launch, once the gateway is up, so the port bind never waits on a push.
+- Refuses to seed a state branch it could not confirm was empty, and refuses to push a tree it never restored from over GitHub state the branch already holds, so an unproven copy cannot silently replace a newer one.
+- Generates a `HERMES_GATEWAY_TOKEN` and marks `BYNARA_API_KEY`, `OPENROUTER_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ALLOWED_USERS`, `GIT_STATE_REPO`, and `GIT_STATE_TOKEN` as `sync: false` so secrets never sync from the repo.
 - Sets a healthcheck that probes the dashboard.
 
 What it deliberately doesn't do:
@@ -896,8 +779,8 @@ What it deliberately doesn't do:
 - **It doesn't install the `render` CLI.** MCP is the supported in-container Render integration. Install the CLI only as a deliberate operator choice.
 - It doesn't try to add authentication on top of the dashboard. Use an auth gateway, private network path, or another access-control layer you trust.
 - It doesn't enable the OpenAI-compatible API server. Flip `API_SERVER_ENABLED=true` and supply `API_SERVER_KEY` if you need it.
-- It doesn't hardcode a model API key. When `BYNARA_API_KEY` is configured, the patcher selects Bynara's `qwen-3.8-max-free` default on a fresh/upstream-default config; otherwise Hermes uses its upstream model default. The setting lives in ephemeral `/opt/data` unless GoFile storage is enabled.
-- It doesn't encrypt GoFile archives. When GoFile sync is enabled, the archive includes `.env` and all regular files under `/opt/data`; protect the GoFile account and folder like a secrets backup.
+- It doesn't hardcode a model API key. When `BYNARA_API_KEY` is configured, the patcher selects Bynara's `qwen-3.8-max-free` default on a fresh/upstream-default config; otherwise Hermes uses its upstream model default. The setting lives in ephemeral `/opt/data` unless git state storage is enabled.
+- It doesn't encrypt the state branch by default. `.env` is committed verbatim in plaintext mode (`GIT_STATE_ENV_MODE`); use `encrypt` or `omit` if you would rather not, and protect the state repo like a secrets backup either way.
 - It doesn't configure browser automation tweaks (`--shm-size`, GPU access). Those need an instance type with more RAM, not extra Render config.
 - It doesn't fork or modify the upstream `render-oss/skills` content. The overlay in `skills/render-on-hermes/` is the only Hermes-specific addition; everything else is the canonical Render skill bundle.
 
