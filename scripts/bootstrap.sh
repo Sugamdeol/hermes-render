@@ -3,9 +3,9 @@
 #
 # Runs as root (PID-1 child of tini). On every boot it:
 #   1. Ensures /opt/data exists and is owned by hermes:hermes.
-#   2. Restores state from GitHub, or from GoFile on a first launch (the
-#      state branch is empty then). Seeding GitHub with that restored state is
-#      left to the git sync daemon, so nothing here can delay the port bind.
+#   2. Restores state from the GitHub state repo (the state branch is empty
+#      on a first launch; seeding it is left to the git sync daemon, so
+#      nothing here can delay the port bind).
 #   3. Seeds the upstream config template when this is a fresh instance.
 #   4. Runs the config patcher as the hermes user. On a fresh template it
 #      lowers known upstream resource defaults; later boots preserve edits.
@@ -22,25 +22,16 @@ set -eu
 
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 PATCHER="/opt/render-tools/patch-config.py"
-STORAGE_SYNC="/opt/render-tools/free-storage.py"
 GIT_SYNC="/opt/render-tools/git-storage.py"
 
 # Which backend keeps the durable copy of ${DATA_DIR}?
 #
-#   git    - a private GitHub repo. Primary when GIT_STATE_REPO and a token are
-#            set, because it uploads only the bytes that changed (a few KB per
-#            save) instead of a whole archive (tens of MB). Saves are
-#            change-driven: the daemon fingerprints /opt/data every few
-#            seconds and pushes once the tree settles.
-#   gofile - the original whole-archive upload. Kept as a backup: it still
-#            holds older snapshots, and it is the only copy on a first launch,
-#            when the GitHub state branch is still empty.
-#
-# Both normally run at once. When git is primary, GoFile is slowed to a long
-# interval (GOFILE_FALLBACK_INTERVAL_SECONDS, default 6 hours) so the pair
-# together still fits a small monthly transfer allowance. On a first launch
-# that ordering is reversed for one boot: the state branch is empty, so we
-# restore from GoFile and immediately `seed` GitHub with it.
+#   git - a private GitHub repo, configured with GIT_STATE_REPO and a token.
+#         It uploads only the bytes that changed (a few KB per save) instead
+#         of a whole archive (tens of MB). Saves are change-driven: the
+#         daemon fingerprints /opt/data every few seconds and pushes once the
+#         tree settles. Without it there is no remote copy: /opt/data is
+#         ephemeral on Free and state lives only for the current instance.
 #
 # Note: these must be real environment variables (Render's Environment tab),
 # not values from env/common.env -- restore runs before the repo env is merged.
@@ -54,23 +45,21 @@ fi
 # before we run the patcher. Idempotent — on Free this is the ephemeral
 # directory from the image; paid deployments may mount a disk here.
 mkdir -p "${DATA_DIR}"
-STORAGE_RESTORE_OK=1
 if ! chown -R hermes:hermes "${DATA_DIR}" 2>/dev/null; then
   echo "[render-tools] warning: could not chown ${DATA_DIR}; continuing" >&2
 fi
 
 # Restore a previous instance's state.
 #
-# GitHub is the primary store as soon as the state branch holds anything. The
-# one exception is the very first launch, when that branch is still empty: the
-# only copy that exists is the GoFile archive (if you have one), so we restore
-# from GoFile and the git sync daemon seeds GitHub with it once the gateway is
-# up. After that GitHub is primary and GoFile drops to a slow backup.
+# GitHub is the durable store as soon as the state branch holds anything. The
+# one exception is the very first launch, when that branch is still empty:
+# there is nothing to restore, so the git sync daemon seeds GitHub from the
+# tree this instance builds once the gateway is up.
 #
 # `state` is what makes this safe rather than a guess: it answers
 # "has-state" / "empty" / "unknown", and only an *empty* branch is seeded --
 # an unreachable one is not assumed empty, because seeding force-pushes and
-# could otherwise overwrite newer GitHub state with an older GoFile archive.
+# could otherwise overwrite newer GitHub state with an unproven local tree.
 #
 # Run the helpers as hermes so restored files already have the right owner.
 #
@@ -105,8 +94,8 @@ run_bounded() {
 
 STATE_SOURCE="fresh"
 GIT_HAS_STATE=0
-GIT_STATE_SEED_FROM_GOFILE=""
-export GIT_STATE_SEED_FROM_GOFILE
+GIT_STATE_SEED_ON_BOOT=""
+export GIT_STATE_SEED_ON_BOOT
 
 if [ "${GIT_BACKEND}" -eq 1 ]; then
   git_state="$(gosu hermes "${GIT_SYNC}" state "${DATA_DIR}" 2>/dev/null | head -n 1)"
@@ -116,7 +105,13 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
       if run_bounded gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
         STATE_SOURCE="github"
       else
-        echo "[render-tools] warning: github restore failed; trying GoFile" >&2
+        # $? is the status of the condition, so 124 means `timeout` stopped it.
+        restore_status=$?
+        if [ "${restore_status}" -eq 124 ]; then
+          echo "[render-tools] warning: state restore ran past ${RESTORE_TIMEOUT}s and was stopped," >&2
+          echo "[render-tools] warning: so the port binds in time. Raise HERMES_RESTORE_TIMEOUT_SECONDS if this repeats." >&2
+        fi
+        echo "[render-tools] warning: github state restore failed; continuing without restored state" >&2
       fi
       ;;
     empty)
@@ -128,21 +123,6 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
       echo "[render-tools] warning: could not read the github state repo; treating it as unavailable" >&2
       ;;
   esac
-fi
-
-if [ "${STATE_SOURCE}" != "github" ] && [ -x "${STORAGE_SYNC}" ]; then
-  if run_bounded gosu hermes "${STORAGE_SYNC}" restore "${DATA_DIR}"; then
-    STATE_SOURCE="gofile"
-  else
-    # $? is the status of the condition, so 124 means `timeout` stopped it.
-    restore_status=$?
-    STORAGE_RESTORE_OK=0
-    if [ "${restore_status}" -eq 124 ]; then
-      echo "[render-tools] warning: state restore ran past ${RESTORE_TIMEOUT}s and was stopped," >&2
-      echo "[render-tools] warning: so the port binds in time. Raise HERMES_RESTORE_TIMEOUT_SECONDS if this repeats." >&2
-    fi
-    echo "[render-tools] warning: remote state restore failed; continuing without state sync" >&2
-  fi
 fi
 
 echo "[render-tools] state restore finished in $(elapsed_boot_seconds)s (source=${STATE_SOURCE})"
@@ -159,13 +139,13 @@ echo "[render-tools] state restore finished in $(elapsed_boot_seconds)s (source=
 # got to bind. The daemon seeds the branch ~15s after the gateway is up, and a
 # failed attempt costs a retry on its next tick rather than a redeploy.
 #
-# The flag below is also the promise not to push a GoFile-restored tree over
-# GitHub state this instance never restored from.
+# The flag below is also the promise not to push a tree this instance never
+# restored from GitHub over state the branch already holds.
 if [ "${GIT_BACKEND}" -eq 1 ] && [ "${STATE_SOURCE}" != "github" ]; then
-  GIT_STATE_SEED_FROM_GOFILE=1
-  export GIT_STATE_SEED_FROM_GOFILE
+  GIT_STATE_SEED_ON_BOOT=1
+  export GIT_STATE_SEED_ON_BOOT
   if [ "${GIT_HAS_STATE}" -eq 0 ]; then
-    echo "[render-tools] github has no state yet; the sync daemon seeds it from ${STATE_SOURCE} after boot"
+    echo "[render-tools] github has no state yet; the sync daemon seeds it from this instance after boot"
   else
     # GitHub holds state we could not read, so this instance's /opt/data is not
     # derived from it. Pushing would replace the backup with a partial tree,
@@ -259,7 +239,8 @@ if [ -x "${SEEDER}" ] && [ -f "${SECRETS_ENC}" ]; then
 fi
 
 # Apply the resource profile once per data tree. The marker is restored along
-# with GoFile state, so later dashboard edits are not repeatedly overwritten.
+# with the rest of /opt/data from the state repo, so later dashboard edits are
+# not repeatedly overwritten.
 RESOURCE_MARKER="${DATA_DIR}/.render-tools-free-profile-v1"
 APPLY_FREE_DEFAULTS=0
 if [ ! -f "${RESOURCE_MARKER}" ]; then
@@ -328,13 +309,11 @@ fi
 HERMES_ROLE=active
 ROLE_SOURCE=""
 if [ "${HERMES_FAILOVER:-0}" = "1" ]; then
-  # Whichever backend is primary also arbitrates the lease, so both instances
-  # are reading the same source of truth. The git backend answers this with a
+  # The state backend also arbitrates the lease, so both instances are
+  # reading the same source of truth. The git backend answers this with a
   # single `git ls-remote`, which transfers only a few hundred bytes.
   if [ "${GIT_BACKEND}" -eq 1 ]; then
     ROLE_SOURCE="${GIT_SYNC}"
-  elif [ -x "${STORAGE_SYNC}" ]; then
-    ROLE_SOURCE="${STORAGE_SYNC}"
   fi
 fi
 if [ -n "${ROLE_SOURCE}" ]; then
@@ -358,37 +337,12 @@ if [ -n "${ROLE_SOURCE}" ]; then
   fi
 fi
 
-# Keep a remote snapshot up to date in the background. The workers are started
-# as hermes so they cannot read files outside the data directory. Both are
-# optional and exit cleanly when their credentials are not configured.
+# Keep a remote snapshot up to date in the background. The worker is started
+# as hermes so it cannot read files outside the data directory. It is optional
+# and exits cleanly when its credentials are not configured.
 if [ "${GIT_BACKEND}" -eq 1 ]; then
   gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
-  echo "[render-tools] started git state sync (primary, delta uploads on change)"
-fi
-
-if [ -x "${STORAGE_SYNC}" ] && [ "${STORAGE_RESTORE_OK}" -eq 1 ]; then
-  # Backups are deliberately lower priority than the gateway. The worker is
-  # change-aware, so quiet instances do not repeatedly recompress /opt/data.
-  #
-  # GitHub holds the primary copy, so GoFile only needs to be an occasional
-  # belt-and-braces archive. Each GoFile run re-uploads the whole tree, so
-  # leaving it at its normal cadence would spend the monthly transfer
-  # allowance that switching to git was meant to save.
-  if [ "${GIT_HAS_STATE}" -eq 1 ]; then
-    GOFILE_MIN_UPLOAD_INTERVAL_SECONDS="${GOFILE_FALLBACK_INTERVAL_SECONDS:-21600}"
-    export GOFILE_MIN_UPLOAD_INTERVAL_SECONDS
-    # The git backend owns the failover lease; a second voter would only
-    # confuse the decision.
-    HERMES_FAILOVER=0 gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
-    echo "[render-tools] started GoFile state sync (backup, every ${GOFILE_MIN_UPLOAD_INTERVAL_SECONDS}s)"
-  else
-    # GitHub has no state yet, so GoFile is the only backup there is: keep it
-    # at its normal cadence. On a first launch this covers the whole boot --
-    # the seed is deferred to the git daemon, so GitHub only becomes primary
-    # (and GoFile only slows down) from the next restart onwards.
-    gosu hermes nice -n 10 "${STORAGE_SYNC}" daemon "${DATA_DIR}" &
-    echo "[render-tools] started GoFile state sync (live copy until github is seeded)"
-  fi
+  echo "[render-tools] started git state sync (delta uploads on change)"
 fi
 
 # Hand off to the upstream entrypoint. The upstream script handles

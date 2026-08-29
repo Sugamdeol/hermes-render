@@ -34,17 +34,15 @@ upstream skill assumes something that isn't true on this host.
 
 This template runs as a Render **Free** web service. Its `/opt/data` filesystem
 is ephemeral: it is reset after a spin-down or redeploy. Unless a state backup
-is configured (`GIT_STATE_REPO` for the git backend, `GOFILE_API_TOKEN` for
-GoFile), do not tell the user that sessions, memories, dashboard configuration,
-logs, or files saved there will persist. With one configured, state is restored
-at boot and saved again within seconds of any change — from the private GitHub
-repo when it holds anything, otherwise from the GoFile archive, which is then
-used to seed that repo. Provider keys, channel tokens, and other important
-configuration must still live in Render environment variables, not only in
-`/opt/data/.env`. When GoFile sync is enabled, the archive includes `.env`,
-logs, and every other regular file under `/opt/data`, so the GoFile folder must
-be treated as sensitive; the GitHub copy is safer only because `.env` is
-age-encrypted or left out of it.
+is configured (`GIT_STATE_REPO` for the git backend), do not tell the user that
+sessions, memories, dashboard configuration, logs, or files saved there will
+persist. With one configured, state is restored at boot and saved again within
+seconds of any change from the private GitHub repo. Provider keys, channel
+tokens, and other important configuration must still live in Render environment
+variables, not only in `/opt/data/.env`. The state branch includes everything
+under `/opt/data` — `.env` included, in plaintext mode — so the repository must
+be treated as sensitive; `.env` can be age-encrypted (`GIT_STATE_ENV_MODE`)
+or left out of the backup entirely.
 
 The Bynara router is available as `custom:bynara` and uses `BYNARA_API_KEY`.
 The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when

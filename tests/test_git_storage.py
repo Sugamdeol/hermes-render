@@ -191,8 +191,7 @@ class MirrorPlanTests(unittest.TestCase):
         self.storage = load_storage()
 
     def _plan(self, data_dir):
-        excludes, _ = self.storage.excludes_and_matcher()
-        return set(self.storage.plan_mirror(data_dir, excludes))
+        return set(self.storage.plan_mirror(data_dir, self.storage.DEFAULT_EXCLUDES))
 
     def test_durable_state_is_mirrored_and_volatile_paths_are_not(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -214,8 +213,8 @@ class MirrorPlanTests(unittest.TestCase):
             data_dir = Path(directory)
             for name in ("c.md", "a.md", "b.md"):
                 (data_dir / name).write_text("x")
-            excludes, _ = self.storage.excludes_and_matcher()
-            planned = list(self.storage.plan_mirror(data_dir, excludes))
+            planned = list(self.storage.plan_mirror(
+                data_dir, self.storage.DEFAULT_EXCLUDES))
             self.assertEqual(planned, sorted(planned))
 
 
@@ -301,26 +300,6 @@ class SecretHandlingTests(unittest.TestCase):
     def test_an_unrecognised_mode_falls_back_to_the_default(self):
         config = make_config(self.storage, env_mode="encrypt-ish")
         self.assertEqual(config.env_mode, self.storage.DEFAULT_ENV_MODE)
-
-    def test_recovered_env_files_are_committed_too(self):
-        """A .env that only exists in the GoFile archive is not left behind."""
-        manifest = self._mirror()[0]
-        self.assertEqual(manifest["reconciled"], [])
-
-        root = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, root, True)
-        data_dir = root / "data"
-        data_dir.mkdir()
-        (data_dir / "config.yaml").write_text("model: x\n")
-        workdir = root / "work"
-        workdir.mkdir()
-        manifest = self.storage.build_worktree(
-            data_dir, workdir, make_config(self.storage),
-            extra={".env": b"HERMES_API_KEY=from-the-archive\n"})
-        self.assertEqual(manifest["reconciled"], [".env"])
-        self.assertIn(".env", manifest["plaintext_env"])
-        self.assertEqual((workdir / "data" / ".env").read_text(),
-                         "HERMES_API_KEY=from-the-archive\n")
 
 
 class SafetyTests(unittest.TestCase):
@@ -449,7 +428,7 @@ class RemoteProbeTests(LocalRemoteTests):
 class SeedTests(LocalRemoteTests):
     """First launch: the GitHub branch is empty and has to be filled."""
 
-    def _data_dir(self, contents="restored from gofile"):
+    def _data_dir(self, contents="built locally"):
         data_dir = self.root / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "config.yaml").write_text("model: x\n")
@@ -462,8 +441,8 @@ class SeedTests(LocalRemoteTests):
         data_dir = self._data_dir()
         config = self.make_config()
 
-        # What bootstrap.sh does on a first launch: git has nothing, GoFile
-        # (here: the pre-existing directory) is the only copy.
+        # What bootstrap.sh flags on a first launch: the branch is empty, so
+        # the tree this instance built locally is the only copy there is.
         self.assertFalse(storage.restore(self.root / "empty-dir", config))
         self.assertTrue(storage.seed(data_dir, config))
 
@@ -480,7 +459,7 @@ class SeedTests(LocalRemoteTests):
         fresh.mkdir()
         self.assertTrue(storage.restore(fresh, self.make_config(workdir=self.root / "w2")))
         self.assertEqual((fresh / "memories" / "note.md").read_text(),
-                         "restored from gofile")
+                         "built locally")
 
     def test_seed_refuses_to_overwrite_state_that_is_already_there(self):
         storage = self.storage
@@ -488,7 +467,7 @@ class SeedTests(LocalRemoteTests):
         # A second boot that somehow still thinks it is seeding must not
         # replace what is on the branch.
         with self.assertRaises(storage.GitStateError):
-            storage.seed(self._data_dir("older gofile copy"),
+            storage.seed(self._data_dir("older local copy"),
                          self.make_config(workdir=self.root / "w2"))
         restored = self.root / "restored"
         restored.mkdir()
@@ -514,16 +493,16 @@ class SeedTests(LocalRemoteTests):
         with self.assertRaises(self.storage.GitStateError):
             self.storage.seed(self._data_dir(), self.make_config())
 
-    def test_a_gofile_booted_instance_does_not_overwrite_github_state(self):
+    def test_a_boot_without_restore_does_not_overwrite_github_state(self):
         """The guard bootstrap.sh arms when GitHub was unreachable at boot."""
         storage = self.storage
         storage.seed(self._data_dir("state already in github"), self.make_config())
 
-        # This instance booted from GoFile, so its tree is not derived from
-        # GitHub. Pushing would clobber the newer copy.
-        config = self.make_config(workdir=self.root / "w2", seed_from_gofile=True)
+        # This instance booted without restoring from GitHub, so its tree is
+        # not derived from the branch. Pushing would clobber the newer copy.
+        config = self.make_config(workdir=self.root / "w2", seed_on_boot=True)
         with self.assertRaises(storage.GitStateError):
-            storage.sync_once(self._data_dir("older gofile copy"), config)
+            storage.sync_once(self._data_dir("older local copy"), config)
 
         restored = self.root / "restored"
         restored.mkdir()
@@ -535,12 +514,12 @@ class SeedTests(LocalRemoteTests):
         """The guard must not block the very case it exists for."""
         self.assertTrue(
             self.storage.seed(self._data_dir(),
-                              self.make_config(seed_from_gofile=True)))
+                              self.make_config(seed_on_boot=True)))
 
     def test_successful_seed_disarms_the_guard(self):
-        config = self.make_config(seed_from_gofile=True)
+        config = self.make_config(seed_on_boot=True)
         self.storage.seed(self._data_dir(), config)
-        self.assertFalse(config.seed_from_gofile)
+        self.assertFalse(config.seed_on_boot)
         # Later saves go through normally.
         self.assertTrue(self.storage.sync_once(self._data_dir("second save"), config))
 
@@ -814,7 +793,7 @@ class StartupSeedTests(LocalRemoteTests):
     failed with "no open ports detected", so the seed moved into the daemon.
     """
 
-    def _data_dir(self, contents="restored from gofile"):
+    def _data_dir(self, contents="built locally"):
         data_dir = self.root / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
         (data_dir / "config.yaml").write_text("model: x\n")
@@ -824,18 +803,18 @@ class StartupSeedTests(LocalRemoteTests):
 
     def test_an_empty_branch_is_seeded_from_the_restored_tree(self):
         storage = self.storage
-        config = self.make_config(seed_from_gofile=True, push_retry_seconds=0)
+        config = self.make_config(seed_on_boot=True, push_retry_seconds=0)
 
         self.assertTrue(storage.seed_on_startup(self._data_dir(), config))
 
         self.assertIn("data/memories/note.md", self.remote_tree())
-        self.assertFalse(config.seed_from_gofile,
+        self.assertFalse(config.seed_on_boot,
                          "a landed seed must disarm the push guard")
 
     def test_nothing_is_pushed_when_the_flag_is_not_set(self):
         """A boot that restored from GitHub has no business seeding."""
         storage = self.storage
-        config = self.make_config(seed_from_gofile=False)
+        config = self.make_config(seed_on_boot=False)
 
         self.assertFalse(storage.seed_on_startup(self._data_dir(), config))
 
@@ -845,13 +824,14 @@ class StartupSeedTests(LocalRemoteTests):
         storage = self.storage
         storage.seed(self._data_dir("newer github state"), self.make_config())
 
-        # This instance booted from GoFile, so its tree is older than what the
-        # branch holds. The seed has to stand down and leave the guard armed.
-        config = self.make_config(workdir=self.root / "w2", seed_from_gofile=True)
-        self.assertFalse(storage.seed_on_startup(self._data_dir("older gofile copy"),
+        # This instance booted without restoring from GitHub, so its tree is
+        # not derived from the branch. The seed has to stand down and leave
+        # the guard armed.
+        config = self.make_config(workdir=self.root / "w2", seed_on_boot=True)
+        self.assertFalse(storage.seed_on_startup(self._data_dir("older local copy"),
                                                  config))
 
-        self.assertTrue(config.seed_from_gofile,
+        self.assertTrue(config.seed_on_boot,
                         "the guard must stay armed when the seed stands down")
         restored = self.root / "restored"
         restored.mkdir()
@@ -862,15 +842,15 @@ class StartupSeedTests(LocalRemoteTests):
     def test_an_unreachable_branch_is_left_for_a_later_tick(self):
         self.storage.GitConfig.remote_url = property(
             lambda self: "file:///nonexistent/nope.git")
-        config = self.make_config(seed_from_gofile=True)
+        config = self.make_config(seed_on_boot=True)
 
         self.assertFalse(self.storage.seed_on_startup(self._data_dir(), config))
 
-        self.assertTrue(config.seed_from_gofile)
+        self.assertTrue(config.seed_on_boot)
 
     def test_a_standby_instance_does_not_seed(self):
         storage = self.storage
-        config = self.make_config(seed_from_gofile=True, failover=True)
+        config = self.make_config(seed_on_boot=True, failover=True)
         config.role = storage.ROLE_STANDBY
 
         self.assertFalse(storage.seed_on_startup(self._data_dir(), config))
@@ -887,9 +867,9 @@ class DaemonStartupSeedTests(LocalRemoteTests):
         data_dir.mkdir()
         (data_dir / "config.yaml").write_text("model: x\n")
         (data_dir / "memories").mkdir()
-        (data_dir / "memories" / "note.md").write_text("restored from gofile")
+        (data_dir / "memories" / "note.md").write_text("built locally")
 
-        config = self.make_config(seed_from_gofile=True, interval=1,
+        config = self.make_config(seed_on_boot=True, interval=1,
                                   watch_seconds=1, push_retry_seconds=0)
         stop = threading.Event()
         thread = threading.Thread(
@@ -905,7 +885,7 @@ class DaemonStartupSeedTests(LocalRemoteTests):
 
         self.assertFalse(thread.is_alive(), "the daemon did not stop when asked")
         self.assertIn("data/memories/note.md", self.remote_tree())
-        self.assertFalse(config.seed_from_gofile,
+        self.assertFalse(config.seed_on_boot,
                          "a landed seed must disarm the push guard")
 
 
@@ -1143,7 +1123,7 @@ class BootstrapOrderTests(unittest.TestCase):
                 f"bootstrap.sh still seeds inline: {line.strip()}")
 
     def test_bootstrap_flags_the_seed_for_the_daemon_instead(self):
-        self.assertIn("GIT_STATE_SEED_FROM_GOFILE=1", self.source)
+        self.assertIn("GIT_STATE_SEED_ON_BOOT=1", self.source)
 
     def test_the_restore_cannot_run_past_its_budget(self):
         """A hung download has to cost the state, not the deploy."""
@@ -1154,273 +1134,6 @@ class BootstrapOrderTests(unittest.TestCase):
         daemon = (Path(__file__).resolve().parents[1]
                   / "scripts" / "git-storage.py").read_text(encoding="utf-8")
         self.assertIn("seed_on_startup(data_dir, config)", daemon)
-
-    def test_the_daemon_runs_the_gofile_reconcile_after_boot(self):
-        daemon = (Path(__file__).resolve().parents[1]
-                  / "scripts" / "git-storage.py").read_text(encoding="utf-8")
-        self.assertIn("reconcile_on_startup(data_dir, config)", daemon)
-
-    def test_bootstrap_never_reconciles_inline(self):
-        """The archive download must sit behind the port bind, not in front."""
-        for line in self.source.splitlines():
-            code = line.split("#", 1)[0]
-            self.assertNotRegex(code, r"reconcile",
-                                f"bootstrap.sh reconciles inline: {line.strip()}")
-
-
-class GofileReconcileTests(LocalRemoteTests):
-    """Once per start: whatever GoFile has and GitHub does not gets pushed."""
-
-    def setUp(self):
-        super().setUp()
-        self._saved_fetch = self.storage.latest_gofile_archive
-        self.archive = self.root / "gofile-state.tar.gz"
-
-    def tearDown(self):
-        self.storage.latest_gofile_archive = self._saved_fetch
-        super().tearDown()
-
-    def write_archive(self, members, *, unsafe=(), links=()):
-        """Build a tar.gz shaped like the one the GoFile backend uploads."""
-        with tarfile.open(self.archive, "w:gz") as tar:
-            for name, content in members.items():
-                payload = content.encode()
-                info = tarfile.TarInfo("./" + name)
-                info.size = len(payload)
-                tar.addfile(info, io.BytesIO(payload))
-            for name in unsafe:
-                tar.addfile(tarfile.TarInfo(name))
-            for name, target in links:
-                info = tarfile.TarInfo(name)
-                info.type = tarfile.SYMTYPE
-                info.linkname = target
-                tar.addfile(info)
-        return self.archive
-
-    def use_archive(self, archive=None):
-        source = archive or self.archive
-        self.storage.latest_gofile_archive = lambda destination: (
-            shutil.copyfile(source, destination) or destination)
-
-    def data_dir(self, **files):
-        data_dir = self.root / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        for name, content in files.items():
-            path = data_dir / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content)
-        return data_dir
-
-    def remote_file(self, relative):
-        proc = subprocess.run(
-            ["git", f"--git-dir={self.remote}", "show", f"state:data/{relative}"],
-            capture_output=True, text=True)
-        return proc.stdout if proc.returncode == 0 else None
-
-    def test_files_missing_from_github_are_pushed_from_the_archive(self):
-        storage = self.storage
-        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
-        self.write_archive({
-            "config.yaml": "model: local\n",
-            ".env": "HERMES_API_KEY=from-the-archive\n",
-            "memories/note.md": "remembered\n",
-        })
-        self.use_archive()
-
-        result = storage.reconcile_gofile_to_github(data_dir, self.make_config())
-
-        self.assertEqual(result["status"], "pushed")
-        self.assertEqual(result["added"], [".env", "memories/note.md"])
-        self.assertIn("data/.env", self.remote_tree())
-        self.assertIn("data/memories/note.md", self.remote_tree())
-        self.assertEqual(self.remote_file(".env"), "HERMES_API_KEY=from-the-archive\n")
-
-    def test_excluded_archive_members_are_not_pushed(self):
-        """Logs and caches are not state, even when the archive carries them."""
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({
-            "config.yaml": "model: x\n",
-            "logs/gateway.log": "chatter\n",
-            "memories/note.md": "remembered\n",
-        })
-        self.use_archive()
-
-        self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
-
-        self.assertIn("data/memories/note.md", self.remote_tree())
-        self.assertNotIn("data/logs/gateway.log", self.remote_tree())
-
-    def test_a_file_already_on_the_branch_keeps_its_own_contents(self):
-        """This is a backfill: it never overwrites what GitHub already has."""
-        storage = self.storage
-        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
-        storage.sync_once(data_dir, self.make_config())
-        self.write_archive({
-            "config.yaml": "model: STALE COPY FROM THE ARCHIVE\n",
-            "memories/note.md": "remembered\n",
-        })
-        self.use_archive()
-
-        result = storage.reconcile_gofile_to_github(
-            data_dir, self.make_config(workdir=self.root / "work2"))
-
-        self.assertEqual(result["added"], ["memories/note.md"])
-        self.assertEqual(self.remote_file("config.yaml"), "model: local\n")
-
-    def test_a_file_present_locally_is_pushed_from_disk_not_the_archive(self):
-        """The on-disk copy is what this instance booted from; it wins."""
-        data_dir = self.data_dir(**{"config.yaml": "model: local\n"})
-        self.write_archive({"config.yaml": "model: from-the-archive\n"})
-        self.use_archive()
-
-        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
-
-        self.assertEqual(result["added"], [])
-        self.assertEqual(self.remote_file("config.yaml"), "model: local\n")
-
-    def test_an_encrypted_copy_on_the_branch_counts_as_present(self):
-        """.env.enc on the branch and .env in the archive are the same file."""
-        storage = self.storage
-        saved = storage.age_encrypt
-        storage.age_encrypt = lambda payload, config: b"SEALED:" + payload
-        try:
-            # Put a branch on the remote whose dotenv was sealed by encrypt
-            # mode, from an instance that had a .env.
-            with_env = self.data_dir(**{"config.yaml": "model: x\n",
-                                        ".env": "HERMES_API_KEY=sealed\n"})
-            storage.sync_once(with_env, self.make_config(env_mode="encrypt",
-                                                         age_recipient="age1test"))
-            self.assertIn("data/.env.enc", self.remote_tree())
-        finally:
-            storage.age_encrypt = saved
-
-        # This instance no longer has a .env on disk, but the archive does.
-        # The branch already holds it (sealed), so it must not be re-added.
-        (self.root / "data" / ".env").unlink()
-        data_dir = self.root / "data"
-        self.write_archive({"config.yaml": "model: x\n", ".env": "KEY=plain\n"})
-        self.use_archive()
-
-        result = storage.reconcile_gofile_to_github(
-            data_dir, self.make_config(workdir=self.root / "work2"))
-
-        self.assertEqual(result["status"], "in-sync")
-        self.assertEqual(result["added"], [])
-        self.assertNotIn("data/.env", self.remote_tree())
-
-    def test_local_state_is_pushed_even_when_the_archive_adds_nothing(self):
-        """The goal is everything on GitHub, not only the GoFile difference."""
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({"config.yaml": "model: x\n"})
-        self.use_archive()
-
-        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
-
-        self.assertEqual(result["status"], "in-sync")
-        self.assertEqual(result["added"], [])
-        self.assertIn("data/config.yaml", self.remote_tree())
-
-    def test_disabled_by_flag(self):
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({"memories/note.md": "remembered\n"})
-        self.use_archive()
-
-        result = self.storage.reconcile_gofile_to_github(
-            data_dir, self.make_config(gofile_reconcile=False))
-
-        self.assertEqual(result["status"], "disabled")
-        self.assertEqual(self.remote_tree(), set())
-
-    def test_a_standby_does_not_reconcile(self):
-        """A standby's tree is a stale copy; it has no business backfilling."""
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({"memories/note.md": "remembered\n"})
-        self.use_archive()
-        config = self.make_config(failover=True)
-        config.role = self.storage.ROLE_STANDBY
-
-        result = self.storage.reconcile_gofile_to_github(data_dir, config)
-
-        self.assertEqual(result["status"], "standby")
-        self.assertEqual(self.remote_tree(), set())
-
-    def test_no_gofile_archive_is_not_an_error(self):
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.storage.latest_gofile_archive = lambda destination: None
-
-        result = self.storage.reconcile_gofile_to_github(data_dir, self.make_config())
-
-        self.assertEqual(result["status"], "empty")
-        self.assertEqual(result["added"], [])
-        # No archive means no diff, but the local tree still belongs on GitHub.
-        self.assertIn("data/config.yaml", self.remote_tree())
-
-    def test_members_over_the_budget_are_reported_and_skipped(self):
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({"memories/note.md": "remembered\n"})
-        self.use_archive()
-
-        result = self.storage.reconcile_gofile_to_github(
-            data_dir, self.make_config(gofile_reconcile_max_bytes=2))
-
-        self.assertEqual(result["status"], "oversize")
-        self.assertEqual(result["skipped"], ["memories/note.md"])
-        self.assertEqual(result["added"], [])
-        self.assertNotIn("data/memories/note.md", self.remote_tree())
-
-    def test_a_public_repo_is_still_refused_in_plaintext_mode(self):
-        """Plaintext .env makes the private-repo guard matter more, not less."""
-        self.storage.repo_is_private = lambda cfg: False
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        self.write_archive({"memories/note.md": "remembered\n"})
-        self.use_archive()
-        config = self.make_config(allow_public=False)
-        config._visibility_checked = False  # force the check to actually run
-
-        with self.assertRaises(self.storage.GitStateError):
-            self.storage.reconcile_gofile_to_github(data_dir, config)
-        self.assertEqual(self.remote_tree(), set())
-
-    def test_on_startup_swallows_a_failed_reconcile(self):
-        """A backfill must never take the sync daemon down with it."""
-        self.storage.latest_gofile_archive = lambda destination: (_ for _ in ()).throw(
-            RuntimeError("gofile is down"))
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-
-        result = self.storage.reconcile_on_startup(data_dir, self.make_config())
-
-        self.assertEqual(result["status"], "failed")
-        self.assertIn("gofile is down", result["error"])
-
-    def test_unsafe_archive_paths_are_never_pushed(self):
-        self.write_archive(
-            {"memories/note.md": "remembered\n"},
-            unsafe=("../escape.txt", "/etc/passwd", "logs/../escape2.txt"),
-            links=(("memories/link", "/etc/passwd"),),
-        )
-        self.assertEqual(self.storage.gofile_archive_paths(self.archive),
-                         ["memories/note.md"])
-
-    def test_the_daemon_reconciles_once_after_boot(self):
-        storage = self.storage
-        data_dir = self.data_dir(**{"config.yaml": "model: x\n"})
-        seen: list = []
-        stop = threading.Event()
-
-        def fake_reconcile(seen_dir, _config):
-            seen.append(seen_dir)
-            stop.set()
-            return {"status": "in-sync", "added": []}
-
-        saved = (storage.reconcile_on_startup, storage.seed_on_startup)
-        storage.reconcile_on_startup = fake_reconcile
-        storage.seed_on_startup = lambda d, c: False
-        try:
-            storage.run_daemon(data_dir, self.make_config(interval=1), stop)
-        finally:
-            storage.reconcile_on_startup, storage.seed_on_startup = saved
-
-        self.assertEqual(seen, [data_dir])
 
 
 if __name__ == "__main__":

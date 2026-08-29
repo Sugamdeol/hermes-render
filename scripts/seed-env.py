@@ -11,8 +11,8 @@ Precedence, highest first:
   1. The real process environment. Render's Environment tab and anything you
      export locally always win; repo values never override a live deploy knob.
   2. An existing value in $HERMES_HOME/.env. That file is written by the
-     dashboard's API Keys tab and restored from GoFile, so a key someone set
-     from the UI is not silently reverted to the committed one.
+     dashboard's API Keys tab and restored from the state repo, so a key
+     someone set from the UI is not silently reverted to the committed one.
   3. The repo's encrypted secrets. These fill in whatever is still missing.
 
 Pass --force to invert rule 2 and make the repo authoritative over the .env
@@ -179,7 +179,7 @@ def main(argv: "list[str] | None" = None) -> int:
 
     env_path = Path(args.env_file)
     env_text = read_text(env_path)
-    # Captured before the merge: these are the keys the dashboard or a GoFile
+    # Captured before the merge: these are the keys the dashboard or a state
     # restore already owns, which outrank the repo unless --force.
     preexisting = existing_keys(env_text)
     new_text, added = merge(env_text, secrets, force=args.force)
