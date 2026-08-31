@@ -589,6 +589,14 @@ Everything under `/opt/data` is mirrored into a `data/` folder in the repo,
 minus logs and caches (logs, `__pycache__`, `node_modules`, tmp files, and the
 like), plus a `MANIFEST.json` recording what was saved and when.
 
+A restore is meant to hand back the tree that was saved, so three things git
+cannot carry on its own ride in the manifest instead: **file permissions**
+beyond the executable bit (a `0600` key would otherwise come back as a
+world-readable `0644`), **empty directories** (git has no such thing), and
+**relative symlinks** that stay inside the data directory. A symlink with an
+absolute target, or one that climbs out with `..`, is skipped and logged —
+restoring it would be a way to write outside the restored tree.
+
 **Deleting a file locally deletes it from the repo.** The backend rebuilds the
 mirror from scratch each time rather than adding to it, so a memory you delete
 does not quietly live on in the backup. (Older *versions* still exist in git
