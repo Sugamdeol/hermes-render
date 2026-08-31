@@ -1135,6 +1135,219 @@ class BootstrapOrderTests(unittest.TestCase):
                   / "scripts" / "git-storage.py").read_text(encoding="utf-8")
         self.assertIn("seed_on_startup(data_dir, config)", daemon)
 
+    def test_the_state_probe_cannot_run_past_its_budget(self):
+        """`state` clones the branch, so it is on the port-bind path too."""
+        for line in self.source.splitlines():
+            code = line.split("#", 1)[0]
+            if '"${GIT_SYNC}" state' in code:
+                self.assertIn(
+                    "run_bounded", code,
+                    f"bootstrap.sh probes the state branch without a bound: "
+                    f"{line.strip()}")
+
+
+class RestoreFidelityTests(LocalRemoteTests):
+    """A restore has to give back the tree that was backed up."""
+
+    def _round_trip(self, build, *, data_name="data"):
+        """Back up a data dir built by `build` and restore it elsewhere."""
+        storage = self.storage
+        data_dir = self.root / data_name
+        data_dir.mkdir(parents=True)
+        build(data_dir)
+        config = self.make_config()
+        storage.sync_once(data_dir, config, force=True)
+
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        self.assertTrue(
+            storage.restore(fresh, self.make_config(workdir=self.root / "work2")))
+        return fresh
+
+    def test_an_executable_script_comes_back_runnable(self):
+        def build(data_dir):
+            script = data_dir / "hook.sh"
+            script.write_text("#!/bin/sh\nexit 0\n")
+            script.chmod(0o755)
+
+        fresh = self._round_trip(build)
+        mode = (fresh / "hook.sh").stat().st_mode & 0o777
+        self.assertTrue(mode & 0o111,
+                        f"the restored hook is not executable: {oct(mode)}")
+
+    def test_a_restored_dotenv_stays_owner_only(self):
+        def build(data_dir):
+            env = data_dir / ".env"
+            env.write_text("K=v\n")
+            env.chmod(0o644)
+
+        fresh = self._round_trip(build)
+        self.assertEqual((fresh / ".env").stat().st_mode & 0o777, 0o600)
+
+    def test_a_private_file_does_not_come_back_world_readable(self):
+        """git stores only the exec bit, so 0600 has to ride in the manifest."""
+        def build(data_dir):
+            key = data_dir / "id_ed25519"
+            key.write_text("PRIVATE\n")
+            key.chmod(0o600)
+
+        fresh = self._round_trip(build)
+        self.assertEqual((fresh / "id_ed25519").stat().st_mode & 0o777, 0o600)
+
+    def test_an_empty_directory_survives_the_round_trip(self):
+        def build(data_dir):
+            (data_dir / "memories" / "archive").mkdir(parents=True)
+            (data_dir / "config.yaml").write_text("model: x\n")
+
+        fresh = self._round_trip(build)
+        self.assertTrue((fresh / "memories" / "archive").is_dir(),
+                        "an empty directory was dropped from the backup")
+
+    def test_a_relative_symlink_survives_the_round_trip(self):
+        def build(data_dir):
+            (data_dir / "config.yaml").write_text("model: x\n")
+            os.symlink("config.yaml", data_dir / "current.yaml")
+
+        fresh = self._round_trip(build)
+        self.assertTrue((fresh / "current.yaml").is_symlink(),
+                        "the symlink was dropped from the backup")
+        self.assertEqual(os.readlink(fresh / "current.yaml"), "config.yaml")
+        self.assertEqual((fresh / "current.yaml").read_text(), "model: x\n")
+
+    def test_a_symlink_pointing_out_of_the_data_dir_is_not_backed_up(self):
+        """The backup must not become a way to write outside the tree."""
+        storage = self.storage
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "secret").write_text("nope\n")
+
+        data_dir = self.root / "data"
+        data_dir.mkdir()
+        os.symlink("../outside/secret", data_dir / "escape")
+        os.symlink(str(outside / "secret"), data_dir / "absolute")
+        (data_dir / "config.yaml").write_text("model: x\n")
+
+        self.assertEqual(
+            storage.plan_mirror(data_dir, storage.DEFAULT_EXCLUDES),
+            ["config.yaml"])
+        _, _, symlinks = storage.plan_tree(data_dir, storage.DEFAULT_EXCLUDES)
+        self.assertEqual(symlinks, {})
+
+    def test_a_tampered_manifest_cannot_restore_outside_the_data_dir(self):
+        storage = self.storage
+        workdir = self.root / "work"
+        (workdir / storage.DATA_SUBDIR).mkdir(parents=True)
+        (workdir / storage.MANIFEST_NAME).write_text(json.dumps({
+            "symlinks": {"evil": "../../../../../../tmp/hermes-escape-test"},
+            "empty_dirs": ["/etc/hermes"],
+        }), encoding="utf-8")
+
+        data_dir = self.root / "restored"
+        data_dir.mkdir()
+        storage.materialize(workdir, data_dir, self.make_config())
+
+        self.assertFalse(Path("/tmp/hermes-escape-test").exists())
+        self.assertFalse(Path("/etc/hermes").exists())
+        self.assertEqual(list(data_dir.iterdir()), [])
+
+
+class ReusedWorkdirTests(LocalRemoteTests):
+    """A clone left over from another repository must not be trusted."""
+
+    def test_a_reused_workdir_follows_the_configured_repository(self):
+        storage = self.storage
+        configured = storage.GitConfig.remote_url  # the throwaway remote setUp made
+        other = self.root / "other-remote"
+        subprocess.run(["git", "init", "-q", "--bare", str(other)], check=True)
+
+        data_dir = self.root / "data"
+        data_dir.mkdir()
+        (data_dir / "config.yaml").write_text("model: x\n")
+
+        # Point the shared workdir at `other` first, as a previous
+        # GIT_STATE_REPO would have left it.
+        storage.GitConfig.remote_url = property(lambda self: str(other))
+        storage.sync_once(data_dir, self.make_config())
+        self.assertIn("data/config.yaml", self._tree_of(other))
+        before = self._tree_of(other)
+
+        # The operator moves the state repo; the same workdir is still there.
+        storage.GitConfig.remote_url = configured
+        storage.sync_once(data_dir, self.make_config())
+
+        self.assertIn("data/config.yaml", self.remote_tree(),
+                      "the configured repository never received the state")
+        self.assertEqual(self._tree_of(other), before,
+                         "state was pushed to the repository we moved away from")
+
+    def _tree_of(self, remote):
+        proc = subprocess.run(
+            ["git", f"--git-dir={remote}", "ls-tree", "-r", "--name-only", "state"],
+            capture_output=True, text=True)
+        return set(proc.stdout.split())
+
+
+class ManifestModeTests(unittest.TestCase):
+    """A mode from a manifest is not trusted blindly."""
+
+    def setUp(self):
+        self.storage = load_storage()
+
+    def test_octal_strings_are_parsed(self):
+        parse = self.storage.manifest_mode
+        self.assertEqual(parse("600"), 0o600)
+        self.assertEqual(parse("750"), 0o750)
+        self.assertEqual(parse(448), 0o700)
+
+    def test_unusable_values_are_ignored(self):
+        parse = self.storage.manifest_mode
+        for bad in (None, "", "not-a-mode", [], {}, True, "999999999999999999999"):
+            self.assertIsNone(parse(bad), f"{bad!r} should not produce a mode")
+
+
+class MidPushChangeTests(unittest.TestCase):
+    """A write made while a push is in flight must not be adopted as the
+    baseline, or it is never backed up."""
+
+    def setUp(self):
+        self.storage = load_storage()
+
+    def _watcher(self, sampler):
+        clock = self.clock = _FakeClock()
+        return self.storage.ChangeWatcher(
+            Path("/tmp/does-not-matter"), make_config(self.storage, debounce_seconds=0),
+            clock=clock, sampler=sampler)
+
+    def test_the_daemon_snapshots_before_the_push_and_restores_that_baseline(self):
+        sampler = _FakeSampler()
+        watcher = self._watcher(sampler)
+
+        self.clock.advance(1)
+        sampler.value = "noticed"
+        self.assertTrue(watcher.poll())
+
+        snapshot = watcher.snapshot()      # what the push is about to send
+        sampler.value = "written during the push"
+        watcher.mark_pushed(snapshot)
+
+        self.clock.advance(1)
+        self.assertTrue(watcher.poll(),
+                        "the mid-push write was swallowed instead of pushed")
+
+    def test_re_sampling_after_the_push_is_what_lost_the_write(self):
+        """Guards the regression: this is the old behaviour, and it drops it."""
+        sampler = _FakeSampler()
+        watcher = self._watcher(sampler)
+
+        self.clock.advance(1)
+        sampler.value = "noticed"
+        self.assertTrue(watcher.poll())
+        sampler.value = "written during the push"
+        watcher.mark_pushed()              # no snapshot: adopts the new state
+
+        self.clock.advance(1)
+        self.assertFalse(watcher.poll())
+
 
 if __name__ == "__main__":
     unittest.main()

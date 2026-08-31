@@ -12,6 +12,13 @@ Layout in the state repo (default branch ``state``):
     data/.env.enc    the dotenv, age-encrypted (never plaintext)
     MANIFEST.json    instance id, timestamp, and what transforms were applied
 
+The manifest also carries the parts of the tree git cannot hold by itself: the
+file modes git does not record (everything except the executable bit), the
+empty directories, and the relative symlinks that stay inside the data
+directory. Without them a restore quietly returns a different tree from the
+one that was saved -- a hook that no longer runs, a ``memories/`` that is gone,
+a private key that is suddenly world-readable.
+
 Deletions are mirrored. The working tree is rebuilt from the data directory on
 every sync, so ``git add -A`` records removals as well as additions and the
 repo never accumulates files you deleted locally.
@@ -86,7 +93,7 @@ import sys
 import tempfile
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 LOG = logging.getLogger("hermes-git-storage")
 
@@ -495,16 +502,42 @@ def ensure_safe_to_push(config: GitConfig) -> None:
     config._visibility_checked = True
 
 
+def origin_matches(workdir: Path, config: GitConfig) -> bool:
+    """Is the clone's ``origin`` the repository we are configured for?
+
+    The working clone lives in a tmpdir that outlives a redeploy, and
+    ``GIT_STATE_REPO`` can change between boots. Every fetch and push in this
+    module goes through ``origin``, so a clone left over from the previous
+    repository keeps quietly reading and writing the *old* one: the operator
+    moves the state repo, the logs still say "pushed state", and the backup is
+    going somewhere they are no longer looking.
+
+    Repointing the URL is not by itself enough either -- the checked-out
+    history and the index still describe the old repository, so the next sync
+    finds "nothing to commit" and the new repository stays empty forever. The
+    clone is thrown away instead and rebuilt against the configured remote.
+    """
+    proc = run_git(["remote", "get-url", "origin"], cwd=workdir,
+                   check=False, config=config)
+    return proc.returncode == 0 and proc.stdout.strip() == config.remote_url
+
+
 def ensure_clone(config: GitConfig) -> Path:
     """Return a working clone of the state branch, creating it if needed."""
     workdir = config.workdir
     if (workdir / ".git").is_dir():
-        proc = run_git(["fetch", "--depth", "1", "origin", config.branch],
-                       cwd=workdir, check=False, config=config)
-        if proc.returncode == 0:
-            run_git(["checkout", "-B", config.branch, "FETCH_HEAD"], cwd=workdir,
-                    config=config)
-        return workdir
+        if origin_matches(workdir, config):
+            proc = run_git(["fetch", "--depth", "1", "origin", config.branch],
+                           cwd=workdir, check=False, config=config)
+            if proc.returncode == 0:
+                run_git(["checkout", "-B", config.branch, "FETCH_HEAD"], cwd=workdir,
+                        config=config)
+            return workdir
+        LOG.info(
+            "state workdir holds a clone of a different repository; starting a "
+            "fresh one for %s", config.api_repo,
+        )
+        shutil.rmtree(workdir, ignore_errors=True)
 
     workdir.parent.mkdir(parents=True, exist_ok=True)
     if workdir.exists():
@@ -756,9 +789,25 @@ class ChangeWatcher:
             return False
         return now - self.pending_since >= self.debounce
 
-    def mark_pushed(self) -> None:
-        """Re-baseline after a push so an unchanged tree stays quiet."""
-        self.baseline = self._sample()
+    def snapshot(self) -> "str | None":
+        """The tree as it is right now, to use as the baseline after a push.
+
+        Taken *before* the push starts. A push can take many seconds, and
+        anything written during it is not in the commit that is on its way --
+        so the post-push baseline has to be the tree the push actually saw, not
+        the tree that exists once the push returns.
+        """
+        return self._sample()
+
+    def mark_pushed(self, baseline: "str | None" = None) -> None:
+        """Re-baseline after a push so an unchanged tree stays quiet.
+
+        ``baseline`` should be the snapshot taken before the push; re-sampling
+        here instead would adopt writes made during the push and never back
+        them up until some later, unrelated change happened to wake the
+        watcher.
+        """
+        self.baseline = baseline if baseline is not None else self._sample()
         self.pending_since = None
         self.not_before = 0.0
 
@@ -772,28 +821,125 @@ class ChangeWatcher:
 # ---------------------------------------------------------------------------
 
 
-def plan_mirror(data_dir: Path, excludes) -> "list[str]":
-    """Relative paths under data_dir that belong in the backup, sorted.
+def _readlink_or_blank(link: Path) -> str:
+    """The link target for a log message, or "" if it cannot be read."""
+    try:
+        return os.readlink(link)
+    except OSError:
+        return ""
+
+
+def safe_symlink_target(link: Path, data_dir: Path) -> "str | None":
+    """The symlink target worth carrying in the backup, or None to drop it.
+
+    A symlink is data -- dropping one silently changes what a restored
+    instance points at -- but it is also the one kind of entry that can name a
+    path outside the tree. So only a *relative* target that resolves inside the
+    data directory is carried; an absolute target or one that climbs out with
+    ``..`` is dropped, because restoring it would be a way to write outside the
+    restored tree.
+    """
+    try:
+        raw = os.readlink(link)
+    except OSError:
+        return None
+    candidate = PurePosixPath(raw)
+    if candidate.is_absolute():
+        return None
+    try:
+        # Non-strict: a dangling link is still a link worth restoring.
+        resolved = (link.parent / candidate).resolve()
+        resolved.relative_to(data_dir.resolve())
+    except (OSError, ValueError):
+        return None
+    return raw
+
+
+def _mark_populated(populated: "set[str]", relative: str) -> None:
+    """Record every directory that holds something, walking up to the root."""
+    parent = PurePosixPath(relative).parent
+    while str(parent) not in ("", "."):
+        populated.add(str(parent))
+        parent = parent.parent
+
+
+def plan_tree(data_dir: Path,
+              excludes) -> "tuple[list[str], list[str], dict[str, str]]":
+    """What under data_dir belongs in the backup.
+
+    Returns ``(files, empty_dirs, symlinks)``.
+
+    A file walk on its own loses two things silently: git has no way to record
+    an empty directory, and a symlink is not a regular file. Both are real
+    state -- an agent whose ``memories/`` directory vanished on restore, or a
+    config that was a link and came back as nothing -- so they are collected
+    here and carried in the manifest instead.
 
     Pure enough to test: it only reads the filesystem and returns names.
     """
-    selected: list[str] = []
-    for root, dirs, files in os.walk(data_dir, topdown=True, followlinks=False):
+    files: list[str] = []
+    kept_dirs: list[str] = []
+    symlinks: dict[str, str] = {}
+    for root, dirs, filenames in os.walk(data_dir, topdown=True, followlinks=False):
         root_path = Path(root)
-        dirs[:] = sorted(
-            name for name in dirs
-            if not (root_path / name).is_symlink()
-            and not is_excluded((root_path / name).relative_to(data_dir).as_posix(), excludes)
-        )
-        for name in sorted(files):
+        keep: list[str] = []
+        for name in sorted(dirs):
             path = root_path / name
-            if path.is_symlink():
-                continue
             relative = path.relative_to(data_dir).as_posix()
             if is_excluded(relative, excludes):
                 continue
-            selected.append(relative)
-    return sorted(selected)
+            if path.is_symlink():
+                target = safe_symlink_target(path, data_dir)
+                if target is None:
+                    LOG.warning(
+                        "symlink %s is not backed up (target %r is absolute or "
+                        "escapes the data directory)", relative,
+                        _readlink_or_blank(path),
+                    )
+                else:
+                    symlinks[relative] = target
+                continue
+            keep.append(name)
+        dirs[:] = keep
+        kept_dirs.extend(
+            (root_path / name).relative_to(data_dir).as_posix() for name in keep
+        )
+        for name in sorted(filenames):
+            path = root_path / name
+            relative = path.relative_to(data_dir).as_posix()
+            if is_excluded(relative, excludes):
+                continue
+            if path.is_symlink():
+                target = safe_symlink_target(path, data_dir)
+                if target is None:
+                    LOG.warning(
+                        "symlink %s is not backed up (target %r is absolute or "
+                        "escapes the data directory)", relative,
+                        _readlink_or_blank(path),
+                    )
+                    continue
+                symlinks[relative] = target
+                continue
+            if not path.is_file():
+                continue
+            files.append(relative)
+
+    populated: set[str] = set()
+    for relative in files:
+        _mark_populated(populated, relative)
+    for relative in symlinks:
+        _mark_populated(populated, relative)
+    for relative in kept_dirs:
+        # A directory holding only other directories is not empty, but the
+        # innermost one may be, so only the parents are marked here.
+        _mark_populated(populated, relative)
+    empty_dirs = sorted(d for d in kept_dirs if d not in populated)
+    return sorted(files), empty_dirs, symlinks
+
+
+def plan_mirror(data_dir: Path, excludes) -> "list[str]":
+    """Relative file paths under data_dir that belong in the backup, sorted."""
+    return plan_tree(data_dir, excludes)[0]
 
 
 def age_encrypt(plaintext: bytes, config: GitConfig) -> "bytes | None":
@@ -890,7 +1036,9 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     target.mkdir(parents=True, exist_ok=True)
 
     copied, encrypted, plaintext_env, skipped = 0, [], [], []
-    for relative in plan_mirror(data_dir, excludes):
+    modes: dict[str, str] = {}
+    planned, empty_dirs, symlinks = plan_tree(data_dir, excludes)
+    for relative in planned:
         source = data_dir / relative
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -930,9 +1078,15 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
 
         destination.write_bytes(payload)
         try:
-            os.chmod(destination, source.stat().st_mode & 0o777)
+            mode = source.stat().st_mode & 0o777
+            os.chmod(destination, mode)
         except OSError:
-            pass
+            mode = 0o644
+        if mode not in (0o644, 0o755):
+            # git records only the executable bit, so every other mode has to
+            # travel in the manifest -- otherwise a 0600 key comes back from a
+            # restore as a world-readable 0644.
+            modes[relative] = format(mode, "o")
         copied += 1
 
     _warn_plaintext_env(plaintext_env, config)
@@ -945,6 +1099,14 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         "encrypted": sorted(encrypted),
         "omitted": sorted(skipped),
         "plaintext_env": sorted(set(plaintext_env)),
+        # git cannot hold an empty directory and this walk does not copy
+        # symlinks as blobs, so both ride in the manifest instead of being
+        # dropped from the backup.
+        "empty_dirs": empty_dirs,
+        "symlinks": {name: symlinks[name] for name in sorted(symlinks)},
+        # Only the modes git cannot express; 0644/0755 come back from the
+        # object mode on their own.
+        "modes": {name: modes[name] for name in sorted(modes)},
     }
     (workdir / MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -962,6 +1124,11 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
     if not source_root.is_dir():
         LOG.info("no data/ in the state repo yet; nothing to restore")
         return 0
+
+    manifest = read_manifest(workdir)
+    recorded_modes = manifest.get("modes")
+    if not isinstance(recorded_modes, dict):
+        recorded_modes = {}
 
     restored = 0
     for source in sorted(source_root.rglob("*")):
@@ -981,10 +1148,105 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
         destination = data_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
+        # git records the executable bit in the object mode, so a script that
+        # was 0755 in /opt/data has to come back runnable -- a restored
+        # entrypoint or hook that lost its +x simply does not run. Modes git
+        # cannot express (a 0600 key) come from the manifest instead. A
+        # restored .env holds live keys, so it is owner-only whatever either
+        # of them says.
         if relative in SENSITIVE_FILES:
-            os.chmod(destination, 0o600)
+            mode = 0o600
+        else:
+            mode = manifest_mode(recorded_modes.get(relative))
+            if mode is None:
+                try:
+                    mode = source.stat().st_mode & 0o777
+                except OSError:
+                    mode = 0o644
+        try:
+            os.chmod(destination, mode or 0o644)
+        except OSError:
+            pass
         restored += 1
+
+    # Directories git could not hold, and the symlinks the walk did not copy
+    # as blobs. Both come from the manifest the mirror wrote.
+    for relative in manifest.get("empty_dirs", []) or []:
+        if not isinstance(relative, str) or not relative or relative.startswith("/"):
+            continue
+        try:
+            (data_dir / relative).mkdir(parents=True, exist_ok=True)
+            restored += 1
+        except OSError as exc:
+            LOG.warning("could not restore directory %s: %s", relative, exc)
+    for relative, target in (manifest.get("symlinks") or {}).items():
+        if restore_symlink(data_dir, relative, target):
+            restored += 1
     return restored
+
+
+def restore_symlink(data_dir: Path, relative: str, target: str) -> bool:
+    """Recreate one backed-up symlink inside data_dir.
+
+    The manifest is read back out of a repository, so the target is re-checked
+    here rather than trusted: only a relative target that stays inside the data
+    directory is created, which is what keeps a tampered manifest from writing
+    somewhere outside the restored tree.
+    """
+    if not isinstance(relative, str) or not relative or relative.startswith("/"):
+        return False
+    if not isinstance(target, str) or not target or PurePosixPath(target).is_absolute():
+        LOG.warning("not restoring symlink %s: target %r is not relative",
+                    relative, target)
+        return False
+    destination = data_dir / relative
+    try:
+        resolved = (destination.parent / target).resolve()
+        resolved.relative_to(data_dir.resolve())
+    except (OSError, ValueError):
+        LOG.warning("not restoring symlink %s: target %r escapes the data directory",
+                    relative, target)
+        return False
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or destination.exists():
+            destination.unlink()
+        os.symlink(target, destination)
+        return True
+    except OSError as exc:
+        LOG.warning("could not restore symlink %s -> %s: %s", relative, target, exc)
+        return False
+
+
+def read_manifest(workdir: Path) -> dict:
+    """The manifest the last mirror wrote, or {} when it is missing/unreadable."""
+    try:
+        raw = json.loads((workdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def manifest_mode(raw) -> "int | None":
+    """A permission recorded in the manifest as an octal string, or None.
+
+    The manifest is read back out of a repository, so the value is parsed
+    defensively: anything that is not an octal mode is ignored and the mode git
+    recorded for the file is used instead.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str):
+        try:
+            value = int(raw.strip(), 8)
+        except ValueError:
+            return None
+    else:
+        return None
+    value &= 0o7777
+    return value or None
 
 
 def read_generation(workdir: Path) -> int:
@@ -994,9 +1256,8 @@ def read_generation(workdir: Path) -> int:
     cannot count the remote's commits itself.
     """
     try:
-        raw = json.loads((workdir / MANIFEST_NAME).read_text(encoding="utf-8"))
-        value = int(raw.get("generation", 0))
-    except (OSError, ValueError, TypeError, AttributeError):
+        value = int(read_manifest(workdir).get("generation", 0))
+    except (TypeError, ValueError):
         return 0
     return max(0, value)
 
@@ -1346,6 +1607,9 @@ def run_daemon(data_dir: Path, config: GitConfig,
     watcher = ChangeWatcher(data_dir, config) if config.watch else None
 
     def push(reason: str) -> None:
+        # Snapshot first: whatever is written while the push is in flight is
+        # not part of the commit, so it has to stay pending afterwards.
+        snapshot = watcher.snapshot() if watcher is not None else None
         try:
             sync_once(data_dir, config)
         except GitStateError as exc:
@@ -1356,7 +1620,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
             return
         config._last_push_at = time.time()
         if watcher is not None:
-            watcher.mark_pushed()
+            watcher.mark_pushed(snapshot)
 
     next_sync = 0.0
     last_scan = 0.0
