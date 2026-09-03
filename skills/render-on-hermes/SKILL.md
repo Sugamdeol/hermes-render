@@ -49,11 +49,15 @@ The Free Blueprint selects `qwen-3.8-max-free` on a fresh/default config when
 that variable is set. An explicit model/provider choice wins.
 
 Free services also spin down after inactivity and do not provide Render Shell
-or SSH. The Blueprint leaves the memory-heavy browser TUI off by default
-(`HERMES_DASHBOARD_TUI=0`) and inserts conservative turn, delegation,
-cache, and subagent limits on first boot. Prefer Telegram or another
-configured chat channel for the lightest runtime. Avoid browser automation and
-parallel subagents when possible; the instance has limited memory.
+or SSH. The dashboard **Chat** tab is enabled (`HERMES_DASHBOARD_TUI=1`): the
+bundled chat plugin drives `tui_gateway` over a pure-Python WebSocket, so it
+does not spawn the memory-heavy Node/esbuild PTY — that path (`/api/pty`)
+only starts on demand, and per-conversation slash-worker Python subprocesses
+are disabled (`HERMES_TUI_DISABLE_SLASH_WORKER=1`). Conservative turn,
+delegation, cache, subagent, git-push, and allocator limits are applied on
+first boot/by env. Avoid browser automation (Playwright) and parallel
+subagents; the instance has 512 MB of RAM. Prefer Telegram or another
+configured chat channel for an always-on bot.
 
 ## Default scope: full MCP access
 

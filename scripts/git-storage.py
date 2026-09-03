@@ -115,13 +115,55 @@ REMOTE_HAS_STATE = "has-state"
 REMOTE_EMPTY = "empty"
 REMOTE_UNKNOWN = "unknown"
 
-# git's http.postBuffer defaults to 1 MiB, and anything larger than that is
-# sent as a chunked request. GitHub's HTTP front end answers a big chunked
-# `git-receive-pack` with "RPC failed; HTTP 408 ... send-pack: unexpected
-# disconnect" -- which is exactly what a first state push (the whole restored
-# tree, tens of MB) looks like. A buffer big enough for one request makes git
-# send it with a Content-Length instead, in a single shot.
-DEFAULT_HTTP_POST_BUFFER_BYTES = 250 * 1024 * 1024
+# git's http.postBuffer only holds *one* request body -- an uncompressable,
+# already-compressed pack is written through it unbuffered -- but git eagerly
+# mallocs the full buffer at the start of every push, so the value is a hard
+# resident-memory floor on this 512 MB instance. The old 250 MB default did
+# not make the seed push (a few tens of MB of compressed state) any more
+# reliable, but it did let `git push` alone commit half the container's RAM.
+# 64 MiB is large enough to keep an unchunked Content-Length request for the
+# seed push while leaving room for the gateway. Override with
+# GIT_STATE_HTTP_POST_BUFFER_MB if a large state tree needs more.
+def _default_post_buffer_bytes() -> int:
+    try:
+        mb = int(os.environ.get("GIT_STATE_HTTP_POST_BUFFER_MB", "").strip())
+        if mb >= 1:
+            return mb * 1024 * 1024
+    except (TypeError, ValueError):
+        pass
+    return 64 * 1024 * 1024
+
+
+DEFAULT_HTTP_POST_BUFFER_BYTES = _default_post_buffer_bytes()
+# pack-objects is git's memory-hungry half of every push/fetch: delta search
+# is bounded by pack.windowMemory and the write buffer by pack.packSizeLimit.
+# The deltas across the small text/session state of this backend are found
+# within a couple of MB either way; the defaults (0 = unlimited, 4 threads)
+# let one push spike RSS far past what a 512 MB instance can give git before
+# the OOM killer reclaims it -- and when it does, it takes the gateway as
+# often as this daemon. Both are env-overridable for big state trees.
+def _default_pack_window_memory_bytes() -> int:
+    try:
+        mb = int(os.environ.get("GIT_STATE_PACK_WINDOW_MEMORY_MB", "").strip())
+        if mb >= 1:
+            return mb * 1024 * 1024
+    except (TypeError, ValueError):
+        pass
+    return 16 * 1024 * 1024
+
+
+DEFAULT_PACK_WINDOW_MEMORY_BYTES = _default_pack_window_memory_bytes()
+
+
+def _default_pack_threads() -> int:
+    try:
+        threads = int(os.environ.get("GIT_STATE_PACK_THREADS", "").strip())
+        return max(1, threads)
+    except (TypeError, ValueError):
+        return 1
+
+
+DEFAULT_PACK_THREADS = _default_pack_threads()
 # A transfer slower than this for this long is stalled, not slow. git gives up
 # and we retry, instead of the process sitting on a dead connection.
 DEFAULT_HTTP_LOW_SPEED_LIMIT = 1000
@@ -242,6 +284,8 @@ class GitConfig:
         http_post_buffer: int = DEFAULT_HTTP_POST_BUFFER_BYTES,
         http_low_speed_limit: int = DEFAULT_HTTP_LOW_SPEED_LIMIT,
         http_low_speed_time: int = DEFAULT_HTTP_LOW_SPEED_TIME,
+        pack_window_memory: int = DEFAULT_PACK_WINDOW_MEMORY_BYTES,
+        pack_threads: int = DEFAULT_PACK_THREADS,
     ) -> None:
         self.repo = repo
         self.token = token
@@ -284,6 +328,10 @@ class GitConfig:
         self.http_post_buffer = max(1024 * 1024, int(http_post_buffer))
         self.http_low_speed_limit = max(0, int(http_low_speed_limit))
         self.http_low_speed_time = max(1, int(http_low_speed_time))
+        self.pack_window_memory = max(
+            1024 * 1024, int(pack_window_memory)
+        )
+        self.pack_threads = max(1, int(pack_threads))
         self.role = ROLE_ACTIVE
         self._visibility_checked = False
         self._last_push_at = 0.0
@@ -376,6 +424,11 @@ class GitConfig:
                                                   DEFAULT_HTTP_LOW_SPEED_LIMIT),
             http_low_speed_time=positive_int("GIT_STATE_HTTP_LOW_SPEED_TIME",
                                              DEFAULT_HTTP_LOW_SPEED_TIME),
+            pack_window_memory=positive_int("GIT_STATE_PACK_WINDOW_MEMORY_MB",
+                                             DEFAULT_PACK_WINDOW_MEMORY_BYTES
+                                             // (1024 * 1024)) * 1024 * 1024,
+            pack_threads=positive_int("GIT_STATE_PACK_THREADS",
+                                      DEFAULT_PACK_THREADS),
         )
 
     @property
@@ -414,6 +467,9 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
                        else DEFAULT_HTTP_LOW_SPEED_LIMIT)
     low_speed_time = (config.http_low_speed_time if config
                       else DEFAULT_HTTP_LOW_SPEED_TIME)
+    window_memory = (config.pack_window_memory if config
+                     else DEFAULT_PACK_WINDOW_MEMORY_BYTES)
+    pack_threads = config.pack_threads if config else DEFAULT_PACK_THREADS
     base = [
         "git",
         "-c", "user.name=hermes-state",
@@ -427,6 +483,14 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "http.version=HTTP/1.1",
         "-c", f"http.lowSpeedLimit={low_speed_limit}",
         "-c", f"http.lowSpeedTime={low_speed_time}",
+        # Memory guardrails for the pack-objects half of push/fetch. The
+        # unbounded upstream defaults let one push spike RSS past 512 MB;
+        # cap the delta-search window and per-object delta cache, and use a
+        # single thread so peak pack memory is not multiplied by core
+        # count. See DEFAULT_PACK_WINDOW_MEMORY_BYTES.
+        "-c", f"pack.windowMemory={window_memory}",
+        "-c", "pack.deltaCacheSize=32m",
+        "-c", f"pack.threads={max(1, int(pack_threads))}",
     ]
     timeout = (config.git_timeout_seconds if config
                else DEFAULT_GIT_TIMEOUT_SECONDS)
@@ -1801,8 +1865,37 @@ def current_role(config: GitConfig) -> str:
 # ---------------------------------------------------------------------------
 
 
+def tune_for_oom_survival() -> None:
+    """Ask the kernel OOM killer to prefer this worker over the gateway.
+
+    On a 512 MB instance the OOM killer scores processes by resident memory.
+    This daemon and its `git` children spike while pushing a large state tree
+    (the pack build, the post buffer), and the default scoring can just as
+    easily select the gateway -- whose death kills the agent session -- as
+    this worker. The backup is disposable: bootstrap.sh supervises the daemon
+    and restarts it after any non-clean exit, and every run rebuilds the
+    mirror from the current tree. Raising oom_score_adj here makes the
+    daemon (and the git children it forks, which inherit the value) the
+    preferred reclaim target instead. 1000 means "kill this first"; the
+    gateway stays at the default 0.
+    """
+    try:
+        adj = int(os.environ.get("GIT_STATE_OOM_SCORE_ADJ", "1000"))
+    except (TypeError, ValueError):
+        adj = 1000
+    adj = max(-1000, min(1000, adj))
+    try:
+        with open("/proc/self/oom_score_adj", "w", encoding="utf-8") as handle:
+            handle.write(f"{adj}\n")
+    except OSError:
+        # Not Linux (or /proc unavailable, as in some unprivileged sandboxes):
+        # there is no OOM score to tune, and nothing else to do.
+        LOG.debug("oom_score_adj unavailable; skipping OOM tuning")
+
+
 def run_daemon(data_dir: Path, config: GitConfig,
                stop: "threading.Event | None" = None) -> None:
+    tune_for_oom_survival()
     stop = stop if stop is not None else threading.Event()
 
     def request_stop(_signum, _frame):

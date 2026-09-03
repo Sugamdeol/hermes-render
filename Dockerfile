@@ -55,9 +55,9 @@ def _resource_float_env(name: str, default: float) -> float:
         return default
 
 
-_AGENT_CACHE_MAX_SIZE = _resource_int_env("HERMES_AGENT_CACHE_MAX_SIZE", 16)
+_AGENT_CACHE_MAX_SIZE = _resource_int_env("HERMES_AGENT_CACHE_MAX_SIZE", 8)
 _AGENT_CACHE_IDLE_TTL_SECS = _resource_float_env(
-    "HERMES_AGENT_CACHE_IDLE_TTL_SECONDS", 900.0
+    "HERMES_AGENT_CACHE_IDLE_TTL_SECONDS", 600.0
 )
 '''
 if old not in text:
@@ -74,6 +74,34 @@ PY
 COPY scripts/patch-model-discovery.py /opt/render-tools/patch-model-discovery.py
 RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-model-discovery.py \
     /opt/hermes/hermes_cli/model_switch.py
+
+# The in-browser chat (the bundled hermes-chat-dashboard plugin drives
+# tui_gateway over a pure-Python WebSocket) spawns a *second* full Python
+# interpreter per conversation -- tui_gateway.slash_worker, the complete
+# cli.HermesCLI stack -- just to serve the interactive TUI's slash menu.
+# That is tens of MB of RSS per open chat, with no eviction when a browser
+# tab closes, so a couple of conversations on a 512 MB instance OOM-kill the
+# dashboard. The web chat never drives that menu. Patch the pinned
+# tui_gateway so the worker is not spawned when HERMES_TUI_DISABLE_SLASH_WORKER
+# is set (the env default in env/common.env turns it on); slash.exec keeps
+# its existing no-worker fallback and normal chat/tool traffic never uses the
+# worker. The patch is exact and fails the build if upstream shifts.
+COPY scripts/patch-slash-worker.py /opt/render-tools/patch-slash-worker.py
+RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-slash-worker.py \
+    /opt/hermes/tui_gateway/server.py
+
+# tui_gateway keeps every dashboard chat session (a full in-process AIAgent)
+# in a module-level dict for the dashboard process's whole lifetime, and on a
+# WebSocket disconnect it only detaches the transport -- nothing evicts them.
+# Open browser conversations then accumulate tens of MB each in the process
+# that has to stay up for the health check, a quiet 512 MB OOM path. Patch the
+# pinned ws handler so sessions created over a closing socket are finalized
+# (the transcript stays in the session DB and re-opens via session.resume).
+# Opt out with HERMES_TUI_CLOSE_SESSIONS_ON_DISCONNECT=0 if a client reconnects
+# with the same in-memory expectation.
+COPY scripts/patch-ws-session-cleanup.py /opt/render-tools/patch-ws-session-cleanup.py
+RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-ws-session-cleanup.py \
+    /opt/hermes/tui_gateway/ws.py
 
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
