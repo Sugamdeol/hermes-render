@@ -187,7 +187,11 @@
   }
 
   function ChatDashboard() {
-    const gwRef = useRef(null); const listEnd = useRef(null);
+    const gwRef = useRef(null); const listEnd = useRef(null); const activeSidRef = useRef(null);
+    // Closes the server-side tui_gateway session for the conversation the
+    // user is leaving. Kept in a ref so the unmount cleanup can reach it.
+    const releaseSessionRef = useRef(null);
+    useEffect(() => { releaseSessionRef.current = () => { const sid = activeSidRef.current; if (!sid) return; activeSidRef.current = null; try { gwRef.current && gwRef.current.request("session.close", { session_id: sid }, 10000).catch(() => {}); } catch {} }; });
     const [ready, setReady] = useState(false); const [error, setError] = useState("");
     const [cap, setCap] = useState({ modes: [], models: [], agents: [], toolsets: [], features: {} });
     const [settings, setSettings] = useState({ enterToSend: true, autoTools: true, memoryEnabled: true, defaultMode: "fast" });
@@ -198,7 +202,7 @@
     const [draftSeed, setDraftSeed] = useState(""); const [share, setShare] = useState("");
 
     const refreshSessions = useCallback(async () => { setLoadingSessions(true); try { const [s, m] = await Promise.all([api.getSessions(80,0), fetchJSON(`${BASE}/metadata`)]); setSessions(s.sessions || []); setMeta(m || {}); } catch (e) { setError(e.message); } finally { setLoadingSessions(false); } }, []);
-    useEffect(() => { (async () => { try { const [c, st] = await Promise.all([fetchJSON(`${BASE}/capabilities`), fetchJSON(`${BASE}/settings`)]); setCap(c); setSettings(st); setSelected(s => ({ ...s, mode: st.defaultMode || "fast", autoTools: st.autoTools !== false, temporary: !!st.temporaryDefault, memoryEnabled: st.memoryEnabled !== false, enterToSend: st.enterToSend !== false })); } catch (e) { setError(e.message); } await refreshSessions(); const gw = new HermesGateway(); gwRef.current = gw; try { await gw.connect(); setReady(true); } catch (e) { setError(e.message); } })(); return () => gwRef.current && gwRef.current.close(); }, []);
+    useEffect(() => { (async () => { try { const [c, st] = await Promise.all([fetchJSON(`${BASE}/capabilities`), fetchJSON(`${BASE}/settings`)]); setCap(c); setSettings(st); setSelected(s => ({ ...s, mode: st.defaultMode || "fast", autoTools: st.autoTools !== false, temporary: !!st.temporaryDefault, memoryEnabled: st.memoryEnabled !== false, enterToSend: st.enterToSend !== false })); } catch (e) { setError(e.message); } await refreshSessions(); const gw = new HermesGateway(); gwRef.current = gw; try { await gw.connect(); setReady(true); } catch (e) { setError(e.message); } })(); return () => { try { releaseSessionRef.current && releaseSessionRef.current(); } catch {} gwRef.current && gwRef.current.close(); }; }, []);
 
     useEffect(() => {
       const gw = gwRef.current; if (!gw) return;
@@ -234,7 +238,7 @@
 
     useEffect(() => { const onKey = e => { const mod = e.ctrlKey || e.metaKey; if (mod && e.key.toLowerCase() === "k") { e.preventDefault(); document.querySelector(".hcd-search")?.focus(); } if (mod && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); newChat(); } if (mod && e.key === "/") { e.preventDefault(); document.querySelector(".hcd-composer textarea")?.focus(); } if (e.key === "Escape" && generating) stop(); if (mod && e.shiftKey && e.key.toLowerCase() === "b") { e.preventDefault(); setMobileSide(s => !s); } }; window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [generating]);
 
-    const ensureSession = async () => { if (selected.sessionId) return selected.sessionId; const res = await gwRef.current.request("session.create", { cols: 100 }); setSelected(s => ({ ...s, sessionId: res.session_id })); setMessages([]); return res.session_id; };
+    const ensureSession = async () => { if (selected.sessionId) { activeSidRef.current = selected.sessionId; return selected.sessionId; } const res = await gwRef.current.request("session.create", { cols: 100 }); activeSidRef.current = res.session_id; setSelected(s => ({ ...s, sessionId: res.session_id })); setMessages([]); return res.session_id; };
     const applySelectors = async (sid) => {
       const mode = cap.modes.find(m => m.id === selected.mode); const strategy = mode?.strategy || {};
       try { if (strategy.fast !== undefined) await gwRef.current.request("config.set", { session_id: sid, key: "fast", value: strategy.fast ? "fast" : "normal" }, 30000); } catch {}
@@ -254,8 +258,14 @@
     };
     const send = async (text) => { setError(""); const sid = await ensureSession(); await applySelectors(sid); const readyAttachments = attachments.filter(a => a.status === "ready"); setMessages(ms => [...ms, { id: nowId(), role: "user", content: text || "Please analyse the attached file(s).", attachments: readyAttachments, timestamp: Date.now()/1000 }]); const prompt = composePrompt(text); setAttachments([]); await gwRef.current.request("prompt.submit", { session_id: sid, text: prompt }); setTimeout(async () => { try { const title = await gwRef.current.request("session.title", { session_id: sid }); if (title.session_key) setSelected(s => ({ ...s, sessionKey: title.session_key })); } catch {} }, 2000); };
     const background = async (text) => { const sid = await ensureSession(); const res = await gwRef.current.request("prompt.background", { session_id: sid, text: composePrompt(text) }); setTasks(ts => [{ id: res.task_id, text: text || "Background task", done: false }, ...ts]); setMessages(ms => [...ms, { id: nowId(), role: "system", content: `Task created successfully: ${res.task_id}`, timestamp: Date.now()/1000 }]); };
-    const openSession = async (id) => { setError(""); try { const res = await gwRef.current.request("session.resume", { session_id: id, cols: 100 }, 120000); setSelected(s => ({ ...s, sessionId: res.session_id, sessionKey: res.resumed || id })); const msgs = (res.messages || []).map((m, i) => ({ id: `${id}-${i}`, role: m.role, content: m.content, timestamp: m.timestamp })); setMessages(msgs); setTools([]); } catch (e) { setError(e.message); } };
-    const newChat = () => { setSelected(s => ({ ...s, sessionId: "", sessionKey: "" })); setMessages([]); setTools([]); setAttachments([]); setShare(""); };
+    // The dashboard keeps every created session resident (a full AIAgent +
+    // LLM clients) until session.close; nothing evicts them on tab close. On
+    // a small instance a handful of abandoned conversations can exhaust RAM,
+    // so release the server-side session whenever we leave it. The persisted
+    // transcript stays in the session DB and re-opens via session.resume.
+    const releaseSession = (sid) => { if (!sid) return; if (activeSidRef.current === sid) activeSidRef.current = null; try { gwRef.current && gwRef.current.request("session.close", { session_id: sid }, 10000).catch(() => {}); } catch {} };
+    const openSession = async (id) => { setError(""); try { const res = await gwRef.current.request("session.resume", { session_id: id, cols: 100 }, 120000); activeSidRef.current = res.session_id; setSelected(s => { if (s.sessionId && s.sessionId !== res.session_id) releaseSession(s.sessionId); return { ...s, sessionId: res.session_id, sessionKey: res.resumed || id }; }); const msgs = (res.messages || []).map((m, i) => ({ id: `${id}-${i}`, role: m.role, content: m.content, timestamp: m.timestamp })); setMessages(msgs); setTools([]); } catch (e) { setError(e.message); } };
+    const newChat = () => { setSelected(s => { releaseSession(s.sessionId); return { ...s, sessionId: "", sessionKey: "" }; }); setMessages([]); setTools([]); setAttachments([]); setShare(""); };
     const stop = () => { if (selected.sessionId) gwRef.current.request("session.interrupt", { session_id: selected.sessionId }, 10000).catch(()=>{}); setGenerating(false); setActivity("Stopped"); };
     const onMeta = async (sid, patch) => { setMeta(m => ({ ...m, [sid]: { ...(m[sid] || {}), ...patch } })); await fetchJSON(`${BASE}/metadata/${encodeURIComponent(sid)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(patch) }).catch(e => setError(e.message)); };
     const msgAction = async (action, msg, idx) => {

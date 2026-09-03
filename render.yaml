@@ -161,17 +161,37 @@ services:
         value: "0.0.0.0"
       - key: HERMES_DASHBOARD_PORT
         value: "10000"
-      # The full browser TUI starts a Node/esbuild PTY per chat and is
-      # expensive on Free. Keep it off by default; use Telegram or another
-      # configured channel for chat. Set to "1" only when the dashboard Chat
-      # tab is needed and the instance has enough headroom.
+      # Upstream gates the in-browser Chat tab's WebSocket (/api/ws, the
+      # pure-Python tui_gateway JSON-RPC surface the bundled
+      # hermes-chat-dashboard plugin drives) behind the same flag as the
+      # terminal-PTY fallback (/api/pty). With it off the Chat tab never
+      # renders and the WebSocket answers 4403. The heavy Node/esbuild PTY
+      # process is only spawned if a client actually connects to /api/pty,
+      # which the plugin never does, so enabling chat stays cheap on Free.
       - key: HERMES_DASHBOARD_TUI
-        value: "0"
+        value: "1"
+      # Each dashboard chat session otherwise spawns a second full Python
+      # interpreter (tui_gateway.slash_worker -> cli.HermesCLI) to serve the
+      # interactive TUI's slash menu -- tens of MB of RSS per conversation,
+      # never evicted when a browser tab closes. The web chat does not use
+      # the slash menu, so the Dockerfile-patched tui_gateway leaves the
+      # worker unspawned when this is set.
+      - key: HERMES_TUI_DISABLE_SLASH_WORKER
+        value: "1"
+      # tui_gateway's long-RPC thread pool defaults to 4 workers; two is
+      # enough for one dashboard user on the small instance.
+      - key: HERMES_TUI_RPC_POOL_WORKERS
+        value: "2"
+      # Finalize in-process chat sessions when the browser's WebSocket
+      # drops instead of holding full AIAgent objects for the dashboard's
+      # whole lifetime; transcripts persist and re-open via session.resume.
+      - key: HERMES_TUI_CLOSE_SESSIONS_ON_DISCONNECT
+        value: "1"
 
       # Keep native runtimes from multiplying worker threads or retaining
       # large allocator arenas on the small Free instance.
       - key: NODE_OPTIONS
-        value: --max-old-space-size=128
+        value: --max-old-space-size=96
       - key: MALLOC_ARENA_MAX
         value: "2"
       - key: OMP_NUM_THREADS
@@ -180,14 +200,32 @@ services:
         value: "1"
       - key: MKL_NUM_THREADS
         value: "1"
+      - key: VECLIB_MAXIMUM_THREADS
+        value: "1"
+      - key: NUMEXPR_NUM_THREADS
+        value: "1"
       - key: TOKENIZERS_PARALLELISM
         value: "false"
+      - key: MAKEFLAGS
+        value: -j1
       # Bound the pinned gateway's cached per-session agent objects. These
       # values are read by the small Dockerfile source patch at process import.
       - key: HERMES_AGENT_CACHE_MAX_SIZE
-        value: "16"
+        value: "8"
       - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
-        value: "900"
+        value: "600"
+      # Git state-sync memory. git eagerly mallocs http.postBuffer on every
+      # push and pack-objects defaults to unbounded delta windows with one
+      # thread per core; the shipped defaults can spike one push far past
+      # 512 MB (and the OOM killer then takes the gateway as readily as the
+      # sync worker). Keep the request unchunked (GitHub 408s on chunked
+      # receive-packs) but small, and cap pack memory.
+      - key: GIT_STATE_HTTP_POST_BUFFER_MB
+        value: "64"
+      - key: GIT_STATE_PACK_WINDOW_MEMORY_MB
+        value: "16"
+      - key: GIT_STATE_PACK_THREADS
+        value: "1"
 
       # Generated once at first deploy. Reuse this value as API_SERVER_KEY
       # in the Render Environment tab if you later opt into the

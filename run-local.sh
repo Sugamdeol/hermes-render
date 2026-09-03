@@ -188,8 +188,9 @@ OPTIONS
       --rebuild        Force an image rebuild before starting.
       --no-cache       Build without the layer cache (implies --rebuild).
       --pull           Pull a newer base image while building.
-      --tui / --no-tui Toggle the dashboard's in-browser TUI chat
-                       (HERMES_DASHBOARD_TUI; Render default is off).
+      --tui / --no-tui Toggle the dashboard's in-browser Chat tab
+                       (HERMES_DASHBOARD_TUI; on by default -- the chat
+                       plugin needs it; --no-tui frees a little headroom).
       --free-limits    Constrain the container to Render Free-ish resources
                        (512MB RAM, 0.5 CPU) to reproduce that environment.
       --takeover       Take over messaging from the Render service while this
@@ -621,20 +622,39 @@ build_env() {
 
   # Dashboard side-process. Bound to 0.0.0.0 inside the container so the
   # published port reaches it; the entrypoint adds --insecure for that.
+  # HERMES_DASHBOARD_TUI=1 enables the in-browser Chat tab: upstream gates
+  # the pure-Python chat WebSocket (/api/ws, which the bundled
+  # hermes-chat-dashboard plugin drives) behind the same flag as the
+  # terminal-PTY fallback. The Node/esbuild PTY only starts when /api/pty is
+  # actually used, so this does not add a Node process to idle RAM.
   set_env HERMES_DASHBOARD "1"
   set_env HERMES_DASHBOARD_HOST "0.0.0.0"
   set_env HERMES_DASHBOARD_PORT "$CONTAINER_PORT"
-  set_env HERMES_DASHBOARD_TUI "0"
+  set_env HERMES_DASHBOARD_TUI "1"
+  # No per-chat second HermesCLI interpreter (slash-command worker); the web
+  # chat UI never drives the slash menu. Requires the Dockerfile
+  # patch-slash-worker bake (image build).
+  set_env HERMES_TUI_DISABLE_SLASH_WORKER "1"
+  set_env HERMES_TUI_RPC_POOL_WORKERS "2"
+  set_env HERMES_TUI_CLOSE_SESSIONS_ON_DISCONNECT "1"
 
   # Free-tier resource guardrails, kept for behavioural parity.
-  set_env NODE_OPTIONS "--max-old-space-size=128"
+  set_env NODE_OPTIONS "--max-old-space-size=96"
   set_env MALLOC_ARENA_MAX "2"
   set_env OMP_NUM_THREADS "1"
   set_env OPENBLAS_NUM_THREADS "1"
   set_env MKL_NUM_THREADS "1"
+  set_env VECLIB_MAXIMUM_THREADS "1"
+  set_env NUMEXPR_NUM_THREADS "1"
   set_env TOKENIZERS_PARALLELISM "false"
-  set_env HERMES_AGENT_CACHE_MAX_SIZE "16"
-  set_env HERMES_AGENT_CACHE_IDLE_TTL_SECONDS "900"
+  set_env MAKEFLAGS "-j1"
+  set_env HERMES_AGENT_CACHE_MAX_SIZE "8"
+  set_env HERMES_AGENT_CACHE_IDLE_TTL_SECONDS "600"
+  # Git state-sync memory: small unchunked post buffer + capped pack memory
+  # so a push cannot spike the container past 512 MB.
+  set_env GIT_STATE_HTTP_POST_BUFFER_MB "64"
+  set_env GIT_STATE_PACK_WINDOW_MEMORY_MB "16"
+  set_env GIT_STATE_PACK_THREADS "1"
 
   # Git state backend defaults. Off unless GIT_STATE_REPO plus a token are
   # supplied. When it is on, every save uploads only the changed bytes, so

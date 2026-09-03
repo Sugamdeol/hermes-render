@@ -105,6 +105,17 @@ class PatchConfigTests(unittest.TestCase):
         self.assertIn("key: BYNARA_API_KEY", service)
         self.assertIn("key: OPENROUTER_API_KEY", service)
         self.assertIn("key: GIT_STATE_REPO", service)
+        # The in-browser Chat tab must be enabled: the hermes-chat-dashboard
+        # plugin drives tui_gateway over /api/ws, which upstream gates behind
+        # HERMES_DASHBOARD_TUI (the Node PTY path it also gates is never used
+        # by the plugin and only spawns on demand).
         self.assertIn("key: HERMES_DASHBOARD_TUI", service)
-        self.assertIn("value: \"0\"", service)
+        self.assertIn("key: HERMES_DASHBOARD_TUI\n        value: \"1\"", service)
+        # The per-chat second Python interpreter (slash-command worker) stays
+        # off so open conversations cannot accumulate tens of MB each.
+        self.assertIn("key: HERMES_TUI_DISABLE_SLASH_WORKER", service)
         self.assertIn("key: HERMES_AGENT_CACHE_MAX_SIZE", service)
+        # Git pushes are memory-capped (post buffer eagerly mallocs; pack
+        # objects defaults to unbounded windows) so a sync cannot OOM the box.
+        self.assertIn("key: GIT_STATE_HTTP_POST_BUFFER_MB", service)
+        self.assertIn("key: GIT_STATE_PACK_WINDOW_MEMORY_MB", service)

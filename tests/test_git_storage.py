@@ -1056,8 +1056,35 @@ class TransportTuningTests(unittest.TestCase):
 
     def test_the_post_buffer_defaults_big_enough_for_a_whole_state_tree(self):
         config = make_config(self.storage)
-        self.assertGreaterEqual(config.http_post_buffer, 100 * 1024 * 1024,
+        # Must stay unchunked (so GitHub does not answer an oversized chunked
+        # receive-pack with HTTP 408) while not reserving more RAM than a
+        # 512 MB Free instance can hand one `git push` (250 MB used to be the
+        # floor, which is how pushes OOM-killed the gateway).
+        self.assertGreaterEqual(config.http_post_buffer, 50 * 1024 * 1024,
                                 "git chunks the body above this and GitHub 408s")
+        self.assertLessEqual(config.http_post_buffer, 96 * 1024 * 1024,
+                             "the post buffer is eagerly malloced; it must "
+                             "not reserve half of a 512 MB instance")
+
+    def test_pack_memory_is_capped_for_small_instances(self):
+        config = make_config(self.storage)
+        self.assertLessEqual(config.pack_window_memory, 64 * 1024 * 1024,
+                             "unbounded pack.windowMemory lets a push spike "
+                             "past the 512 MB OOM line")
+        self.assertEqual(config.pack_threads, 1,
+                         "pack.threads multiplies peak pack memory by core count")
+
+    def test_git_calls_carry_pack_memory_guardrails(self):
+        fake = _RecordingSubprocess()
+        self.storage.subprocess = fake
+        config = make_config(self.storage)
+
+        self.storage.run_git(["--version"], config=config)
+
+        cmd = " ".join(fake.calls[0][0])
+        self.assertIn(f"pack.windowMemory={config.pack_window_memory}", cmd)
+        self.assertIn("pack.threads=1", cmd)
+        self.assertIn("pack.deltaCacheSize=", cmd)
 
     def test_every_git_call_is_bounded_by_a_timeout(self):
         fake = _RecordingSubprocess()
@@ -1648,6 +1675,71 @@ class DaemonResilienceTests(LocalRemoteTests):
         self.assertFalse(thread.is_alive(),
                          "the daemon died on an unexpected watcher error")
         self.assertIn("data/memories/note.md", self.remote_tree())
+
+
+class OomSurvivalTests(unittest.TestCase):
+    """The sync worker asks the OOM killer to prefer it over the gateway."""
+
+    def setUp(self):
+        self.storage = load_storage()
+        self._env = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_daemon_marks_itself_preferred_oom_target(self):
+        storage = self.storage
+        written = {}
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).endswith("/proc/self/oom_score_adj"):
+                class Handle:
+                    def __enter__(self_inner):
+                        return self_inner
+
+                    def __exit__(self_inner, *exc):
+                        return False
+
+                    def write(self_inner, text):
+                        written["value"] = text.strip()
+                return Handle()
+            return real_open(path, *args, **kwargs)
+
+        storage.open = fake_open
+        storage.tune_for_oom_survival()
+        # 1000 = "kill me first": a push spike then reclaims this
+        # auto-restarted worker instead of the gateway holding the session.
+        self.assertEqual(written.get("value"), "1000")
+
+    def test_score_can_be_relaxed_and_is_clamped(self):
+        storage = self.storage
+        values = []
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).endswith("/proc/self/oom_score_adj"):
+                class Handle:
+                    def __enter__(self_inner):
+                        return self_inner
+
+                    def __exit__(self_inner, *exc):
+                        return False
+
+                    def write(self_inner, text):
+                        values.append(text.strip())
+                return Handle()
+            return real_open(path, *args, **kwargs)
+
+        storage.open = fake_open
+        os.environ["GIT_STATE_OOM_SCORE_ADJ"] = "500"
+        storage.tune_for_oom_survival()
+        os.environ["GIT_STATE_OOM_SCORE_ADJ"] = "99999"
+        storage.tune_for_oom_survival()
+        self.assertEqual(values, ["500", "1000"])
 
 
 if __name__ == "__main__":
