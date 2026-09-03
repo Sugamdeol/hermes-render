@@ -1,0 +1,16 @@
+{
+  "name": "hermes-chat-dashboard",
+  "label": "Chat",
+  "description": "First-class ChatGPT-style Hermes web chat workspace backed by the real Hermes TUI gateway, tools, agents, memory, sessions, and streaming events.",
+  "icon": "MessageSquare",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/chat",
+    "override": "/chat",
+    "position": "before:sessions"
+  },
+  "slots": [],
+  "entry": "bundle/index.js",
+  "css": "bundle/style.css",
+  "api": "plugin_api.py"
+}
