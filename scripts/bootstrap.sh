@@ -10,8 +10,12 @@
 #   4. Runs the config patcher as the hermes user. On a fresh template it
 #      lowers known upstream resource defaults; later boots preserve edits.
 #      Integration entries remain idempotent and insert-only.
-#   5. Starts the optional state-sync worker and exec's the upstream
-#      entrypoint chain with the original args (default CMD is `gateway run`).
+#   5. Starts the optional state-sync worker (supervised: if the worker
+#      process ever dies, it is restarted) and the optional Free-tier
+#      keep-alive ping.
+#   6. Runs the upstream entrypoint chain as a supervised child and, when it
+#      exits, holds the container open for a few bounded seconds so the sync
+#      daemon can land its final push before tini tears everything down.
 #
 # The upstream entrypoint also chowns /opt/data and drops to the hermes
 # user via gosu for the gateway process. Our chown here is redundant in
@@ -107,17 +111,35 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
   case "${git_state}" in
     has-state)
       GIT_HAS_STATE=1
-      if run_bounded gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
-        STATE_SOURCE="github"
-      else
+      # A single transient GitHub failure must not disarm state sync for the
+      # whole runtime ("not pushing until a restart that restores it
+      # cleanly"), so a failed restore is retried while boot budget remains.
+      # Each attempt is individually bounded by RESTORE_TIMEOUT; the retry
+      # only happens when the boot is still fast enough to keep the port
+      # scan happy.
+      restore_attempts="${HERMES_RESTORE_ATTEMPTS:-2}"
+      [ "${restore_attempts}" -ge 1 ] 2>/dev/null || restore_attempts=1
+      restore_attempt=1
+      while :; do
+        if run_bounded gosu hermes "${GIT_SYNC}" restore "${DATA_DIR}"; then
+          STATE_SOURCE="github"
+          break
+        fi
         # $? is the status of the condition, so 124 means `timeout` stopped it.
         restore_status=$?
         if [ "${restore_status}" -eq 124 ]; then
           echo "[render-tools] warning: state restore ran past ${RESTORE_TIMEOUT}s and was stopped," >&2
           echo "[render-tools] warning: so the port binds in time. Raise HERMES_RESTORE_TIMEOUT_SECONDS if this repeats." >&2
         fi
-        echo "[render-tools] warning: github state restore failed; continuing without restored state" >&2
-      fi
+        if [ "${restore_attempt}" -ge "${restore_attempts}" ] \
+           || [ "$(elapsed_boot_seconds)" -ge 180 ]; then
+          echo "[render-tools] warning: github state restore failed; continuing without restored state" >&2
+          break
+        fi
+        restore_attempt=$((restore_attempt + 1))
+        echo "[render-tools] warning: state restore attempt failed; retrying (${restore_attempt}/${restore_attempts})" >&2
+        sleep 3
+      done
       ;;
     empty)
       echo "[render-tools] github state branch is empty (first launch); the sync daemon seeds it after boot" >&2
@@ -345,11 +367,139 @@ fi
 # Keep a remote snapshot up to date in the background. The worker is started
 # as hermes so it cannot read files outside the data directory. It is optional
 # and exits cleanly when its credentials are not configured.
+#
+# The worker runs under a tiny supervisor loop: if the daemon *process* ever
+# dies unexpectedly (an unexpected crash, a killed child, anything outside the
+# exception guard inside the daemon itself), it is restarted here. A dead
+# daemon that nobody restarts is exactly how "github files are not synced"
+# happens -- the logs keep saying everything is fine until the next restart.
+GIT_DAEMON_PIDFILE="${TMPDIR:-/tmp}/render-tools-git-daemon.pid"
+GIT_DAEMON_SUPERVISOR=""
 if [ "${GIT_BACKEND}" -eq 1 ]; then
-  gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
+  rm -f "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true
+  (
+    daemon_attempts=0
+    max_restarts="${HERMES_SYNC_DAEMON_RESTARTS:-20}"
+    while :; do
+      gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
+      daemon_pid=$!
+      echo "${daemon_pid}" > "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true
+      daemon_status=0
+      wait "${daemon_pid}" || daemon_status=$?
+      # 0 = the daemon exited cleanly -- it installs a SIGTERM handler and
+      # returns normally, so a stop (container shutdown or a failover
+      # handoff) looks like status 0, not 143; 143/130 = killed by
+      # SIGTERM/SIGINT before the handler ran. All of those are normal
+      # stops, not crashes -- do not restart.
+      if [ "${daemon_status}" -eq 0 ] || [ "${daemon_status}" -eq 143 ] \
+         || [ "${daemon_status}" -eq 130 ]; then
+        exit 0
+      fi
+      daemon_attempts=$((daemon_attempts + 1))
+      if [ "${daemon_attempts}" -gt "${max_restarts}" ]; then
+        echo "[render-tools] warning: sync daemon keeps exiting; giving up after ${max_restarts} restarts" >&2
+        exit 1
+      fi
+      echo "[render-tools] warning: sync daemon exited (status ${daemon_status});" \
+          "restarting (${daemon_attempts}/${max_restarts})" >&2
+      sleep 5
+    done
+  ) &
+  GIT_DAEMON_SUPERVISOR=$!
   echo "[render-tools] started git state sync (delta uploads on change)"
 fi
 
-# Hand off to the upstream entrypoint. The upstream script handles
-# privilege drop, dashboard backgrounding, and the actual gateway exec.
-exec /opt/hermes/docker/entrypoint.sh "$@"
+# Keep the Free service awake. Render spins a Free web service down after
+# ~15 minutes without inbound HTTP traffic, and chat platforms are
+# outbound-only -- so with no help the container sleeps mid-conversation and
+# the agent simply stops answering until something happens to wake it.
+#
+# Render injects RENDER_EXTERNAL_URL into every web service; a tiny loop in
+# the container requesting the dashboard's own /api/status over that public
+# URL counts as traffic, which is all the spin-down timer looks at. It only
+# runs on Render (no external URL, no loop), costs one small request per
+# interval, and is disabled with HERMES_KEEP_ALIVE=0.
+KEEP_ALIVE_URL="${RENDER_EXTERNAL_URL:-}"
+if [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ]; then
+  keep_alive_interval="${HERMES_KEEP_ALIVE_SECONDS:-600}"
+  case "${keep_alive_interval}" in
+    ''|*[!0-9]*) keep_alive_interval=600 ;;
+  esac
+  (
+    while :; do
+      sleep "${keep_alive_interval}"
+      if command -v curl >/dev/null 2>&1; then
+        curl -fsS --max-time 20 "${KEEP_ALIVE_URL}/api/status" >/dev/null 2>&1 || true
+      elif [ -x /opt/hermes/.venv/bin/python ]; then
+        /opt/hermes/.venv/bin/python - "${KEEP_ALIVE_URL}" <<'PYEOF' >/dev/null 2>&1 || true
+import sys, urllib.request
+urllib.request.urlopen(sys.argv[1].rstrip("/") + "/api/status", timeout=20).read()
+PYEOF
+      fi
+    done
+  ) &
+  echo "[render-tools] keep-alive: requesting /api/status every ${keep_alive_interval}s" \
+      "so the Free service does not spin down (HERMES_KEEP_ALIVE=0 to disable)"
+fi
+
+# Hand off to the upstream entrypoint -- as a supervised child rather than an
+# exec. The upstream script handles privilege drop, dashboard backgrounding,
+# and the gateway exec.
+#
+# The reason this wrapper must outlive the entrypoint by a few seconds is the
+# shutdown path. tini was started with -g, so a container stop signals the
+# whole process group: the gateway exits almost immediately, tini sees its
+# direct child (this script, in the old exec design) exit, and the container
+# is torn down -- SIGKILLing the sync daemon mid-final-push. Every restart
+# then silently dropped whatever had not been pushed in the last ~30s. From
+# here, after the gateway exits we hold the container open for a bounded
+# window (HERMES_SHUTDOWN_FLUSH_SECONDS, default 20s -- Render's stop grace
+# period is 30s) while the daemon flushes, then exit with the gateway's
+# status so a crash still restarts the service exactly as before.
+UPSTREAM_ENTRYPOINT="${HERMES_UPSTREAM_ENTRYPOINT:-/opt/hermes/docker/entrypoint.sh}"
+
+stop_requested=0
+on_stop() { stop_requested=1; }
+trap on_stop TERM INT
+
+"${UPSTREAM_ENTRYPOINT}" "$@" &
+CHILD=$!
+
+set +e
+child_status=0
+wait "${CHILD}"
+child_status=$?
+# A trapped signal interrupts `wait` without reaping the child; when that
+# happened, wait again for the child's real exit status (this returns
+# immediately if the child exited in the meantime).
+if kill -0 "${CHILD}" 2>/dev/null; then
+  wait "${CHILD}"
+  child_status=$?
+fi
+
+# The gateway is gone. Make sure the sync daemon is stopping too -- a
+# failover role change kills only the gateway, and a daemon left running
+# would keep this container alive forever -- then give its final push the
+# rest of the flush window before letting tini tear the container down.
+if [ "${GIT_BACKEND}" -eq 1 ]; then
+  daemon_pid="$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)"
+  if [ -n "${daemon_pid}" ]; then
+    kill -TERM "${daemon_pid}" 2>/dev/null || true
+  fi
+  kill -TERM "${GIT_DAEMON_SUPERVISOR}" 2>/dev/null || true
+  flush_wait="${HERMES_SHUTDOWN_FLUSH_SECONDS:-20}"
+  case "${flush_wait}" in
+    ''|*[!0-9]*) flush_wait=20 ;;
+  esac
+  if [ -n "${daemon_pid}" ] && [ "${flush_wait}" -gt 0 ]; then
+    flush_deadline=$(( $(date +%s) + flush_wait ))
+    while kill -0 "${daemon_pid}" 2>/dev/null \
+          && [ "$(date +%s)" -lt "${flush_deadline}" ]; do
+      sleep 1
+    done
+    kill -KILL "${daemon_pid}" 2>/dev/null || true
+  fi
+  wait "${GIT_DAEMON_SUPERVISOR}" 2>/dev/null || true
+fi
+
+exit "${child_status}"

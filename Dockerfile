@@ -192,7 +192,9 @@ RUN set -eu; \
 RUN install -d -o hermes -g hermes -m 0755 /opt/data
 
 # Stay as root so the bootstrap can chown the mounted /opt/data on first
-# boot, then `gosu hermes` for the config patch, then exec the upstream
-# entrypoint (which also runs as root and does its own gosu drop).
+# boot, then `gosu hermes` for the config patch, then run the upstream
+# entrypoint (which also runs as root and does its own gosu drop) as a
+# supervised child — the supervision is what gives the sync daemon a window
+# to land its final state push at shutdown.
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]
 CMD ["gateway", "run"]

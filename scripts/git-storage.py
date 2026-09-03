@@ -100,6 +100,10 @@ LOG = logging.getLogger("hermes-git-storage")
 LEASE_REF_PREFIX = "refs/hermes-lease/"
 DATA_SUBDIR = "data"
 MANIFEST_NAME = "MANIFEST.json"
+# Working-set bookkeeping for the incremental mirror: what was copied last
+# time, so the next sync copies only what changed. Lives in the workdir, not
+# in the branch (see _ensure_inventory_ignored).
+INVENTORY_NAME = ".mirror-inventory.json"
 ENCRYPTED_SUFFIX = ".enc"
 ROLE_ACTIVE = "active"
 ROLE_STANDBY = "standby"
@@ -1019,11 +1023,145 @@ def _warn_plaintext_env(names: "list[str]", config: GitConfig) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Incremental mirror bookkeeping
+# ---------------------------------------------------------------------------
+
+
+def _file_signature(path: Path) -> "list | None":
+    """(size, mtime_ns, mode) for a regular file, or None if unstatable.
+
+    Mode is part of the signature on purpose: chmod changes ctime but not
+    mtime, so a permission-only change would otherwise be invisible to the
+    mirror and the manifest would keep the stale mode forever.
+    """
+    try:
+        info = path.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return [info.st_size, info.st_mtime_ns, info.st_mode & 0o777]
+
+
+def _load_inventory(inventory_path: Path) -> "dict[str, dict]":
+    """What the previous mirror copied, or {} when it cannot be trusted.
+
+    A missing, corrupt or malformed inventory is never fatal: the sync just
+    falls back to copying everything, which is what it did before the
+    incremental mirror existed.
+    """
+    try:
+        raw = json.loads(inventory_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        relative: entry
+        for relative, entry in raw.items()
+        if isinstance(relative, str) and isinstance(entry, dict)
+    }
+
+
+def _store_inventory(inventory_path: Path, inventory: "dict[str, dict]") -> None:
+    """Persist the inventory, best-effort.
+
+    A failed write costs at most one full re-copy on the next sync.
+    """
+    try:
+        inventory_path.write_text(
+            json.dumps(inventory, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        LOG.warning("could not write the mirror inventory: %s", exc)
+
+
+def _ensure_inventory_ignored(workdir: Path) -> None:
+    """Keep the mirror inventory out of the state branch.
+
+    The inventory is working-set bookkeeping, not agent state; committing it
+    would add churn to every sync for nothing. It lives in the workdir (not
+    some temp dir) precisely so it survives from sync to sync -- skipping
+    work the previous sync already did is the whole point.
+    """
+    exclude = workdir / ".git" / "info" / "exclude"
+    try:
+        if not exclude.is_file():
+            return
+        existing = exclude.read_text(encoding="utf-8", errors="replace")
+        if INVENTORY_NAME not in existing.split():
+            with open(exclude, "a", encoding="utf-8") as handle:
+                handle.write(f"{INVENTORY_NAME}\n")
+    except OSError:
+        # Worst case the inventory is committed next to the manifest: churn,
+        # not corruption. Never fail a sync over it.
+        pass
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Remove a file (and then empty parent dirs) without ever raising."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        LOG.warning("could not remove stale mirror file %s: %s", path, exc)
+        return
+    parent = path.parent
+    try:
+        while parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+    except OSError:
+        pass
+
+
+def tracked_worktree_files(workdir: Path, config: GitConfig) -> "set[str]":
+    """Paths under data/ that git tracks in the working clone.
+
+    `git ls-files` answers from the index, so after a fetch + checkout it
+    includes files the remote still holds that the local tree has deleted.
+    The mirror has to drop those from the worktree, or the next `git add -A`
+    would quietly resurrect a deletion.
+    """
+    proc = run_git(["ls-files", "-z", "--", DATA_SUBDIR], cwd=workdir,
+                   check=False, config=config)
+    files: set[str] = set()
+    prefix = DATA_SUBDIR + "/"
+    for raw in (proc.stdout or "").split("\0"):
+        if not raw:
+            continue
+        relative = raw
+        if relative.startswith(prefix):
+            files.add(relative[len(prefix):])
+    return files
+
+
 def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     """Rebuild <workdir>/data from data_dir. Returns a manifest dict.
 
-    The tree is rebuilt rather than patched so that files deleted locally
-    disappear from the next commit: `git add -A` sees them gone.
+    The mirror is *incremental*: a file whose size, mtime and mode are
+    unchanged since the last sync is left exactly as it stands in the
+    worktree, so a 30 MB session database that gained one message costs one
+    small copy instead of re-reading the whole tree on every push. On a
+    512 MB Free instance that is not an optimisation: re-reading every file
+    per push spikes this process's memory by the size of the largest file,
+    which is RAM the gateway never gets -- and when the OOM killer comes for
+    the RAM, it can just as well take the gateway (the session dies) as this
+    daemon (the backup silently stops).
+
+    Deletions still propagate in both directions, which is what keeps the
+    branch a faithful mirror:
+      * a file removed locally is removed from the worktree, and so from the
+        next commit, and
+      * a file that exists in the worktree only because the last
+        fetch + checkout brought the remote's copy back -- a file the local
+        tree has since deleted -- is dropped too, so `git add -A` records the
+        removal rather than resurrecting the file.
+
+    The skip decision trusts (size, mtime_ns, mode) -- the same evidence the
+    change fingerprint uses. A write that preserves all three is invisible
+    here exactly as it is invisible to the watcher; it is also vanishingly
+    rare on a real write.
     """
     excludes = DEFAULT_EXCLUDES
     # Read the previous generation before the manifest is overwritten. The
@@ -1031,28 +1169,58 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     # remote history is; we carry the count in the manifest instead.
     generation = read_generation(workdir) + 1
     target = workdir / DATA_SUBDIR
-    if target.exists():
-        shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
 
-    copied, encrypted, plaintext_env, skipped = 0, [], [], []
+    _ensure_inventory_ignored(workdir)
+    inventory_path = workdir / INVENTORY_NAME
+    previous = _load_inventory(inventory_path)
+    inventory: "dict[str, dict]" = {}
+
+    copied, unchanged, encrypted, plaintext_env, skipped = 0, 0, [], [], []
     modes: dict[str, str] = {}
     planned, empty_dirs, symlinks = plan_tree(data_dir, excludes)
+    planned_set = set(planned)
+
+    # Anything the previous mirror wrote that the tree no longer has, plus
+    # anything git tracks that the plan does not (the fetch/checkout case),
+    # has to leave the worktree before `git add -A` runs.
+    stale: list[str] = []
+    for relative, entry in previous.items():
+        if relative in planned_set:
+            continue
+        dest_name = relative
+        if isinstance(entry, dict) and isinstance(entry.get("dest"), str):
+            dest_name = entry["dest"]
+        stale.append(dest_name)
+    for relative in sorted(tracked_worktree_files(workdir, config)):
+        if relative not in planned_set:
+            stale.append(relative)
+    for dest_name in sorted(set(stale)):
+        _unlink_quietly(target / dest_name)
+
     for relative in planned:
         source = data_dir / relative
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            payload = source.read_bytes()
-        except OSError:
-            continue
+        source_sig = _file_signature(source)
 
         if relative in SENSITIVE_FILES:
+            # Small by nature and transformed before it is stored, so the
+            # skip path never applies: read and process it every time.
+            entry = previous.get(relative)
+            try:
+                payload = source.read_bytes()
+            except OSError:
+                if isinstance(entry, dict) and entry.get("dest"):
+                    _unlink_quietly(target / str(entry["dest"]))
+                _unlink_quietly(target / relative)
+                continue
             payload, disposition = _prepare_sensitive(payload, config)
             if disposition == ENV_MODE_OMIT:
                 # Either the operator asked for omit, or encrypt was asked for
                 # and age could not seal it. Neither falls back to plaintext.
                 skipped.append(relative)
+                if isinstance(entry, dict) and entry.get("dest"):
+                    _unlink_quietly(target / str(entry["dest"]))
+                _unlink_quietly(target / relative)
                 LOG.warning(
                     "%s left OUT of the git backup (GIT_STATE_ENV_MODE=%s%s). "
                     "Keep those values in Render's Environment tab or the "
@@ -1062,39 +1230,82 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
                 )
                 continue
             if disposition == ENV_MODE_ENCRYPT:
-                destination = destination.with_name(destination.name + ENCRYPTED_SUFFIX)
+                destination = (target / relative).with_name(
+                    (target / relative).name + ENCRYPTED_SUFFIX)
                 encrypted.append(relative)
             else:
+                destination = target / relative
                 plaintext_env.append(relative)
+            dest_name = destination.relative_to(target).as_posix()
+            if isinstance(entry, dict) and entry.get("dest") != dest_name:
+                # A mode switch moved the file (plaintext .env -> .env.enc or
+                # back); the copy under the old name must not survive.
+                _unlink_quietly(target / str(entry["dest"]))
             destination.write_bytes(payload)
-            copied += 1
             try:
                 # A restored .env holds live keys; keep it owner-only on disk
                 # even though the copy in the branch is world-readable.
                 os.chmod(destination, 0o600)
             except OSError:
                 pass
+            copied += 1
+            inventory[relative] = {
+                "dest": destination.relative_to(target).as_posix(),
+                "src": source_sig,
+                "dst": _file_signature(destination),
+            }
             continue
 
-        destination.write_bytes(payload)
-        try:
-            mode = source.stat().st_mode & 0o777
-            os.chmod(destination, mode)
-        except OSError:
-            mode = 0o644
-        if mode not in (0o644, 0o755):
+        if source_sig is None:
+            # The file vanished between the plan and the copy; treat it as
+            # deleted rather than half-backing-it-up.
+            _unlink_quietly(target / relative)
+            continue
+
+        entry = previous.get(relative)
+        destination = target / relative
+        dest_sig = _file_signature(destination)
+        if (isinstance(entry, dict)
+                and entry.get("dest") == relative
+                and entry.get("src") == source_sig
+                and dest_sig is not None
+                and dest_sig == entry.get("dst")):
+            # Same size, mtime and mode on both sides: what the worktree
+            # holds is what the source holds. Leave it alone.
+            unchanged += 1
+            inventory[relative] = entry
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                # Streamed copy: a large file never has to fit in memory.
+                shutil.copyfile(source, destination)
+            except OSError:
+                _unlink_quietly(destination)
+                continue
+            try:
+                mode = source.stat().st_mode & 0o777
+                os.chmod(destination, mode)
+            except OSError:
+                mode = 0o644
+            copied += 1
+            inventory[relative] = {
+                "dest": relative,
+                "src": source_sig,
+                "dst": _file_signature(destination),
+            }
+        if source_sig[2] not in (0o644, 0o755):
             # git records only the executable bit, so every other mode has to
             # travel in the manifest -- otherwise a 0600 key comes back from a
             # restore as a world-readable 0644.
-            modes[relative] = format(mode, "o")
-        copied += 1
+            modes[relative] = format(source_sig[2], "o")
 
     _warn_plaintext_env(plaintext_env, config)
+    _store_inventory(inventory_path, inventory)
 
     manifest = {
         "instance": config.instance_id,
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        "files": copied,
+        "files": copied + unchanged,
         "generation": generation,
         "encrypted": sorted(encrypted),
         "omitted": sorted(skipped),
@@ -1289,6 +1500,37 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
     push_branch(workdir, config, force=True)
 
 
+def manifest_differs_from_head(workdir: Path, config: GitConfig) -> bool:
+    """Does the freshly built manifest carry anything HEAD's does not?
+
+    "updated" (a timestamp) and "generation" (a commit counter) are written
+    by every build but only mean something once a commit actually lands, so
+    both are ignored here. This answers "did the mirror itself change?",
+    which is what decides whether a data/ tree that `git status` calls clean
+    still deserves a commit: a permission-only change is invisible to git --
+    it tracks the executable bit only -- and travels in the manifest alone,
+    so without this check the early-return path would revert the manifest
+    and the restored file would come back world-readable.
+    """
+    volatile = ("updated", "generation")
+    proc = run_git(["show", f"HEAD:{MANIFEST_NAME}"], cwd=workdir,
+                   check=False, config=config)
+    if proc.returncode != 0:
+        return True
+    try:
+        head = json.loads(proc.stdout)
+        current = json.loads(
+            (workdir / MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(head, dict) or not isinstance(current, dict):
+        return True
+    head = {key: value for key, value in head.items() if key not in volatile}
+    current = {key: value for key, value in current.items()
+               if key not in volatile}
+    return head != current
+
+
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
@@ -1317,10 +1559,13 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     # Only real state changes are worth a commit. The manifest carries a
     # timestamp and generation counter that differ on every run, so asking
     # about the whole tree would push a pointless commit every interval --
-    # exactly the bandwidth waste this backend exists to avoid.
+    # exactly the bandwidth waste this backend exists to avoid. A data/ tree
+    # that git calls clean can still have changed in ways only the manifest
+    # records (a chmod), so a manifest-only difference counts as a change.
     status = run_git(["status", "--porcelain", "--", DATA_SUBDIR],
                      cwd=workdir, config=config)
-    if not status.stdout.strip() and not force:
+    if (not status.stdout.strip() and not force
+            and not manifest_differs_from_head(workdir, config)):
         LOG.debug("state unchanged; nothing to commit")
         run_git(["checkout", "HEAD", "--", MANIFEST_NAME], cwd=workdir,
                 check=False, config=config)
@@ -1584,7 +1829,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
             last_heartbeat = time.time()
             LOG.info("failover: instance=%s priority=%d role=%s",
                      config.instance_id, config.priority, config.role)
-        except GitStateError as exc:
+        except Exception as exc:  # a missed first lease must not end the daemon
             LOG.warning("could not claim lease; assuming active: %s", redact(str(exc)))
 
     # Let the upstream entrypoint finish its first-boot directory setup before
@@ -1599,12 +1844,21 @@ def run_daemon(data_dir: Path, config: GitConfig,
     # boot and Render failed the deploy with "no open ports detected". The
     # daemon owns the seed now, so a slow or failed push costs a retry instead
     # of a redeploy.
-    seed_on_startup(data_dir, config)
+    try:
+        seed_on_startup(data_dir, config)
+    except Exception:
+        # Nothing that happens in one attempt may end the backup for the
+        # lifetime of the instance: the loop below keeps retrying.
+        LOG.exception("startup seed failed unexpectedly; the sync loop keeps retrying")
 
     # Change-driven saves. The interval below is only the safety net: a change
     # is normally pushed within `debounce` seconds of the last write, not at
     # the next interval boundary.
-    watcher = ChangeWatcher(data_dir, config) if config.watch else None
+    try:
+        watcher = ChangeWatcher(data_dir, config) if config.watch else None
+    except Exception:
+        LOG.exception("change watcher could not start; falling back to interval syncs")
+        watcher = None
 
     def push(reason: str) -> None:
         # Snapshot first: whatever is written while the push is in flight is
@@ -1612,7 +1866,9 @@ def run_daemon(data_dir: Path, config: GitConfig,
         snapshot = watcher.snapshot() if watcher is not None else None
         try:
             sync_once(data_dir, config)
-        except GitStateError as exc:
+        except Exception as exc:
+            # GitStateError or not -- a failed push must never escape into the
+            # loop and end the backup for the lifetime of the instance.
             LOG.warning("git state push failed (%s); will retry: %s",
                         reason, redact(str(exc)))
             if watcher is not None:
@@ -1626,40 +1882,50 @@ def run_daemon(data_dir: Path, config: GitConfig,
     last_scan = 0.0
     while not stop.is_set():
         now = time.time()
-        if config.failover:
-            if now - last_heartbeat >= config.heartbeat_interval:
-                try:
-                    claim_lease(config)
-                    last_heartbeat = now
-                except GitStateError as exc:
-                    LOG.warning("lease heartbeat failed: %s", redact(str(exc)))
-            try:
-                role = current_role(config)
-            except GitStateError:
-                role = config.role
-            if role != config.role and now - last_switch >= config.role_switch_min:
-                previous, config.role = config.role, role
-                last_switch = now
-                if previous == ROLE_ACTIVE:
+        try:
+            if config.failover:
+                if now - last_heartbeat >= config.heartbeat_interval:
                     try:
-                        sync_once(data_dir, config, force=True)
-                    except GitStateError as exc:
-                        LOG.warning("handoff push failed: %s", redact(str(exc)))
-                _request_restart(f"{previous} -> {role}")
-                stop.wait(5)
-                continue
+                        claim_lease(config)
+                        last_heartbeat = now
+                    except Exception as exc:
+                        LOG.warning("lease heartbeat failed: %s", redact(str(exc)))
+                try:
+                    role = current_role(config)
+                except Exception:
+                    role = config.role
+                if role != config.role and now - last_switch >= config.role_switch_min:
+                    previous, config.role = config.role, role
+                    last_switch = now
+                    if previous == ROLE_ACTIVE:
+                        try:
+                            sync_once(data_dir, config, force=True)
+                        except Exception as exc:
+                            LOG.warning("handoff push failed: %s", redact(str(exc)))
+                    _request_restart(f"{previous} -> {role}")
+                    stop.wait(5)
+                    continue
 
-        if watcher is not None and now - last_scan >= config.watch_seconds:
-            last_scan = now
-            # A burst of writes should become one commit, so wait for quiet
-            # before pushing -- then respect the minimum gap so a very chatty
-            # agent cannot turn one minute into dozens of commits.
-            if watcher.poll() and now - config._last_push_at >= config.min_push_interval:
-                push("change detected")
+            if watcher is not None and now - last_scan >= config.watch_seconds:
+                last_scan = now
+                # A burst of writes should become one commit, so wait for quiet
+                # before pushing -- then respect the minimum gap so a very chatty
+                # agent cannot turn one minute into dozens of commits.
+                if watcher.poll() and now - config._last_push_at >= config.min_push_interval:
+                    push("change detected")
 
-        if now >= next_sync:
-            next_sync = now + config.interval
-            push("safety-net interval")
+            if now >= next_sync:
+                next_sync = now + config.interval
+                push("safety-net interval")
+        except Exception:
+            # The daemon dying is how "github files are not synced" happens:
+            # nothing restarts it until the next deploy. One bad tick -- a
+            # file vanishing mid-scan, a full disk, anything unexpected --
+            # gets logged with its traceback and paid for with a backoff
+            # instead of ending the backup.
+            LOG.exception("unexpected error in the sync loop; backing off")
+            next_sync = time.time() + max(5, config.retry_seconds)
+            stop.wait(min(30, max(1, config.retry_seconds)))
 
         stop.wait(min(
             config.watch_seconds,
@@ -1667,15 +1933,38 @@ def run_daemon(data_dir: Path, config: GitConfig,
             config.interval,
         ))
 
-    try:
-        sync_once(data_dir, config, force=True)
-    except GitStateError as exc:
-        LOG.warning("final git state push failed: %s", redact(str(exc)))
+    # Final flush. Anything observed but not yet pushed -- a change still
+    # inside its debounce window, or a push that failed on the last tick --
+    # gets one last chance here. bootstrap.sh holds the container open for a
+    # bounded window after the gateway exits precisely so this can finish;
+    # before that window existed the daemon was usually SIGKILLed mid-push,
+    # which is how the last seconds of a session used to go missing.
+    final_flush(data_dir, config, watcher)
     if config.failover:
         try:
             release_lease(config)
-        except GitStateError as exc:
+        except Exception as exc:
             LOG.warning("could not release lease: %s", redact(str(exc)))
+
+
+def final_flush(data_dir: Path, config: GitConfig,
+                watcher: "ChangeWatcher | None" = None) -> bool:
+    """One last push at shutdown for anything observed but not yet pushed.
+
+    Nothing is forced: when the mirror is clean against the remote this is a
+    cheap no-op, not another commit of an unchanged tree. With the watcher
+    disabled there is no way to know whether anything is pending, so a sync
+    is attempted anyway -- sync_once's own nothing-to-commit check keeps that
+    honest. Returns True when the branch now carries everything it saw.
+    """
+    if watcher is not None and watcher.pending_since is None:
+        LOG.debug("nothing pending at shutdown; skipping the final push")
+        return False
+    try:
+        return bool(sync_once(data_dir, config))
+    except Exception as exc:
+        LOG.warning("final git state push failed: %s", redact(str(exc)))
+        return False
 
 
 def _find_gateway_pid() -> "int | None":
