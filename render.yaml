@@ -104,6 +104,11 @@ services:
       # so the repository cannot grow without bound.
       - key: GIT_STATE_MAX_COMMITS
         value: "200"
+      # A failed state restore at boot (a transient GitHub blip) is retried
+      # this many times while boot time allows, because one failure otherwise
+      # disarms state sync until the next restart.
+      - key: HERMES_RESTORE_ATTEMPTS
+        value: "2"
       # age public key. If set, /opt/data/.env is encrypted to it before being
       # committed. If unset, .env is simply left out of the backup -- it is
       # never committed in the clear.
@@ -123,6 +128,28 @@ services:
         value: render
       - key: HERMES_INSTANCE_PRIORITY
         value: "50"
+
+      # Keep-alive. Render Free spins a service down after ~15 minutes
+      # without inbound HTTP traffic, and chat platforms are outbound-only —
+      # so without help the container sleeps mid-conversation and the agent
+      # stops answering. When RENDER_EXTERNAL_URL is set (Render injects it
+      # on every web service), bootstrap starts a tiny loop that requests the
+      # dashboard's /api/status over the public URL on the cadence below,
+      # which counts as traffic and keeps the service awake. Set to 0 to let
+      # the service sleep instead (saves Free instance hours; the next
+      # message then waits out a cold start).
+      - key: HERMES_KEEP_ALIVE
+        value: "1"
+      - key: HERMES_KEEP_ALIVE_SECONDS
+        value: "600"
+
+      # Shutdown flush. When the service stops or redeploys, the container
+      # stays up this many seconds after the gateway exits so the sync
+      # daemon can land its final state push instead of being killed
+      # mid-flight. Keep this below Render's stop grace period (30s by
+      # default) or Render will SIGKILL the container first.
+      - key: HERMES_SHUTDOWN_FLUSH_SECONDS
+        value: "20"
 
       # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
       # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.

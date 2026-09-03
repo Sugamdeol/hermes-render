@@ -1349,5 +1349,306 @@ class MidPushChangeTests(unittest.TestCase):
         self.assertFalse(watcher.poll())
 
 
+class IncrementalMirrorTests(LocalRemoteTests):
+    """The mirror copies only what changed, but never misses a change.
+
+    Before the incremental mirror, every push re-read and re-copied the whole
+    /opt/data tree into the workdir. On a 512 MB Free instance that is RAM
+    and CPU the gateway does not get, once per push.
+    """
+
+    def _data_dir(self):
+        data_dir = self.root / "data"
+        (data_dir / "memories").mkdir(parents=True)
+        (data_dir / "memories" / "note.md").write_text("remembered")
+        (data_dir / "config.yaml").write_text("model: x\n")
+        return data_dir
+
+    def _mirror_file(self, config):
+        workdir = self.storage.ensure_clone(config)
+        return workdir / "data" / "memories" / "note.md"
+
+    def test_an_unchanged_file_is_not_recopied_on_the_next_sync(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+
+        storage.sync_once(data_dir, config)
+        mirror = self._mirror_file(config)
+        first_mtime = mirror.stat().st_mtime_ns
+
+        storage.sync_once(data_dir, config)
+
+        self.assertIsNotNone(storage.head_commit(storage.ensure_clone(config), config))
+        self.assertEqual(
+            mirror.stat().st_mtime_ns, first_mtime,
+            "an unchanged file was re-copied into the worktree")
+
+    def test_a_changed_file_is_still_pushed(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+
+        (data_dir / "memories" / "note.md").write_text("updated memory")
+        storage.sync_once(data_dir, config)
+
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        self.assertTrue(storage.restore(fresh, self.make_config(workdir=self.root / "w2")))
+        self.assertEqual((fresh / "memories" / "note.md").read_text(),
+                         "updated memory")
+
+    def test_a_mode_only_change_is_still_mirrored(self):
+        """chmod changes ctime, not mtime -- the signature carries the mode."""
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+
+        os.chmod(data_dir / "config.yaml", 0o600)
+        storage.sync_once(data_dir, config)
+
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        self.assertTrue(storage.restore(fresh, self.make_config(workdir=self.root / "w2")))
+        self.assertEqual(
+            (fresh / "config.yaml").stat().st_mode & 0o777, 0o600,
+            "a permission-only change was lost by the incremental mirror")
+
+    def test_a_corrupt_inventory_falls_back_to_a_full_copy(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+
+        workdir = storage.ensure_clone(config)
+        (workdir / storage.INVENTORY_NAME).write_text("{not json", encoding="utf-8")
+        (data_dir / "memories" / "note.md").write_text("after the corruption")
+        storage.sync_once(data_dir, config)
+
+        fresh = self.root / "fresh"
+        fresh.mkdir()
+        self.assertTrue(storage.restore(fresh, self.make_config(workdir=self.root / "w2")))
+        self.assertEqual((fresh / "memories" / "note.md").read_text(),
+                         "after the corruption")
+
+    def test_the_mirror_inventory_is_never_committed(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        storage.sync_once(data_dir, self.make_config())
+        storage.sync_once(data_dir, self.make_config())
+
+        tree = self.remote_tree()
+        self.assertNotIn(storage.INVENTORY_NAME, tree)
+        self.assertNotIn(f"data/{storage.INVENTORY_NAME}", tree)
+
+    def test_deleting_a_local_file_still_removes_it_after_it_was_skipped(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+
+        (data_dir / "memories" / "note.md").unlink()
+        storage.sync_once(data_dir, config)
+
+        self.assertNotIn("data/memories/note.md", self.remote_tree())
+        workdir = storage.ensure_clone(config)
+        self.assertFalse((workdir / "data" / "memories").exists(),
+                         "the emptied directory was left behind")
+
+    def test_switching_to_encrypt_mode_moves_the_dotenv_off_the_branch(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        (data_dir / ".env").write_text("HERMES_API_KEY=super-secret\n")
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+        self.assertIn("data/.env", self.remote_tree())
+
+        saved_age = storage.age_encrypt
+        storage.age_encrypt = lambda payload, cfg: b"SEALED(" + str(len(payload)).encode() + b")"
+        try:
+            encrypted = self.make_config(env_mode="encrypt",
+                                         age_recipient="age1test")
+            storage.sync_once(data_dir, encrypted)
+        finally:
+            storage.age_encrypt = saved_age
+
+        tree = self.remote_tree()
+        self.assertIn("data/.env.enc", tree)
+        self.assertNotIn("data/.env", tree,
+                         "the plaintext dotenv survived a switch to encrypt")
+
+
+class FinalFlushTests(LocalRemoteTests):
+    """The shutdown flush: one last push for anything not yet on the branch."""
+
+    def _data_dir(self, contents="remembered"):
+        data_dir = self.root / "data"
+        (data_dir / "memories").mkdir(parents=True)
+        (data_dir / "memories" / "note.md").write_text(contents)
+        return data_dir
+
+    def _watcher(self, data_dir, pending):
+        storage = self.storage
+        clock = _FakeClock()
+        watcher = storage.ChangeWatcher(
+            data_dir, self.make_config(), clock=clock, sampler=_FakeSampler())
+        if pending:
+            watcher.pending_since = clock()
+        return watcher
+
+    def test_a_pending_change_is_pushed_by_the_flush(self):
+        storage = self.storage
+        data_dir = self._data_dir("written seconds before the stop")
+        watcher = self._watcher(data_dir, pending=True)
+
+        self.assertTrue(storage.final_flush(data_dir, self.make_config(), watcher))
+        self.assertIn("data/memories/note.md", self.remote_tree())
+
+    def test_a_clean_tree_is_not_pushed_by_the_flush(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        watcher = self._watcher(data_dir, pending=False)
+
+        attempted = {"calls": 0}
+        real_sync_once = storage.sync_once
+
+        def counting(*args, **kwargs):
+            attempted["calls"] += 1
+            return real_sync_once(*args, **kwargs)
+
+        storage.sync_once = counting
+        try:
+            self.assertFalse(
+                storage.final_flush(data_dir, self.make_config(), watcher))
+        finally:
+            storage.sync_once = real_sync_once
+
+        self.assertEqual(attempted["calls"], 0,
+                         "a flush with nothing pending still touched the remote")
+        self.assertEqual(self.remote_tree(), set())
+
+    def test_without_a_watcher_the_flush_runs_but_commits_nothing_new(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config()
+        storage.sync_once(data_dir, config)
+        first = subprocess.run(
+            ["git", f"--git-dir={self.remote}", "rev-parse", "state"],
+            capture_output=True, text=True).stdout.strip()
+
+        self.assertTrue(storage.final_flush(data_dir, config, None))
+        second = subprocess.run(
+            ["git", f"--git-dir={self.remote}", "rev-parse", "state"],
+            capture_output=True, text=True).stdout.strip()
+        self.assertEqual(first, second,
+                         "the flush committed an unchanged tree")
+
+    def test_a_failing_flush_is_reported_not_raised(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        watcher = self._watcher(data_dir, pending=True)
+
+        real_sync_once = storage.sync_once
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("remote is down")
+
+        storage.sync_once = broken
+        try:
+            self.assertFalse(
+                storage.final_flush(data_dir, self.make_config(), watcher))
+        finally:
+            storage.sync_once = real_sync_once
+
+
+class DaemonResilienceTests(LocalRemoteTests):
+    """The daemon process must survive anything one bad tick can throw at it.
+
+    Nothing restarts the daemon until the next deploy, so a single uncaught
+    exception used to end state sync silently for the rest of the instance's
+    life -- the other half of "github files are not synced".
+    """
+
+    def _data_dir(self):
+        data_dir = self.root / "data"
+        (data_dir / "memories").mkdir(parents=True)
+        (data_dir / "memories" / "note.md").write_text("built locally")
+        (data_dir / "config.yaml").write_text("model: x\n")
+        return data_dir
+
+    def _run_daemon_briefly(self, data_dir, config, until_remote_has):
+        storage = self.storage
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=storage.run_daemon, args=(data_dir, config, stop), daemon=True)
+        thread.start()
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline and until_remote_has not in self.remote_tree():
+                time.sleep(0.5)
+        finally:
+            stop.set()
+            thread.join(timeout=30)
+        return thread
+
+    def test_an_unexpected_push_error_does_not_end_the_daemon(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config(interval=1, watch_seconds=1,
+                                  debounce_seconds=0, min_push_interval=0,
+                                  retry_seconds=1, push_retry_seconds=0)
+
+        real_sync_once = storage.sync_once
+        calls = {"n": 0}
+
+        def flaky(data_dir_, config_, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("unexpected sync failure")
+            return real_sync_once(data_dir_, config_, **kwargs)
+
+        storage.sync_once = flaky
+        try:
+            thread = self._run_daemon_briefly(data_dir, config,
+                                              "data/memories/note.md")
+        finally:
+            storage.sync_once = real_sync_once
+
+        self.assertFalse(thread.is_alive(),
+                         "the daemon died on an unexpected push error")
+        self.assertIn("data/memories/note.md", self.remote_tree(),
+                      "the daemon never retried after the unexpected error")
+        self.assertGreaterEqual(calls["n"], 2, "the failed push was not retried")
+
+    def test_an_unexpected_watcher_error_does_not_end_the_daemon(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        config = self.make_config(interval=1, watch_seconds=1,
+                                  debounce_seconds=0, min_push_interval=0,
+                                  retry_seconds=1, push_retry_seconds=0)
+
+        real_fingerprint = storage.state_fingerprint
+        calls = {"n": 0}
+
+        def flaky_fingerprint(data_dir_):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("tree vanished mid-scan")
+            return real_fingerprint(data_dir_)
+
+        storage.state_fingerprint = flaky_fingerprint
+        try:
+            thread = self._run_daemon_briefly(data_dir, config,
+                                              "data/memories/note.md")
+        finally:
+            storage.state_fingerprint = real_fingerprint
+
+        self.assertFalse(thread.is_alive(),
+                         "the daemon died on an unexpected watcher error")
+        self.assertIn("data/memories/note.md", self.remote_tree())
+
+
 if __name__ == "__main__":
     unittest.main()

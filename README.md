@@ -442,6 +442,36 @@ This Blueprint uses Render's **Free** web-service instance. It has no service ch
 
 LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
 
+## Keeping the service awake (keep-alive)
+
+A Render Free web service spins down after roughly 15 minutes without
+**inbound** HTTP traffic, and a cold start takes tens of seconds. That is a
+poor fit for a chat agent: Telegram, Discord and Slack messages are
+*outbound* connections from the container, so they do not count as traffic —
+with no help, the service falls asleep in the middle of a conversation and
+the agent stops answering until something happens to wake it again.
+
+The image ships with a keep-alive for exactly this. When Render injects
+`RENDER_EXTERNAL_URL` (it does for every web service), the boot wrapper
+starts a tiny loop that requests the dashboard's own `/api/status` over the
+public URL every `HERMES_KEEP_ALIVE_SECONDS` (600 by default — well inside
+the 15-minute idle window). The request goes through Render's proxy, so it
+counts as traffic and the service stays awake. It runs only where that
+variable exists, so local `run-local.sh` containers are unaffected
+automatically.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `HERMES_KEEP_ALIVE` | `1` | Set to `0` to let the service sleep when idle |
+| `HERMES_KEEP_ALIVE_SECONDS` | `600` | Seconds between keep-alive requests |
+
+The trade-off is instance hours: awake around the clock, one Free service
+uses roughly 720 of the ~750 monthly Free instance hours, which fits, but a
+second always-awake Free service would not. If you would rather let the
+agent sleep between messages — accepting a cold start on the next one — set
+`HERMES_KEEP_ALIVE=0` in Render's **Environment** tab. Sessions and files
+still survive the sleep either way when the git state sync is enabled.
+
 ## Keeping files between restarts
 
 Render Free cannot attach a persistent disk: when the service restarts, the
@@ -483,6 +513,32 @@ That handoff is guarded: only a branch the daemon has confirmed is empty gets
 seeded, and never one it simply could not reach. If GitHub is unreachable at
 boot, the local tree is not pushed over state this instance never restored
 from — the daemon waits for a boot that restores cleanly.
+
+**Shutdown order, and the flush window.** The mirror works the same way in
+reverse when the service stops. A stop signals the whole process group: the
+gateway exits almost immediately, and without help the container would be torn
+down with it — taking the sync daemon down mid-push and silently dropping
+whatever had changed in the previous few seconds. That is the bug behind
+"the GitHub files are not synced after restart": every restart lost the tail
+of the last session. The boot wrapper now supervises the upstream entrypoint
+instead of replacing itself with it, and after the gateway exits it holds the
+container open for `HERMES_SHUTDOWN_FLUSH_SECONDS` (20 by default — keep it
+below Render's 30s stop grace period) while the daemon lands its final push
+and releases its failover lease. The final push is deliberately not forced:
+when everything is already on the branch it is a no-op, so a quiet restart
+costs a second or two, not a commit.
+
+A failed restore at boot also no longer poisons the whole runtime. Restoring
+is retried while boot time allows (`HERMES_RESTORE_ATTEMPTS`, 2 by default),
+because a single transient GitHub blip at boot used to leave the instance
+running with state sync disarmed until the next restart. The daemon process
+itself is supervised twice over: unexpected errors are caught and logged
+inside the daemon (one bad tick costs a backoff, not the backup), and if the
+daemon *process* ever dies, the boot wrapper restarts it
+(`HERMES_SYNC_DAEMON_RESTARTS` restarts before giving up).
+
+where the branch points before believing the failure — which is what the
+`Everything up-to-date` in that same error message is telling you.
 
 ### Configure the git backup
 
@@ -582,6 +638,15 @@ raise them if you would rather trade freshness for fewer commits. The
 `GIT_STATE_INTERVAL_SECONDS` sync is deliberately still there: a fingerprint
 is metadata-based, so an edit that rewrites a file to the same size within one
 mtime tick can slip past it.
+
+The upload is a real delta, not just a delta commit. The daemon remembers what
+it copied last time (size, mtime and mode per file) and re-copies only what
+changed, so a 30 MB session database that gained one message costs one small
+copy instead of re-reading the whole tree on every push. On a 512 MB Free
+instance that matters beyond bandwidth: re-reading every file per push spikes
+the daemon's memory by the size of the largest file, and when the OOM killer
+comes to reclaim it, it can just as well take the gateway — which is one way
+an agent ends up "stopping mid-session".
 
 #### What gets backed up, and what deliberately does not
 
@@ -694,6 +759,9 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
 | `Port scan timeout reached, no open ports detected`  | The container never bound `$PORT` inside Render's scan window, because the boot wrapper was still working when it expired. `[render-tools] state restore finished in Ns (source=...)` in the logs says how long the blocking part took; `HERMES_RESTORE_TIMEOUT_SECONDS` (240) caps it. The GitHub state seed is no longer part of it — a slow first push there used to eat the whole window, so it now runs in the sync daemon after the dashboard is up. |
 | Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
+| The agent stops answering mid-session, and the dashboard is slow or 502s until you open it | On Free, the service spun down: chat platforms are outbound-only, so a quiet dashboard lets the ~15-minute idle timer expire even while you are chatting. The bundled keep-alive prevents it (see **Keeping the service awake**); check the boot log for `keep-alive: requesting /api/status`. If it is present but the service still sleeps, make sure `HERMES_KEEP_ALIVE` has not been set to `0`. |
+| The last chat messages or file edits are missing after a restart | The final state push was cut off. Since the fix, the container stays up for `HERMES_SHUTDOWN_FLUSH_SECONDS` (20s) after the gateway exits so the sync daemon can land its last push — if you forked an older version of `bootstrap.sh`, the wrapper must supervise the entrypoint instead of `exec`-ing it. Anything older than that window was already on the branch; check `pushed state:` lines in the logs for the last successful save. |
+| `[render-tools] warning: sync daemon exited (status N); restarting` | The sync daemon process crashed; the wrapper restarted it (up to `HERMES_SYNC_DAEMON_RESTARTS` times). If it repeats, look one line up in the logs for the actual error. |
 | API keys or sessions disappear                      | Render's **Environment** tab is the durable fallback. If dashboard-managed keys, sessions, logs, and files must survive a cold start/redeploy, configure the git state sync (`GIT_STATE_REPO` + `GIT_STATE_TOKEN`). |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
