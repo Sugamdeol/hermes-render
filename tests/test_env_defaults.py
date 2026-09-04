@@ -17,6 +17,37 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def _duplicate_keys(path: Path) -> list[str]:
+    """Keys assigned more than once, in file order."""
+    seen: set[str] = set()
+    dupes: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key in seen and key not in dupes:
+            dupes.append(key)
+        seen.add(key)
+    return dupes
+
+
+def test_env_files_have_no_duplicate_keys():
+    """A repeated key is last-one-wins, so a duplicate silently changes what
+    the container runs -- and it reads as a typo nobody notices in review.
+
+    These files are edited by hand and by scripts, and the same knob has
+    landed twice in both of them already. seed-env.py emits one `export` per
+    assignment, so a duplicate is invisible until the value is wrong.
+    """
+    for path in (ROOT / "env" / "common.env", ROOT / ".env.example"):
+        assert not _duplicate_keys(path), (
+            f"{path.name} assigns the same key twice: "
+            f"{_duplicate_keys(path)}. Last one wins, which is a silent "
+            "behaviour change."
+        )
+
+
 def test_env_example_matches_boot_defaults_for_chat_and_free_tier_guards():
     common = _parse_env_file(ROOT / "env" / "common.env")
     example = _parse_env_file(ROOT / ".env.example")

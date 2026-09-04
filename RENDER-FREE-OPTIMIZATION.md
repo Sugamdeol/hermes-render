@@ -399,19 +399,30 @@ names the offending line if any ungated `_SlashWorker(` reappears.
 
 ## 9. Verification
 
-**243 tests pass across 12 files**, run file-by-file (whole-directory runs have
+**244 tests pass across 12 files**, run file-by-file (whole-directory runs have
 pre-existing cross-file pollution unrelated to this work):
 
 ```
 test_bootstrap_supervision.py   11 passed     test_git_storage.py        107 passed
 test_chat_dashboard_plugin.py    4 passed     test_patch_config.py        11 passed
 test_chat_dashboard_routes.py   36 passed     test_patch_model_discovery.py 2 passed
-test_env_defaults.py             1 passed     test_patch_session_cap.py    6 passed
+test_env_defaults.py             2 passed     test_patch_session_cap.py    6 passed
 test_plugin_api.py              31 passed     test_patch_slash_worker.py   7 passed (+3 subtests)
 test_seed_env.py                24 passed     test_patch_ws_session_cleanup.py 3 passed
 ```
 
 The `test_env_defaults.py` failure on the base commit is **fixed**.
+
+One more thing the end-to-end check caught: running `seed-env.py --knobs`
+against the real `env/common.env` — the production path that turns that file
+into `export` statements, which the bench bypassed by setting the variables
+directly — emitted `HERMES_KEEP_ALIVE_PATH` **twice**, and `.env.example` had
+two undocumented copies of the git memory knobs. Same value each time, so
+nothing was broken, but a repeated key is last-one-wins and reads as a typo
+nobody catches in review. Both files are clean now, and
+`test_env_files_have_no_duplicate_keys` fails the build if a knob lands twice
+again (verified red: adding a second `MALLOC_ARENA_MAX` fails it, naming the
+key). All 42 exported knobs now emit exactly once.
 
 Integration checks:
 - All four patch scripts apply cleanly and **idempotently** to a pristine
