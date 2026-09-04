@@ -1109,6 +1109,93 @@
 .hcd-toast button { border: 0; background: transparent; color: var(--hcd-muted); cursor: pointer; font-size: 15px; margin-left: auto; }
 @keyframes hcd-slide-in { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
 
+/* ── model picker ───────────────────────────────────────────────────── */
+
+.hcd-model-picker { position: relative; }
+.hcd-model-btn { max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+.hcd-model-pop {
+  position: absolute;
+  z-index: 40;
+  left: 0;
+  bottom: 38px;
+  width: min(320px, 78vw);
+  max-height: 380px;
+  display: flex;
+  flex-direction: column;
+  background: var(--hcd-panel-2);
+  border: 1px solid var(--hcd-border-strong);
+  border-radius: 14px;
+  box-shadow: var(--hcd-shadow);
+  overflow: hidden;
+}
+.hcd-model-search {
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid var(--hcd-border);
+  background: color-mix(in srgb, #000 22%, transparent);
+  color: inherit;
+  padding: 10px 12px;
+  outline: none;
+  font-size: 12.5px;
+}
+.hcd-model-list { overflow-y: auto; padding: 6px; }
+.hcd-model-group h5 {
+  margin: 8px 6px 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--hcd-muted);
+}
+.hcd-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 9px;
+  padding: 7px 9px;
+  font-size: 12.5px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+.hcd-model-row:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+.hcd-model-row.active { background: var(--hcd-accent-soft); border-color: color-mix(in srgb, var(--hcd-accent) 35%, transparent); }
+.hcd-model-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.hcd-model-row small { color: var(--hcd-muted); font-size: 11px; }
+.hcd-model-ctx { color: var(--hcd-muted); font-size: 10.5px; }
+.hcd-model-pin {
+  border: 0;
+  background: transparent;
+  color: var(--hcd-warn);
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.hcd-model-none { padding: 14px 10px; text-align: center; }
+
+/* ── settings chips + font sizes ────────────────────────────────────── */
+
+.hcd-setting-tools { align-items: flex-start; }
+.hcd-setting-chips { display: flex; flex-wrap: wrap; gap: 6px; max-width: 300px; }
+.hcd-chip {
+  border: 1px solid var(--hcd-border);
+  background: color-mix(in srgb, currentColor 4%, transparent);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  color: var(--hcd-muted);
+}
+.hcd-chip.on { border-color: color-mix(in srgb, var(--hcd-accent) 50%, transparent); background: var(--hcd-accent-soft); color: var(--hcd-accent); }
+
+.font-small .hcd-markdown { font-size: 13px; }
+.font-small .hcd-composer textarea { font-size: 13px; }
+.font-small .hcd-message { margin-bottom: 16px; }
+.font-large .hcd-markdown { font-size: 16px; }
+.font-large .hcd-composer textarea { font-size: 15px; }
+
 /* ── compact density ────────────────────────────────────────────────── */
 
 .compact .hcd-scroll { padding-top: 12px; }

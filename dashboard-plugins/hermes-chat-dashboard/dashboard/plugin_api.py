@@ -255,16 +255,19 @@ def _content_text(content: Any) -> str:
 
 
 @router.get("/sessions")
-async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0):
+async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = ""):
     """List stored conversations (works even when the gateway WebSocket is down).
 
     Mirrors the gateway's ``session.list`` shape (id/title/preview/started_at/
     message_count/source) so the UI can browse and open history without a live
-    TUI session.
+    TUI session.  ``q`` additionally runs a full-text search across message
+    content (via ``SessionDB.search_sessions`` when available) and merges the
+    matching sessions into the result, so stale titles never hide an old chat.
     """
     _require_session(request)
     limit = max(1, min(int(limit or 120), 500))
     offset = max(0, int(offset or 0))
+    query = str(q or "").strip()
     db = _session_db()
     try:
         rich = getattr(db, "list_sessions_rich", None)
@@ -290,7 +293,45 @@ async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0
                 "started_at": s.get("started_at") or s.get("created_at") or 0,
                 "message_count": s.get("message_count") or s.get("msg_count") or 0,
                 "source": s.get("source") or "",
+                "snippet": "",
             })
+
+        if query:
+            try:
+                hits = db.search_sessions(query) or []
+            except Exception:
+                hits = []
+            if hits:
+                by_id = {s["id"]: s for s in out}
+                merged = list(out)
+                for hit in hits:
+                    if not isinstance(hit, dict):
+                        continue
+                    sid = hit.get("session_id") or hit.get("id")
+                    if not sid:
+                        continue
+                    snippet = hit.get("snippet") or ""
+                    if sid in by_id:
+                        if snippet:
+                            by_id[sid]["snippet"] = snippet
+                        continue
+                    row = None
+                    try:
+                        row = db.get_session(sid)
+                    except Exception:
+                        row = None
+                    if not isinstance(row, dict):
+                        continue
+                    merged.append({
+                        "id": sid,
+                        "title": row.get("title") or "",
+                        "preview": row.get("preview") or row.get("summary") or snippet,
+                        "started_at": row.get("started_at") or row.get("created_at") or 0,
+                        "message_count": row.get("message_count") or row.get("msg_count") or 0,
+                        "source": row.get("source") or "",
+                        "snippet": snippet,
+                    })
+                out = sorted(merged, key=lambda s: s.get("started_at") or 0, reverse=True)[:limit]
         return {"sessions": out, "has_more": len(out) >= limit}
     finally:
         db.close()
@@ -389,7 +430,10 @@ async def get_settings(request: Request):
     defaults = {
         "density": "comfortable",
         "messageWidth": "wide",
+        "fontSize": "medium",
         "showTimestamps": True,
+        "showUsage": True,
+        "confirmDelete": False,
         "enterToSend": True,
         "autoScroll": True,
         "autoTitle": True,
@@ -398,8 +442,10 @@ async def get_settings(request: Request):
         "memoryEnabled": True,
         "temporaryDefault": False,
         "defaultMode": "fast",
+        "defaultModel": "",
         "defaultAgent": "auto",
         "defaultTools": [],
+        "pinnedModels": [],
     }
     saved = _read_json(SETTINGS_FILE, {})
     if isinstance(saved, dict):

@@ -611,7 +611,7 @@
 
   // ── message ─────────────────────────────────────────────────────────
 
-  function MessageView({ msg, index, active, onAction, showTime }) {
+  function MessageView({ msg, index, active, onAction, showTime, showUsage }) {
     const bodyRef = useRef(null);
     useEffect(() => {
       bindCopyButtons(bodyRef.current);
@@ -651,7 +651,7 @@
               h("pre", null, msg.reasoning),
             )
           : null,
-        msg.usage && msg.usage.total
+        msg.usage && msg.usage.total && showUsage !== false
           ? h("div", { className: "hcd-usage" },
               `${fmtTokens(msg.usage.input || 0)} in · ${fmtTokens(msg.usage.output || 0)} out · ${msg.usage.calls || 1} call${(msg.usage.calls || 1) === 1 ? "" : "s"} ${msg.usage.model ? `· ${msg.usage.model}` : ""}`)
           : null,
@@ -670,9 +670,103 @@
     );
   }
 
+  // ── model picker (searchable; pin to favourites) ────────────────────
+
+  function ModelPicker({ models, pinned, value, onChange, onPinnedChange, disabled }) {
+    const [open, setOpen] = useState(false);
+    const [q, setQ] = useState("");
+    const inputRef = useRef(null);
+    const wrapRef = useRef(null);
+
+    useEffect(() => {
+      if (open) {
+        setQ("");
+        setTimeout(() => inputRef.current && inputRef.current.focus(), 0);
+      }
+    }, [open]);
+
+    useEffect(() => {
+      if (!open) return;
+      const close = (e) => {
+        if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpen(false);
+      };
+      document.addEventListener("mousedown", close);
+      return () => document.removeEventListener("mousedown", close);
+    }, [open]);
+
+    const chosen = models.find((m) => m.id === value) || null;
+    const label = value === "auto" || !value ? "Auto" : `${chosen?.provider || ""}${chosen ? "/" : ""}${chosen?.name || chosen?.model || value}`;
+    const ql = q.trim().toLowerCase();
+    const pins = (Array.isArray(pinned) ? pinned : []).map((p) => String(p));
+    const list = models.slice(0, 400).filter((m) => !ql || `${m.provider} ${m.name} ${m.model}`.toLowerCase().includes(ql));
+    const pinnedList = list.filter((m) => pins.includes(m.id));
+    const rest = list.filter((m) => !pins.includes(m.id));
+
+    const row = (m) => h("div", {
+      key: m.id,
+      className: cn("hcd-model-row", m.id === value && "active"),
+      role: "button",
+      tabIndex: 0,
+      onClick: () => { onChange(m.id); setOpen(false); },
+      onKeyDown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onChange(m.id); setOpen(false); } },
+    },
+      h("span", { className: "hcd-model-name" }, m.name || m.model),
+      h("small", null, m.provider || ""),
+      m.context_window ? h("span", { className: "hcd-model-ctx" }, `${fmtTokens(m.context_window)} ctx`) : null,
+      h("button", {
+        type: "button",
+        className: "hcd-model-pin",
+        title: pins.includes(m.id) ? "Unpin from favourites" : "Pin to favourites",
+        onClick: (e) => {
+          e.stopPropagation();
+          const next = pins.includes(m.id) ? pins.filter((p) => p !== m.id) : [...pins, m.id];
+          if (onPinnedChange) onPinnedChange(next);
+        },
+      }, pins.includes(m.id) ? "★" : "☆"),
+    );
+
+    return h(
+      "div",
+      { className: cn("hcd-model-picker", open && "open"), ref: wrapRef },
+      h("button", {
+        className: "hcd-ctl-btn hcd-model-btn",
+        onClick: () => setOpen((v) => !v),
+        disabled,
+        title: "Choose model",
+      },
+        "🧠 ", label, " ▾"),
+      open
+        ? h("div", { className: "hcd-model-pop" },
+            h("input", {
+              ref: inputRef,
+              className: "hcd-model-search",
+              value: q,
+              onChange: (e) => setQ(e.target.value),
+              placeholder: "Search models…",
+            }),
+            h("div", { className: "hcd-model-list" },
+              h("div", {
+                className: cn("hcd-model-row", value === "auto" && "active"),
+                role: "button",
+                tabIndex: 0,
+                onClick: () => { onChange("auto"); setOpen(false); },
+              },
+                h("span", { className: "hcd-model-name" }, "Auto"), h("small", null, "let Hermes decide")),
+              pinnedList.length
+                ? h("div", { className: "hcd-model-group" }, h("h5", null, "★ Favourites"), pinnedList.map(row))
+                : null,
+              rest.length
+                ? h("div", { className: "hcd-model-group" }, pinnedList.length && h("h5", null, "All models"), rest.map(row))
+                : h("div", { className: "hcd-empty-small hcd-model-none" }, "No models match"),
+            ),
+          )
+        : null,
+    );
+  }
+
   // ── composer ────────────────────────────────────────────────────────
 
-  function Composer({ disabled, readOnly, modes, models, agents, toolsets, selected, setSelected, attachments, setAttachments, onSend, onStop, generating, onBackground, draftSeed, clearDraft, gatewayStatus, onRetryConnect, onUndo, canUndo }) {
+  function Composer({ disabled, readOnly, modes, models, agents, toolsets, selected, setSelected, attachments, setAttachments, onSend, onStop, generating, onBackground, draftSeed, clearDraft, gatewayStatus, onRetryConnect, onUndo, canUndo, pinnedModels, onSetPinnedModels, onModelChange }) {
     const [text, setText] = useState("");
     const [toolsOpen, setToolsOpen] = useState(false);
     const [drag, setDrag] = useState(false);
@@ -781,15 +875,14 @@
             onChange: (e) => setSelected((s) => ({ ...s, mode: e.target.value })),
           }, modes.map((m) => h("option", { value: m.id, key: m.id }, `${m.emoji || ""} ${m.label}`))),
         ),
-        h("label", { className: "hcd-ctl" }, "Model",
-          h("select", {
-            value: selected.model,
-            onChange: (e) => setSelected((s) => ({ ...s, model: e.target.value })),
-          },
-            h("option", { value: "auto" }, "Auto"),
-            models.slice(0, 250).map((m) => h("option", { value: m.id, key: m.id }, `${m.provider || ""}/${m.name || m.model}`)),
-          ),
-        ),
+        h(ModelPicker, {
+          models,
+          pinned: pinnedModels,
+          value: selected.model,
+          disabled,
+          onChange: (v) => (onModelChange ? onModelChange(v) : setSelected((s) => ({ ...s, model: v, model_label: undefined }))),
+          onPinnedChange: onSetPinnedModels,
+        }),
         h("label", { className: "hcd-ctl" }, "Agent",
           h("select", {
             value: selected.agent,
@@ -899,6 +992,8 @@
         h("button", { onClick: () => { onMeta(s.id, { pinned: !meta[s.id]?.pinned }); setMenuFor(null); } }, meta[s.id]?.pinned ? "📌 Unpin" : "📌 Pin"),
         h("button", { onClick: () => { onMeta(s.id, { starred: !meta[s.id]?.starred }); setMenuFor(null); } }, meta[s.id]?.starred ? "★ Unstar" : "☆ Star"),
         h("button", { onClick: () => { const title = window.prompt("Rename conversation", s.title || ""); if (title && title.trim()) onRename(s.id, title.trim()); setMenuFor(null); } }, "✏️ Rename"),
+        h("button", { onClick: () => { const folder = window.prompt("Folder name (empty to remove)", meta[s.id]?.folder || ""); if (folder !== null) onMeta(s.id, { folder: folder.trim() }); setMenuFor(null); } }, meta[s.id]?.folder ? `📁 ${meta[s.id].folder}` : "📁 Folder…"),
+        h("button", { onClick: () => { const tags = window.prompt("Tags (comma separated)", (meta[s.id]?.tags || []).join(", ")); if (tags !== null) onMeta(s.id, { tags: tags.split(",").map((t) => t.trim()).filter(Boolean) }); setMenuFor(null); } }, meta[s.id]?.tags?.length ? `🏷️ ${meta[s.id].tags.length} tag${meta[s.id].tags.length === 1 ? "" : "s"}` : "🏷️ Tags…"),
         h("button", { onClick: () => { onMeta(s.id, { archived: !meta[s.id]?.archived }); setMenuFor(null); } }, meta[s.id]?.archived ? "↩️ Unarchive" : "🗄️ Archive"),
         confirmDelete === s.id
           ? h("button", { className: "danger", onClick: () => { onDelete(s.id); setConfirmDelete(null); setMenuFor(null); } }, "⚠️ Confirm delete")
@@ -930,13 +1025,19 @@
                   h("h4", null, label),
                   arr.map((s) => {
                     const active = currentKey === s.id;
+                    const m_ = meta[s.id] || {};
                     return h("div", { key: s.id, className: cn("hcd-conv-wrap", active && "active") },
                       h("button", { className: cn("hcd-conv", active && "active"), onClick: () => onOpen(s.id) },
-                        h("span", { className: "hcd-conv-title" }, meta[s.id]?.pinned ? "📌 " : meta[s.id]?.starred ? "★ " : "", s.title || s.preview || "Untitled chat"),
-                        h("span", { className: "hcd-conv-preview" }, s.preview || s.id),
+                        h("span", { className: "hcd-conv-title" },
+                          m_.pinned ? "📌 " : m_.starred ? "★ " : "",
+                          m_.folder ? `📁 ` : "",
+                          s.title || s.preview || "Untitled chat"),
+                        h("span", { className: "hcd-conv-preview" },
+                          s.snippet ? `“${s.snippet}”` : s.preview || s.id),
                         h("span", { className: "hcd-conv-meta" },
                           relTime(s.started_at),
                           num(s.message_count) ? ` · ${s.message_count} msg` : "",
+                          m_.tags && m_.tags.length ? ` · 🏷️ ${m_.tags.join(", ")}` : "",
                         ),
                       ),
                       h("button", { className: "hcd-conv-more", onClick: (e) => { e.stopPropagation(); setMenuFor(menuFor === s.id ? null : s.id); }, title: "More actions" }, "⋯"),
@@ -1021,7 +1122,7 @@
 
   // ── settings modal ──────────────────────────────────────────────────
 
-  function SettingsModal({ settings, setSettings, onClose }) {
+  function SettingsModal({ settings, setSettings, modes, models, agents, toolsets, onClose }) {
     const update = (patch) => {
       const next = { ...settings, ...patch };
       setSettings(next);
@@ -1032,37 +1133,63 @@
         h("input", { type: "checkbox", checked: !!checked, onChange: (e) => onChange(e.target.checked) }),
         h("span", null, label, hint && h("small", null, hint)),
       );
+    const Select = ({ label, value, onChange, children }) =>
+      h("label", { className: "hcd-setting-row" },
+        h("span", null, label),
+        h("select", { value, onChange: (e) => onChange(e.target.value) }, children),
+      );
 
     return h("div", { className: "hcd-modal", onClick: (e) => e.target === e.currentTarget && onClose() },
       h("div", { className: "hcd-settings" },
         h("button", { className: "hcd-x", onClick: onClose }, "×"),
         h("h2", null, "Chat settings"),
+        h("h3", null, "Defaults for new chats"),
+        Select({ label: "Default mode", value: settings.defaultMode || "fast", onChange: (v) => update({ defaultMode: v }) },
+          modes.map((m) => h("option", { value: m.id, key: m.id }, `${m.emoji || ""} ${m.label}`))),
+        Select({ label: "Default model", value: settings.defaultModel || "auto", onChange: (v) => update({ defaultModel: v }) },
+          h("option", { value: "auto" }, "Auto"),
+          models.slice(0, 250).map((m) => h("option", { value: m.id, key: m.id }, `${m.provider || ""}/${m.name || m.model}`))),
+        Select({ label: "Default agent", value: settings.defaultAgent || "auto", onChange: (v) => update({ defaultAgent: v }) },
+          agents.map((a) => h("option", { value: a.id, key: a.id }, a.label))),
+        h("label", { className: "hcd-setting-row hcd-setting-tools" },
+          h("span", null, "Default toolsets"),
+          h("div", { className: "hcd-setting-chips" },
+            toolsets.map((t) => {
+              const id = t.id || t.name;
+              const on = (settings.defaultTools || []).includes(id);
+              return h("button", {
+                key: id,
+                className: cn("hcd-chip", on && "on"),
+                onClick: () => update({ defaultTools: on ? (settings.defaultTools || []).filter((x) => x !== id) : [...new Set([...(settings.defaultTools || []), id])] }),
+              }, toolIcon(id), " ", t.label || t.name);
+            }),
+          ),
+        ),
         h("h3", null, "Appearance"),
-        h("label", { className: "hcd-setting-row" },
-          h("span", null, "Density"),
-          h("select", { value: settings.density, onChange: (e) => update({ density: e.target.value }) },
-            h("option", { value: "comfortable" }, "Comfortable"),
-            h("option", { value: "compact" }, "Compact"),
-          ),
-        ),
-        h("label", { className: "hcd-setting-row" },
-          h("span", null, "Message width"),
-          h("select", { value: settings.messageWidth || "wide", onChange: (e) => update({ messageWidth: e.target.value }) },
-            h("option", { value: "narrow" }, "Narrow"),
-            h("option", { value: "wide" }, "Wide"),
-            h("option", { value: "full" }, "Full"),
-          ),
-        ),
+        Select({ label: "Density", value: settings.density, onChange: (v) => update({ density: v }) },
+          h("option", { value: "comfortable" }, "Comfortable"),
+          h("option", { value: "compact" }, "Compact")),
+        Select({ label: "Message width", value: settings.messageWidth || "wide", onChange: (v) => update({ messageWidth: v }) },
+          h("option", { value: "narrow" }, "Narrow"),
+          h("option", { value: "wide" }, "Wide"),
+          h("option", { value: "full" }, "Full")),
+        Select({ label: "Font size", value: settings.fontSize || "medium", onChange: (v) => update({ fontSize: v }) },
+          h("option", { value: "small" }, "Small"),
+          h("option", { value: "medium" }, "Medium"),
+          h("option", { value: "large" }, "Large")),
         Toggle({ label: "Show timestamps", checked: settings.showTimestamps, onChange: (v) => update({ showTimestamps: v }) }),
-        Toggle({ label: "Auto-scroll to newest message", checked: settings.autoScroll !== false, onChange: (v) => update({ autoScroll: v }) }),
+        Toggle({ label: "Show token usage", checked: settings.showUsage !== false, onChange: (v) => update({ showUsage: v }) }),
         Toggle({ label: "Show reasoning blocks", checked: settings.showReasoning !== false, onChange: (v) => update({ showReasoning: v }) }),
+        Toggle({ label: "Auto-scroll to newest message", checked: settings.autoScroll !== false, onChange: (v) => update({ autoScroll: v }) }),
         h("h3", null, "Behaviour"),
         Toggle({ label: "Enter sends (Shift+Enter = newline)", checked: settings.enterToSend !== false, onChange: (v) => update({ enterToSend: v }) }),
         Toggle({ label: "Auto-select tools", checked: settings.autoTools !== false, onChange: (v) => update({ autoTools: v }) }),
         Toggle({ label: "Auto-title conversations", hint: "Hermes names chats after the first message.", checked: settings.autoTitle !== false, onChange: (v) => update({ autoTitle: v }) }),
+        Toggle({ label: "Confirm before deleting a session", checked: !!settings.confirmDelete, onChange: (v) => update({ confirmDelete: v }) }),
         h("h3", null, "Privacy"),
         Toggle({ label: "Save history", checked: settings.saveHistory !== false, onChange: (v) => update({ saveHistory: v }) }),
         Toggle({ label: "Use long-term memory", checked: settings.memoryEnabled !== false, onChange: (v) => update({ memoryEnabled: v }) }),
+        Toggle({ label: "New chats are temporary by default", checked: !!settings.temporaryDefault, onChange: (v) => update({ temporaryDefault: v }) }),
         h("p", { className: "hcd-settings-note" }, "Preferences are stored per browser on this device and synced to the server for this plugin."),
       ),
     );
@@ -1138,7 +1265,7 @@
     const [error, setError] = useState("");
     const [toasts, setToasts] = useState([]);
     const [cap, setCap] = useState({ modes: [], models: [], agents: [], toolsets: [], features: {} });
-    const [settings, setSettings] = useState({ enterToSend: true, autoTools: true, memoryEnabled: true, showTimestamps: true, autoScroll: true, showReasoning: true, messageWidth: "wide", density: "comfortable" });
+    const [settings, setSettings] = useState({ enterToSend: true, autoTools: true, memoryEnabled: true, showTimestamps: true, autoScroll: true, showReasoning: true, messageWidth: "wide", density: "comfortable", fontSize: "medium", showUsage: true, confirmDelete: false, defaultMode: "fast", defaultModel: "", defaultAgent: "auto", defaultTools: [], temporaryDefault: false, pinnedModels: [] });
     const [selected, setSelected] = useState({ sessionId: "", sessionKey: "", mode: "fast", model: "auto", agent: "auto", tools: [], autoTools: true, temporary: false, memoryEnabled: true, enterToSend: true });
     const [readOnly, setReadOnly] = useState(false);
     const [sessions, setSessions] = useState([]);
@@ -1177,11 +1304,14 @@
     // ── sessions (REST-backed; independent of the gateway) ────────────
 
     const refreshSessions = useCallback(async (opts = {}) => {
-      const { offset = 0, quiet = false } = opts;
+      const { offset = 0, quiet = false, search = "" } = opts;
       setLoadingSessions((v) => (offset === 0 ? true : v));
       try {
+        const qs = new URLSearchParams({ limit: "200", offset: String(offset) });
+        const q = String(search || "").trim();
+        if (q.length >= 2) qs.set("q", q);
         const [listRes, metaRes] = await Promise.all([
-          fetchJSON(`${BASE}/sessions?limit=200&offset=${offset}`),
+          fetchJSON(`${BASE}/sessions?${qs}`),
           fetchJSON(`${BASE}/metadata`),
         ]);
         const rows = (listRes.sessions || []);
@@ -1210,6 +1340,15 @@
       return () => { clearInterval(poll); window.removeEventListener("focus", onFocus); };
     }, [refreshSessions]);
 
+    // Debounced server-side full-text search across message content.
+    useEffect(() => {
+      const q = query.trim();
+      const timer = setTimeout(() => {
+        refreshSessions({ quiet: true, search: q });
+      }, 300);
+      return () => clearTimeout(timer);
+    }, [query, refreshSessions]);
+
     // ── gateway boot ──────────────────────────────────────────────────
 
     useEffect(() => {
@@ -1226,6 +1365,9 @@
           setSelected((s) => ({
             ...s,
             mode: st.defaultMode || "fast",
+            model: st.defaultModel || "auto",
+            agent: st.defaultAgent || "auto",
+            tools: Array.isArray(st.defaultTools) ? st.defaultTools : [],
             autoTools: st.autoTools !== false,
             temporary: !!st.temporaryDefault,
             memoryEnabled: st.memoryEnabled !== false,
@@ -1497,7 +1639,7 @@
       try { if (strategy.fast !== undefined) await gwRef.current.request("config.set", { session_id: sid, key: "fast", value: strategy.fast ? "fast" : "normal" }, 30000); } catch { /* non-fatal */ }
       try { if (strategy.yolo) await gwRef.current.request("config.set", { session_id: sid, key: "yolo", value: "on" }, 30000); } catch { /* non-fatal */ }
       const sel = selectedRef.current;
-      if (sel.model && sel.model !== "auto") {
+      if (sel.model && sel.model !== "auto" && !sel.model_label) {
         const m = cap.models.find((x) => x.id === sel.model);
         if (m) {
           try { await gwRef.current.request("config.set", { session_id: sid, key: "model", value: `${m.provider}:${m.model || m.name}` }, 60000); }
@@ -1508,6 +1650,33 @@
         try { await gwRef.current.request("tools.configure", { session_id: sid, action: "enable", names: sel.tools }, 60000); } catch { /* non-fatal */ }
       }
       return mode;
+    };
+
+    // Live model switching: applies to the active gateway session immediately;
+    // for a fresh chat it is persisted when the first message is sent.
+    const changeModel = async (mid) => {
+      setSelected((s) => ({ ...s, model: mid }));
+      const sid = selectedRef.current.sessionId;
+      if (!sid || mid === "auto") return;
+      const m = cap.models.find((x) => x.id === mid);
+      if (!m) return;
+      if (generating) {
+        toast("Model change will apply to the next message", "info");
+        return;
+      }
+      try {
+        await gwRef.current.request("config.set", { session_id: sid, key: "model", value: `${m.provider}:${m.model || m.name}` }, 60000);
+        setSelected((s) => ({ ...s, model_label: `${m.provider}/${m.model || m.name}` }));
+        toast(`Model switched to ${m.name || m.model}`, "info");
+      } catch (e) {
+        toast(`Model switch failed: ${e.message}`, "error");
+      }
+    };
+
+    const setPinnedModels = (pins) => {
+      const next = { ...settingsRef.current, pinnedModels: Array.isArray(pins) ? pins : [] };
+      setSettings(next);
+      fetchJSON(`${BASE}/settings`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(next) }).catch(() => {});
     };
 
     const composePrompt = (text) => {
@@ -1688,6 +1857,7 @@
     };
 
     const onDelete = async (sid) => {
+      if (settingsRef.current.confirmDelete && !window.confirm("Delete this conversation permanently?")) return;
       const active = selectedRef.current.sessionKey === sid && selectedRef.current.sessionId;
       try {
         if (active) {
@@ -1888,7 +2058,7 @@
         })
       : h("strong", { title: "Double-click to rename", onDoubleClick: () => currentKey && setTitleInput(title) }, title);
 
-    return h("div", { className: cn("hcd-root", settings.density === "compact" && "compact", settings.messageWidth === "narrow" && "narrow", settings.messageWidth === "full" && "full") },
+    return h("div", { className: cn("hcd-root", settings.density === "compact" && "compact", settings.messageWidth === "narrow" && "narrow", settings.messageWidth === "full" && "full", settings.fontSize === "small" && "font-small", settings.fontSize === "large" && "font-large") },
       h(SessionSidebar, {
         sessions, meta, currentKey, query, setQuery, filter, setFilter,
         onNew: newChat, onOpen: openSession, onMeta, onRename, onDelete,
@@ -1917,6 +2087,7 @@
                 messages.map((m, i) => h(MessageView, {
                   key: m.id || i, msg: m, index: i, active: m.streaming,
                   onAction: msgAction, showTime: settings.showTimestamps !== false,
+                  showUsage: settings.showUsage !== false,
                 })),
                 tools.length
                   ? h("div", { className: "hcd-tools-inline" },
@@ -1943,6 +2114,9 @@
           gatewayStatus: conn, onRetryConnect: retryConnect,
           onUndo: undo,
           canUndo: messages.length > 0 && !!selected.sessionId,
+          pinnedModels: settings.pinnedModels || [],
+          onSetPinnedModels: setPinnedModels,
+          onModelChange: changeModel,
         }),
       ),
       h(RightPanel, {
@@ -1954,7 +2128,11 @@
         onExport: exportChat, onShare: shareChat, onDeleteCurrent: () => currentKey && onDelete(currentKey),
         onRenameCurrent: renameCurrent, onRespondPrompt: respondPrompt,
       }),
-      showSettings && h(SettingsModal, { settings, setSettings, onClose: () => setShowSettings(false) }),
+      showSettings && h(SettingsModal, {
+        settings, setSettings,
+        modes: cap.modes, models: cap.models, agents: cap.agents, toolsets: cap.toolsets,
+        onClose: () => setShowSettings(false),
+      }),
       h(ToastStack, { toasts, dismiss: (id) => setToasts((ts) => ts.filter((t) => t.id !== id)) }),
       h("div", { className: cn("hcd-mobile-drawer", mobileSide && "open") },
         h(SessionSidebar, {
