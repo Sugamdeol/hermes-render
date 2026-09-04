@@ -148,9 +148,53 @@ def _reap_stale_fixtures() -> None:
                 pass
 
 
+def _live_hermes_conflicts() -> list[str]:
+    """Describe running processes that would satisfy bootstrap's own needles.
+
+    bootstrap.sh finds its children by substring-matching /proc/*/cmdline
+    against needles such as "hermes dashboard" and "hermes gateway". That scan
+    is whole-machine and cannot be namespaced from a test, so if a *real*
+    Hermes is running on this host -- a developer's local stack, an
+    integration run left up in another terminal -- the watchdog under test
+    sees that process, concludes a dashboard is already up, and never starts
+    its own. The resulting failure looks like a supervision bug and is not
+    one.
+
+    This suite's own fixtures are named ``fake-hermes`` and are excluded, so a
+    test running concurrently in its own sandbox does not cause a skip.
+    """
+    found: list[str] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cmdline = (
+                Path(f"/proc/{entry}/cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        if "fake-hermes" in cmdline:
+            continue
+        for needle in ("hermes dashboard", "hermes gateway"):
+            if needle in cmdline:
+                found.append(f"pid={entry} {cmdline.strip()[:80]}")
+                break
+    return found
+
+
 class BootstrapSupervisionTests(unittest.TestCase):
     def setUp(self):
         _reap_stale_fixtures()
+        conflicts = _live_hermes_conflicts()
+        if conflicts:
+            self.skipTest(
+                "a real Hermes is running on this host, so bootstrap's "
+                "whole-machine /proc scan would match it instead of this "
+                "test's fixtures; stop it and re-run: " + "; ".join(conflicts)
+            )
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-boot-sup-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
@@ -390,6 +434,15 @@ class _GuardHarness(unittest.TestCase):
 
     def setUp(self):
         _reap_stale_fixtures()
+        conflicts = _live_hermes_conflicts()
+        if conflicts:
+            self.skipTest(
+                "a real Hermes is running on this host and bootstrap's "
+                "whole-machine /proc scan would match it; the guard's "
+                "EMERGENCY stage kills whatever that scan returns, so these "
+                "tests could terminate a live dashboard. Stop it and "
+                "re-run: " + "; ".join(conflicts)
+            )
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-oom-guard-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
