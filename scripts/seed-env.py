@@ -1,12 +1,25 @@
 #!/opt/hermes/.venv/bin/python
-"""Merge repo-managed secrets into Hermes' runtime environment.
+"""Merge repo-managed environment into Hermes' runtime environment.
 
-The Blueprint's durable source for secrets is Render's Environment tab. This
-script adds a second, version-controlled source: a SOPS-encrypted dotenv file
-committed to the repo (`env/secrets.enc.env`), decrypted at boot by
-bootstrap.sh and piped in here.
+Two kinds of input, with deliberately different handling:
 
-Precedence, highest first:
+--secrets FILE   Credentials: the SOPS-encrypted dotenv committed to the repo
+                 (`env/secrets.enc.env`), decrypted at boot by bootstrap.sh and
+                 piped in here. These are merged into $HERMES_HOME/.env so the
+                 dashboard's API Keys tab sees them and they survive restarts.
+
+--knobs FILE     Non-secret deploy knobs (`env/common.env`: ports, dashboard
+                 flags, thread caps, cache sizes). These are exported for the
+                 gateway/dashboard processes but NEVER written to
+                 $HERMES_HOME/.env, and any copy of them already sitting in
+                 that file is removed. Upstream Hermes loads .env with
+                 override=True on every start, so a knob persisted there would
+                 outrank Render's Environment tab -- which is how a stale
+                 `HERMES_DASHBOARD_TUI=0`, seeded by an older image and carried
+                 along in the state backup, kept the Chat tab disabled after
+                 the operator had set the variable to 1.
+
+Precedence for secrets, highest first:
 
   1. The real process environment. Render's Environment tab and anything you
      export locally always win; repo values never override a live deploy knob.
@@ -18,18 +31,23 @@ Precedence, highest first:
 Pass --force to invert rule 2 and make the repo authoritative over the .env
 file, which is what you want when rotating a key in git.
 
-The merge is line-preserving: comments, ordering, and unmanaged keys in the
-existing .env are kept as-is, and only missing keys are appended under a
-marked block.
+Precedence for knobs is simply: process environment, then the repo file. The
+.env file does not take part, because it is not allowed to hold them.
 
-Two outputs:
-  * The merged .env is written back to disk (0600).
+The secrets merge is line-preserving: comments, ordering, and unmanaged keys in
+the existing .env are kept as-is, and only missing keys are appended under a
+marked block. The knob eviction is equally surgical: only assignments of the
+listed keys are dropped, everything else is left byte-for-byte.
+
+Outputs:
+  * --secrets: the merged .env is written back to disk (0600).
+  * --knobs: the .env is rewritten (0600) only when a stale knob was removed.
   * With --print-exports, shell-quoted assignments are written to stdout for
-    variables that are neither in the process environment nor already owned by
-    the .env file, so the caller can eval them into the gateway's environment.
-    Exporting a repo value for a key the .env already defines would invert
-    rule 2, since a dotenv loader will not override a variable that is already
-    set in the environment. config.yaml's ${RENDER_MCP_API_KEY}
+    variables the process environment lacks (and, for secrets, that the .env
+    file does not already own), so the caller can eval them into the gateway's
+    environment. Exporting a repo secret for a key the .env already defines
+    would invert rule 2, since a dotenv loader will not override a variable
+    that is already set in the environment. config.yaml's ${RENDER_MCP_API_KEY}
     substitution reads the process env, so this is what makes MCP auth work.
 
 Never log the values. stdout is meant for `eval`, not for a terminal.
@@ -125,6 +143,65 @@ def merge(env_text: str, secrets: "list[tuple[str, str]]", *, force: bool) -> "t
     return env_text + "\n".join(block) + "\n", added
 
 
+def evict_keys(env_text: str, keys: "set[str]") -> "tuple[str, list[str]]":
+    """Return (new_env_text, keys_removed) with every assignment of `keys` dropped.
+
+    Line-preserving otherwise: comments, blank lines, ordering, and every other
+    assignment survive untouched. If the managed block header is left with no
+    assignments under it, it is dropped too, so repeated boots do not leave a
+    trail of orphaned headers behind.
+    """
+    if not keys:
+        return env_text, []
+
+    removed: list[str] = []
+    lines_out: list[str] = []
+    for raw in env_text.splitlines():
+        stripped = raw.strip()
+        candidate = stripped[len("export "):].lstrip() if stripped.startswith("export ") else stripped
+        if stripped and not stripped.startswith("#") and "=" in candidate:
+            key = candidate.split("=", 1)[0].strip()
+            if key in keys:
+                if key not in removed:
+                    removed.append(key)
+                continue
+        lines_out.append(raw)
+
+    if not removed:
+        return env_text, []
+
+    lines_out = _prune_empty_managed_blocks(lines_out)
+    new_text = "\n".join(lines_out)
+    if not new_text.strip():
+        return "", removed
+    if not new_text.endswith("\n"):
+        new_text += "\n"
+    return new_text, removed
+
+
+def _prune_empty_managed_blocks(lines: "list[str]") -> "list[str]":
+    """Drop a MANAGED_HEADER line when no assignment follows it before the next
+    header or end of file -- i.e. when eviction emptied the block it introduced."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == MANAGED_HEADER:
+            j = i + 1
+            has_assignment = False
+            while j < len(lines) and lines[j].strip() != MANAGED_HEADER:
+                s = lines[j].strip()
+                if s and not s.startswith("#"):
+                    has_assignment = True
+                    break
+                j += 1
+            if not has_assignment:
+                i += 1
+                continue
+        out.append(lines[i])
+        i += 1
+    return out
+
+
 def read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -148,10 +225,61 @@ def write_env(path: Path, text: str) -> bool:
         return False
 
 
+def _read_source(arg: str, label: str) -> "list[tuple[str, str]] | None":
+    """Parse a dotenv source given as a path or `-` (stdin). None = nothing to do."""
+    if arg == "-":
+        text = sys.stdin.read()
+    else:
+        path = Path(arg)
+        if not path.exists():
+            print(f"[render-tools] no repo {label} file; skipping", file=sys.stderr)
+            return None
+        text = read_text(path)
+    pairs = parse_dotenv(text)
+    # An empty placeholder value means "declared but not set"; skip it so a
+    # scaffolded key never blanks out a real one.
+    pairs = [(k, v) for k, v in pairs if v != ""]
+    if not pairs:
+        print(f"[render-tools] repo {label} file has no values; skipping", file=sys.stderr)
+        return None
+    return pairs
+
+
+def run_knobs(knobs: "list[tuple[str, str]]", env_path: Path, *, print_exports: bool) -> int:
+    """Export non-secret knobs and make sure the .env file does not carry them.
+
+    The .env file is loaded by every Hermes process with override=True, so a
+    knob left in there would beat Render's Environment tab on the next start.
+    Removing stale copies here is what lets the Environment tab (and this
+    repo's env/common.env) actually control values such as
+    HERMES_DASHBOARD_TUI on an instance whose .env was seeded by an older
+    image or restored from the state backup.
+    """
+    env_text = read_text(env_path)
+    new_text, removed = evict_keys(env_text, {k for k, _ in knobs})
+    if removed:
+        if not write_env(env_path, new_text):
+            return 1
+        print(f"[render-tools] removed {len(removed)} deploy knob(s) from {env_path} "
+              f"(the process environment owns them): {', '.join(sorted(removed))}",
+              file=sys.stderr)
+
+    if print_exports:
+        for key, value in knobs:
+            if os.environ.get(key):
+                continue  # the live environment always wins
+            sys.stdout.write(f"export {key}={shlex.quote(value)}\n")
+    return 0
+
+
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--secrets", required=True,
-                        help="decrypted dotenv file, or - to read stdin")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--secrets",
+                        help="decrypted dotenv of credentials to merge into .env, or - for stdin")
+    source.add_argument("--knobs",
+                        help="dotenv of non-secret deploy knobs to export but keep OUT of .env, "
+                             "or - for stdin")
     parser.add_argument("--env-file", required=True,
                         help="target .env, normally $HERMES_HOME/.env")
     parser.add_argument("--force", action="store_true",
@@ -160,21 +288,14 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="write shell-quoted exports for vars missing from the process env")
     args = parser.parse_args(argv)
 
-    if args.secrets == "-":
-        secrets_text = sys.stdin.read()
-    else:
-        secrets_path = Path(args.secrets)
-        if not secrets_path.exists():
-            print("[render-tools] no repo secrets file; skipping", file=sys.stderr)
+    if args.knobs is not None:
+        knobs = _read_source(args.knobs, "knobs")
+        if knobs is None:
             return 0
-        secrets_text = read_text(secrets_path)
+        return run_knobs(knobs, Path(args.env_file), print_exports=args.print_exports)
 
-    secrets = parse_dotenv(secrets_text)
-    # An empty placeholder value means "declared but not set"; skip it so a
-    # scaffolded key never blanks out a real one.
-    secrets = [(k, v) for k, v in secrets if v != ""]
-    if not secrets:
-        print("[render-tools] repo secrets file has no values; skipping", file=sys.stderr)
+    secrets = _read_source(args.secrets, "secrets")
+    if secrets is None:
         return 0
 
     env_path = Path(args.env_file)
