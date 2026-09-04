@@ -87,7 +87,15 @@ elapsed_boot_seconds() {
 
 # A hung download would otherwise hold the boot open indefinitely. Set to 0 to
 # wait for the backend no matter how long it takes.
-RESTORE_TIMEOUT="${HERMES_RESTORE_TIMEOUT_SECONDS:-240}"
+#
+# 90s, not the 240s this used to be: everything above the port bind is inside
+# Render's port-scan window, and a restore that is allowed to run for four
+# minutes (240s x the old 2 attempts) is a deploy that fails with "Port scan
+# timeout reached, no open ports detected" -- the worst possible outcome,
+# because it costs the restored state AND the deploy. A restore that does not
+# finish in 90s is a restore that should be retried on the next boot, not one
+# that should gamble the whole deploy.
+RESTORE_TIMEOUT="${HERMES_RESTORE_TIMEOUT_SECONDS:-90}"
 
 run_bounded() {
   # $@ = command, run under `timeout` when one is configured and available.
@@ -126,7 +134,7 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
       # Each attempt is individually bounded by RESTORE_TIMEOUT; the retry
       # only happens when the boot is still fast enough to keep the port
       # scan happy.
-      restore_attempts="${HERMES_RESTORE_ATTEMPTS:-2}"
+      restore_attempts="${HERMES_RESTORE_ATTEMPTS:-1}"
       [ "${restore_attempts}" -ge 1 ] 2>/dev/null || restore_attempts=1
       restore_attempt=1
       while :; do
@@ -404,13 +412,23 @@ fi
 # daemon that nobody restarts is exactly how "github files are not synced"
 # happens -- the logs keep saying everything is fine until the next restart.
 GIT_DAEMON_PIDFILE="${TMPDIR:-/tmp}/render-tools-git-daemon.pid"
+# Written by the memory guard when it stops the daemon under CRITICAL
+# pressure; the supervisor sees it and holds off restarting until the guard
+# clears it. Without this the supervisor would immediately undo the reclaim.
+GIT_DAEMON_HOLD_FILE="${TMPDIR:-/tmp}/render-tools-git-daemon.hold"
 GIT_DAEMON_SUPERVISOR=""
+rm -f "${GIT_DAEMON_HOLD_FILE}" 2>/dev/null || true
 if [ "${GIT_BACKEND}" -eq 1 ]; then
   rm -f "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true
   (
     daemon_attempts=0
     max_restarts="${HERMES_SYNC_DAEMON_RESTARTS:-20}"
     while :; do
+      # The memory guard stopped the daemon on purpose. Wait it out rather
+      # than restarting into the same pressure that stopped it.
+      while [ -f "${GIT_DAEMON_HOLD_FILE}" ]; do
+        sleep 10
+      done
       gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
       daemon_pid=$!
       echo "${daemon_pid}" > "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true
@@ -450,7 +468,18 @@ fi
 # runs on Render (no external URL, no loop), costs one small request per
 # interval, and is disabled with HERMES_KEEP_ALIVE=0.
 KEEP_ALIVE_URL="${RENDER_EXTERNAL_URL:-}"
-if [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ]; then
+# The cheapest endpoint the container serves: a plugin route that answers
+# "process is alive" without touching the session database, the config or the
+# gateway. /api/status is what the dashboard UI polls, and it is measurably
+# expensive on 0.1 CPU (180-700 ms per call: it re-parses config.yaml, loads
+# the gateway config and opens SQLite to count recent sessions), so nothing
+# here should be pointing at it on a timer.
+KEEP_ALIVE_PATH="${HERMES_KEEP_ALIVE_PATH:-/api/plugins/hermes-chat-dashboard/health}"
+if [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ] \
+   && [ "${HERMES_MEMGUARD:-1}" != "1" ]; then
+  # Only when the memory guard is NOT running: the guard loop already owns
+  # this tick (see mg_housekeeping), and a second loop here would mean a
+  # second process and a second sleep doing the same job.
   keep_alive_interval="${HERMES_KEEP_ALIVE_SECONDS:-600}"
   case "${keep_alive_interval}" in
     ''|*[!0-9]*) keep_alive_interval=600 ;;
@@ -459,17 +488,19 @@ if [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ]; then
     while :; do
       sleep "${keep_alive_interval}"
       if command -v curl >/dev/null 2>&1; then
-        curl -fsS --max-time 20 "${KEEP_ALIVE_URL}/api/status" >/dev/null 2>&1 || true
+        curl -fsS --max-time 20 "${KEEP_ALIVE_URL}${KEEP_ALIVE_PATH}" >/dev/null 2>&1 || true
       elif [ -x /opt/hermes/.venv/bin/python ]; then
-        /opt/hermes/.venv/bin/python - "${KEEP_ALIVE_URL}" <<'PYEOF' >/dev/null 2>&1 || true
+        /opt/hermes/.venv/bin/python - "${KEEP_ALIVE_URL}${KEEP_ALIVE_PATH}" <<'PYEOF' >/dev/null 2>&1 || true
 import sys, urllib.request
-urllib.request.urlopen(sys.argv[1].rstrip("/") + "/api/status", timeout=20).read()
+urllib.request.urlopen(sys.argv[1], timeout=20).read()
 PYEOF
       fi
     done
   ) &
-  echo "[render-tools] keep-alive: requesting /api/status every ${keep_alive_interval}s" \
+  echo "[render-tools] keep-alive: requesting ${KEEP_ALIVE_PATH} every ${keep_alive_interval}s" \
       "so the Free service does not spin down (HERMES_KEEP_ALIVE=0 to disable)"
+elif [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ]; then
+  echo "[render-tools] keep-alive: ${KEEP_ALIVE_PATH} every ${HERMES_KEEP_ALIVE_SECONDS:-600}s, run by the memory guard loop"
 fi
 
 # Hand off to the upstream entrypoint -- as a supervised child rather than an
@@ -515,6 +546,92 @@ proc_pids_matching() {
       *"${proc_needle}"*) echo "${proc_pid}" ;;
     esac
   done
+}
+
+# Per-role RSS/threads for the telemetry line, so a log reader can see WHICH
+# process is eating the box instead of only that the box is full. Leaves:
+#   TELEMETRY_LINE   "gateway=NNMB dashboard=NNMB children=NNMB procs=N threads=N"
+telemetry_snapshot() {
+  tl_gateway=0; tl_dashboard=0; tl_children=0; tl_procs=0; tl_threads=0
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "${proc_dir}" ] || continue
+    proc_pid=${proc_dir#/proc/}
+    [ "${proc_pid}" != "$$" ] || continue
+    proc_rss=$(awk "/^VmRSS:/{print \$2; exit}" "${proc_dir}/status" 2>/dev/null)
+    case "${proc_rss}" in ""|*[!0-9]*) continue ;; esac
+    proc_thr=$(awk "/^Threads:/{print \$2; exit}" "${proc_dir}/status" 2>/dev/null)
+    case "${proc_thr}" in ""|*[!0-9]*) proc_thr=0 ;; esac
+    proc_cmd=$(tr "\000" " " < "${proc_dir}/cmdline" 2>/dev/null) || continue
+    tl_procs=$(( tl_procs + 1 ))
+    tl_threads=$(( tl_threads + proc_thr ))
+    case "${proc_cmd}" in
+      *"hermes gateway"*)  tl_gateway=$(( tl_gateway + proc_rss )) ;;
+      *"hermes dashboard"*) tl_dashboard=$(( tl_dashboard + proc_rss )) ;;
+      *)                   tl_children=$(( tl_children + proc_rss )) ;;
+    esac
+  done
+  TELEMETRY_LINE="gateway=$(( tl_gateway / 1024 ))MB dashboard=$(( tl_dashboard / 1024 ))MB children=$(( tl_children / 1024 ))MB procs=${tl_procs} threads=${tl_threads}"
+}
+
+# Tell the kernel OOM killer which process to spare.
+#
+# On a 512 MB container the OOM killer picks by resident size, and the two
+# biggest things here are the gateway (every chat platform) and the dashboard
+# (the health check plus every web-chat agent). Left alone it takes whichever
+# is largest at that moment -- which is how the service ended up restarting
+# the *gateway* and dropping live Telegram/Discord conversations over memory
+# the state backup was using.
+#
+# Ranking, lowest score = most protected:
+#   gateway        protected: losing it loses every platform connection and
+#                  the in-flight turn with it.
+#   dashboard      restartable in ~10s by the watchdog below, and the browser
+#                  simply reconnects.
+#   state sync     already asks for 1000 (kill me first) in git-storage.py.
+# Negative values need CAP_SYS_RESOURCE; bootstrap runs as root before the
+# gosu drop, so this is the one moment it can be set. Failure is fine.
+oom_protect_gateway() {
+  gw_score="${HERMES_OOM_SCORE_GATEWAY:--500}"
+  for gw_pid in $(proc_pids_matching "hermes gateway"); do
+    echo "${gw_score}" > "/proc/${gw_pid}/oom_score_adj" 2>/dev/null || true
+  done
+  dash_score="${HERMES_OOM_SCORE_DASHBOARD:-250}"
+  for dash_pid in $(proc_pids_matching "hermes dashboard"); do
+    echo "${dash_score}" > "/proc/${dash_pid}/oom_score_adj" 2>/dev/null || true
+  done
+}
+
+# Apply that ranking as soon as the processes exist, rather than waiting for
+# the guard's 30 s housekeeping tick. Two reasons this cannot just be left to
+# the tick: the tick only exists when HERMES_MEMGUARD=1, and even when it does,
+# the first half minute of a boot is exactly when a cold start allocates
+# hardest -- importing the agent runtime is the single biggest jump measured on
+# this image -- so that is the window where an unprotected gateway is most
+# likely to be the one the kernel takes.
+#
+# This polls for the pid instead of sleeping a fixed interval: the gateway is
+# spawned by the upstream entrypoint a moment after the child starts, and the
+# honest way to wait for that is to look for it. The 1 s interval is the poll
+# period of a bounded wait with a deadline, not a delay hoping a race resolves.
+# Giving up quietly is correct -- a gateway that never appears is the restart
+# loop's business, not this function's.
+oom_protect_gateway_when_ready() {
+  oom_child="${1:-}"
+  case "${oom_child}" in ""|*[!0-9]*) return 2 ;; esac
+  oom_wait="${HERMES_OOM_PROTECT_WAIT_SECONDS:-60}"
+  case "${oom_wait}" in ""|*[!0-9]*) oom_wait=60 ;; esac
+  [ "${oom_wait}" -gt 0 ] || return 2
+  oom_deadline=$(( $(date +%s) + oom_wait ))
+  while [ "$(date +%s)" -lt "${oom_deadline}" ]; do
+    if [ -n "$(proc_pids_matching "hermes gateway")" ]; then
+      oom_protect_gateway
+      return 0
+    fi
+    # The child is gone; no gateway will ever match, so stop looking.
+    kill -0 "${oom_child}" 2>/dev/null || return 1
+    sleep 1
+  done
+  return 1
 }
 
 # One-shot memory context, logged on every gateway exit and (throttled)
@@ -654,6 +771,35 @@ mem_container_limits() {
 # Auto-reclaim only ever engages on a *measured* cap that is at most
 # HERMES_MEMGUARD_MAX_ACTIVE_MB (so a big dev box or unlimited host never gets
 # processes killed). Disable entirely with HERMES_MEMGUARD=0.
+# Periodic work that has nothing to do with memory but does need a heartbeat,
+# folded into the guard loop so the container does not carry an extra process
+# and an extra sleep loop just to do it:
+#   * the Free-tier keep-alive ping (Render spins the service down after ~15
+#     minutes without inbound HTTP traffic, and chat platforms are
+#     outbound-only, so without it the container sleeps mid-conversation);
+#   * re-applying the OOM ranking, because a restarted gateway or dashboard
+#     is a new PID with the default score.
+mg_housekeeping() {
+  if [ "${HERMES_KEEP_ALIVE:-1}" = "1" ] && [ -n "${KEEP_ALIVE_URL}" ] \
+     && [ $(( $(date +%s) - mg_keep_last )) -ge "${mg_keepalive}" ]; then
+    mg_keep_last=$(date +%s)
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsS --max-time 20 "${KEEP_ALIVE_URL}${KEEP_ALIVE_PATH}" >/dev/null 2>&1 || true
+    elif [ -x /opt/hermes/.venv/bin/python ]; then
+      /opt/hermes/.venv/bin/python - "${KEEP_ALIVE_URL}${KEEP_ALIVE_PATH}" <<'PYEOF' >/dev/null 2>&1 || true
+import sys, urllib.request
+urllib.request.urlopen(sys.argv[1], timeout=20).read()
+PYEOF
+    fi
+  fi
+  # Cheap enough to run on the guard's own cadence, and it is what keeps a
+  # freshly restarted gateway protected instead of defaulting back to 0.
+  if [ $(( $(date +%s) - mg_oom_last )) -ge 30 ]; then
+    mg_oom_last=$(date +%s)
+    oom_protect_gateway
+  fi
+}
+
 memory_guard_loop() {
   set +e
   mg_interval="${HERMES_MEMGUARD_INTERVAL_SECONDS:-3}"
@@ -664,19 +810,29 @@ memory_guard_loop() {
   case "${mg_pause}" in ""|*[!0-9]*) mg_pause=80 ;; esac
   mg_resume="${HERMES_MEMGUARD_RESUME_SYNC:-62}"
   case "${mg_resume}" in ""|*[!0-9]*) mg_resume=62 ;; esac
+  mg_critical="${HERMES_MEMGUARD_CRITICAL:-87}"
+  case "${mg_critical}" in ""|*[!0-9]*) mg_critical=87 ;; esac
   mg_dashpct="${HERMES_MEMGUARD_DASHBOARD_PCT:-92}"
   case "${mg_dashpct}" in ""|*[!0-9]*) mg_dashpct=92 ;; esac
   mg_dashcool="${HERMES_MEMGUARD_DASHBOARD_COOLDOWN:-150}"
   case "${mg_dashcool}" in ""|*[!0-9]*) mg_dashcool=150 ;; esac
+  mg_dashgrace="${HERMES_MEMGUARD_DASHBOARD_GRACE:-5}"
+  case "${mg_dashgrace}" in ""|*[!0-9]*) mg_dashgrace=5 ;; esac
   mg_maxactive="${HERMES_MEMGUARD_MAX_ACTIVE_MB:-2048}"
   case "${mg_maxactive}" in ""|*[!0-9]*) mg_maxactive=2048 ;; esac
   mg_logint="${HERMES_MEMGUARD_LOG_INTERVAL:-90}"
   case "${mg_logint}" in ""|*[!0-9]*) mg_logint=90 ;; esac
+  mg_keepalive="${HERMES_KEEP_ALIVE_SECONDS:-600}"
+  case "${mg_keepalive}" in ""|*[!0-9]*) mg_keepalive=600 ;; esac
   mg_synced_paused=0
+  mg_synced_stopped=0
   mg_dash_armed=0
   mg_dash_confirms=0
   mg_dash_last=0
   mg_log_last=0
+  mg_keep_last=0
+  mg_oom_last=0
+  mg_level="NORMAL"
   mg_reported_offline=0
 
   # On our way out (container stop), never leave the sync daemon frozen.
@@ -707,7 +863,9 @@ memory_guard_loop() {
         LMT_OK=1
         if [ "${mg_reported_offline}" -eq 0 ]; then
           echo "[render-tools] memory guard: no cgroup cap visible — using RSS estimate against HERMES_MEM_LIMIT_MB=${mg_est_limit}MB" >&2
-          mg_reported_offline=1
+          # Never reset: this describes the *mode* the guard is running in, so
+          # repeating it on every tick is pure log noise.
+          mg_reported_offline=2
         fi
       fi
     fi
@@ -717,6 +875,7 @@ memory_guard_loop() {
         echo "[render-tools] memory guard: no container cgroup cap visible; telemetry-only mode (set HERMES_MEM_LIMIT_MB to reclaim by RSS)" >&2
         mg_reported_offline=1
       fi
+      mg_housekeeping
       continue
     fi
     mg_limit_mb=$(( LMT_LIMIT_KB / 1024 ))
@@ -728,27 +887,67 @@ memory_guard_loop() {
         echo "[render-tools] memory guard: cap ${mg_limit_mb}MB > ${mg_maxactive}MB; telemetry-only mode (HERMES_MEMGUARD_MAX_ACTIVE_MB to widen)" >&2
         mg_reported_offline=1
       fi
+      mg_housekeeping
       continue
     fi
-    mg_reported_offline=0
+    # Reset the "cap too large / no cap" notice so a later boot-time change
+    # is reported again, but keep the RSS-estimate announcement (2) sticky.
+    [ "${mg_reported_offline}" -eq 2 ] || mg_reported_offline=0
 
-    # 1. throttled warning telemetry
+    # ── degradation level ────────────────────────────────────────────────
+    # Declared once so the log says which stage the box is in instead of
+    # leaving the reader to infer it from which reclaim lines appeared.
+    # A stage set to 0 is off, for every stage and for the same reason: an
+    # operator who does not want the dashboard recycled should not have to
+    # guess that 0 is the switch while 999 is the only way to turn the others
+    # off. The percentages themselves are uncapped, so 0 is unambiguous.
+    mg_newlevel="NORMAL"
+    if [ "${mg_dashpct}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_dashpct}" ]; then
+      mg_newlevel="EMERGENCY"
+    elif [ "${mg_critical}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_critical}" ]; then
+      mg_newlevel="CRITICAL"
+    elif [ "${mg_pause}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_pause}" ]; then
+      mg_newlevel="HIGH"
+    elif [ "${mg_warn}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_warn}" ]; then
+      mg_newlevel="WATCH"
+    fi
+    if [ "${mg_newlevel}" != "${mg_level}" ]; then
+      telemetry_snapshot
+      echo "[render-tools] memory guard: ${mg_level} -> ${mg_newlevel} at ${mg_used_mb}MB/${mg_limit_mb}MB (${mg_pct}%); ${TELEMETRY_LINE}" >&2
+      mg_level="${mg_newlevel}"
+      mg_log_last=$(date +%s)
+    fi
+
+    # ── 1. telemetry: one structured line, throttled ─────────────────────
+    # Deliberately NOT a per-second firehose: this is the line that makes the
+    # next "it crashed again" log actionable, and it costs one /proc walk.
     if [ "${mg_pct}" -ge "${mg_warn}" ] \
        && [ $(( $(date +%s) - mg_log_last )) -ge "${mg_logint}" ]; then
       mg_log_last=$(date +%s)
-      echo "[render-tools] memory guard: ${mg_used_mb}MB / ${mg_limit_mb}MB (${mg_pct}%) — reclaiming before OOM; top RSS:" >&2
+      telemetry_snapshot
+      echo "[render-tools] MEMORY: total=${mg_used_mb}MB/${mg_limit_mb}MB (${mg_pct}%) ${TELEMETRY_LINE}; top RSS:" >&2
       memwatch_top_rss >&2
     fi
 
-    # 2. pause the git sync daemon under pressure, resume when it clears
-    if [ "${mg_pct}" -ge "${mg_pause}" ] && [ "${mg_synced_paused}" -eq 0 ]; then
+    # ── 2. HIGH: stop optional background work ───────────────────────────
+    # Pausing (not killing) the sync daemon is free headroom: it is already
+    # OOM-scored as the preferred victim and its supervisor restarts it.
+    if [ "${mg_pause}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_pause}" ] \
+       && [ "${mg_synced_paused}" -eq 0 ] && [ "${mg_synced_stopped}" -eq 0 ]; then
       mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
       if [ -n "${mg_dpid}" ] && kill -0 "${mg_dpid}" 2>/dev/null; then
         if kill -STOP "${mg_dpid}" 2>/dev/null; then
           mg_synced_paused=1
-          echo "[render-tools] memory guard: ${mg_pct}% >= ${mg_pause}% — pausing git state sync (daemon ${mg_dpid})" >&2
+          echo "[render-tools] memory guard HIGH: ${mg_pct}% >= ${mg_pause}% — pausing git state sync (daemon ${mg_dpid})" >&2
         fi
       fi
+      # Orphaned slash-worker interpreters are pure waste here: the web chat
+      # never drives the TUI slash menu, and each one is a full HermesCLI
+      # stack. Reclaiming them costs no functionality at all.
+      for mg_sw in $(proc_pids_matching "tui_gateway.slash_worker"); do
+        echo "[render-tools] memory guard HIGH: reaping orphaned slash worker ${mg_sw}" >&2
+        kill -KILL "${mg_sw}" 2>/dev/null || true
+      done
     elif [ "${mg_synced_paused}" -eq 1 ] && [ "${mg_pct}" -le "${mg_resume}" ]; then
       mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
       kill -CONT "${mg_dpid}" 2>/dev/null || true
@@ -756,7 +955,32 @@ memory_guard_loop() {
       echo "[render-tools] memory guard: ${mg_pct}% <= ${mg_resume}% — resumed git state sync" >&2
     fi
 
-    # 3. shed the dashboard (holds every web-chat agent) only as a last resort
+    # ── 3. CRITICAL: give up on the backup entirely ──────────────────────
+    # A paused daemon still holds its RSS. Stopping it for good (and holding
+    # the supervisor off) is the last reclaim that does not touch anything
+    # the user is actively using.
+    if [ "${mg_critical}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_critical}" ] \
+       && [ "${mg_synced_stopped}" -eq 0 ]; then
+      mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
+      if [ -n "${mg_dpid}" ]; then
+        touch "${GIT_DAEMON_HOLD_FILE}" 2>/dev/null || true
+        kill -CONT "${mg_dpid}" 2>/dev/null || true
+        mg_synced_paused=0
+        kill -TERM "${mg_dpid}" 2>/dev/null || true
+        mg_synced_stopped=1
+        echo "[render-tools] memory guard CRITICAL: ${mg_pct}% >= ${mg_critical}% — stopping git state sync so chat keeps the RAM (it resumes below ${mg_resume}%)" >&2
+      fi
+    elif [ "${mg_synced_stopped}" -eq 1 ] && [ "${mg_pct}" -le "${mg_resume}" ]; then
+      rm -f "${GIT_DAEMON_HOLD_FILE}" 2>/dev/null || true
+      mg_synced_stopped=0
+      echo "[render-tools] memory guard: ${mg_pct}% <= ${mg_resume}% — git state sync allowed to restart" >&2
+    fi
+
+    # ── 4. EMERGENCY: recycle the dashboard, never the gateway ───────────
+    # The dashboard holds every web-chat agent and is the single largest
+    # reclaimable RSS, and unlike the gateway it comes back in ~10s with the
+    # browser reconnecting on its own. SIGTERM first so it can finalize
+    # sessions (transcripts land in the session DB) before SIGKILL.
     if [ "${mg_dashpct}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_dashpct}" ]; then
       mg_dash_confirms=$((mg_dash_confirms + 1))
     else
@@ -767,8 +991,17 @@ memory_guard_loop() {
       mg_dashboard_pids=$(proc_pids_matching "hermes dashboard")
       if [ -n "${mg_dashboard_pids}" ]; then
         mg_dash_last=$(date +%s)
-        echo "[render-tools] memory guard: ${mg_pct}% >= ${mg_dashpct}% (${mg_dash_confirms} samples) — dropping dashboard to free web-chat agents; watchdog will restart it" >&2
+        echo "[render-tools] memory guard EMERGENCY: ${mg_pct}% >= ${mg_dashpct}% (${mg_dash_confirms} samples) — recycling the dashboard to free web-chat agents; watchdog will restart it" >&2
         for mg_dp in ${mg_dashboard_pids}; do
+          kill -TERM "${mg_dp}" 2>/dev/null || true
+        done
+        mg_grace_left="${mg_dashgrace}"
+        while [ "${mg_grace_left}" -gt 0 ]; do
+          [ -n "$(proc_pids_matching "hermes dashboard")" ] || break
+          sleep 1
+          mg_grace_left=$((mg_grace_left - 1))
+        done
+        for mg_dp in $(proc_pids_matching "hermes dashboard"); do
           kill -KILL "${mg_dp}" 2>/dev/null || true
         done
         mg_dash_armed=1
@@ -778,6 +1011,8 @@ memory_guard_loop() {
     if [ "${mg_dash_armed}" -eq 1 ] && [ "${mg_pct}" -le "${mg_resume}" ]; then
       mg_dash_armed=0
     fi
+
+    mg_housekeeping
   done
 }
 
@@ -911,6 +1146,11 @@ while :; do
     CHILD=$!
   fi
   child_started=$(date +%s)
+
+  # Rank the processes for the kernel OOM killer as soon as they exist.
+  # Backgrounded so the main loop reaches `wait` (and therefore signal
+  # handling) immediately instead of blocking on the poll.
+  oom_protect_gateway_when_ready "${CHILD}" &
 
   set +e
   wait "${CHILD}"

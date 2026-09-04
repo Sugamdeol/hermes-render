@@ -168,6 +168,17 @@ DEFAULT_PACK_THREADS = _default_pack_threads()
 # and we retry, instead of the process sitting on a dead connection.
 DEFAULT_HTTP_LOW_SPEED_LIMIT = 1000
 DEFAULT_HTTP_LOW_SPEED_TIME = 60
+
+# Share of the container's memory cap above which the daemon defers a push
+# instead of starting one. A push is the only routine operation here that
+# allocates in a hurry (the pack build, the HTTP post buffer), and on a
+# 512 MB instance it must lose every contest with the chat in progress.
+DEFAULT_MAX_MEMORY_PERCENT = 80
+
+# Blobs at or below this size are mmap'd by git for hashing and delta
+# compression, i.e. they cost resident memory equal to their own size. Set
+# low so anything big is streamed instead. See the run_git() comment.
+DEFAULT_BIG_FILE_THRESHOLD_BYTES = 1024 * 1024
 # No git command here should ever run forever: the boot wrapper and the daemon
 # both wait on them.
 DEFAULT_GIT_TIMEOUT_SECONDS = 600
@@ -245,10 +256,102 @@ def redact(text: str) -> str:
     git puts the remote URL in its error messages, and the remote URL carries
     the token. Without this, a failed push writes the token into Render's logs.
     """
-    text = re.sub(r"(https://)[^@/\s]+(@)", r"\1***\2", text)
+    # GIT_STATE_REMOTE_URL lets an operator embed credentials in any scheme,
+    # so every scheme the backend can be pointed at is scrubbed, not just https.
+    text = re.sub(r"((?:https?|git|ssh)://)[^@/\s]+(@)", r"\1***\2", text)
     text = re.sub(r"gh[pousr]_[A-Za-z0-9]{20,}", "***", text)
     text = re.sub(r"github_pat_[A-Za-z0-9_]{20,}", "***", text)
     return text
+
+
+# ---------------------------------------------------------------------------
+# Container memory awareness
+# ---------------------------------------------------------------------------
+
+
+def container_memory_percent() -> "tuple[int, int, int] | None":
+    """(used_mb, limit_mb, percent) for this container, or None if unknowable.
+
+    Reads the real cgroup accounting (v2 then v1) rather than /proc/meminfo,
+    which reports the *host's* free memory and so cannot predict a container
+    OOM. Falls back to summing this PID namespace's RSS when the operator
+    states the budget with HERMES_MEM_LIMIT_MB and no cgroup cap is visible.
+
+    The state sync uses this to stand down under pressure: a backup is worth
+    less than the conversation in progress, and a push is one of the few
+    things this service does that can allocate tens of MB in a hurry.
+    """
+    root = os.environ.get("HERMES_CGROUP_ROOT", "/sys/fs/cgroup")
+    path = os.environ.get("HERMES_CGROUP_PATH", "")
+    if not path:
+        try:
+            with open("/proc/self/cgroup", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("0::"):
+                        path = line.strip()[3:]
+                        break
+        except OSError:
+            path = ""
+
+    def _read_int(name: str) -> "int | None":
+        try:
+            with open(name, encoding="utf-8") as handle:
+                raw = handle.read().strip()
+        except OSError:
+            return None
+        if raw in ("", "max"):
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    candidates = []
+    if path:
+        candidates.append(f"{root}{path}")
+    candidates.append(root)
+    for base in candidates:
+        used = _read_int(f"{base}/memory.current")
+        limit = _read_int(f"{base}/memory.max")
+        if used is not None and limit:
+            return _percent(used // 1024, limit // 1024)
+    # cgroup v1
+    used = _read_int(f"{root}/memory/memory.usage_in_bytes")
+    limit = _read_int(f"{root}/memory/memory.limit_in_bytes")
+    if used is not None and limit and limit < 1 << 50:
+        return _percent(used // 1024, limit // 1024)
+
+    # No visible cap: optional RSS estimate against a stated budget.
+    try:
+        budget_mb = int(os.environ.get("HERMES_MEM_LIMIT_MB", "0") or 0)
+    except ValueError:
+        budget_mb = 0
+    if budget_mb <= 0:
+        return None
+    total_kb = 0
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        total_kb += int(line.split()[1])
+                        break
+        except (OSError, ValueError, IndexError):
+            continue
+    return _percent(total_kb, budget_mb * 1024)
+
+
+def _percent(used_kb: int, limit_kb: int) -> "tuple[int, int, int]":
+    if limit_kb <= 0:
+        return (used_kb // 1024, 0, 0)
+    return (used_kb // 1024, limit_kb // 1024,
+            max(0, min(1000, used_kb * 100 // limit_kb)))
 
 
 class GitConfig:
@@ -286,6 +389,9 @@ class GitConfig:
         http_low_speed_time: int = DEFAULT_HTTP_LOW_SPEED_TIME,
         pack_window_memory: int = DEFAULT_PACK_WINDOW_MEMORY_BYTES,
         pack_threads: int = DEFAULT_PACK_THREADS,
+        remote_url_override: str = "",
+        max_memory_percent: int = DEFAULT_MAX_MEMORY_PERCENT,
+        big_file_threshold: int = DEFAULT_BIG_FILE_THRESHOLD_BYTES,
     ) -> None:
         self.repo = repo
         self.token = token
@@ -332,6 +438,17 @@ class GitConfig:
             1024 * 1024, int(pack_window_memory)
         )
         self.pack_threads = max(1, int(pack_threads))
+        # An explicit remote (self-hosted Gitea/GitLab, an SSH remote, or a
+        # local bare repo in a test) instead of the GitHub URL derived from
+        # `repo`. Credentials, if any, must already be in the URL or handled by
+        # a credential helper -- nothing is appended to it.
+        self.remote_url_override = remote_url_override.strip()
+        # Stand down above this share of the container's memory cap. 0 disables
+        # the check (a dedicated box with room to spare does not need it).
+        self.max_memory_percent = max(0, min(100, int(max_memory_percent)))
+        # git mmaps blobs up to this size; keep it small so a large file in
+        # the state tree cannot cost resident memory equal to its own size.
+        self.big_file_threshold = max(1024, int(big_file_threshold))
         self.role = ROLE_ACTIVE
         self._visibility_checked = False
         self._last_push_at = 0.0
@@ -429,10 +546,18 @@ class GitConfig:
                                              // (1024 * 1024)) * 1024 * 1024,
             pack_threads=positive_int("GIT_STATE_PACK_THREADS",
                                       DEFAULT_PACK_THREADS),
+            remote_url_override=os.environ.get("GIT_STATE_REMOTE_URL", "").strip(),
+            max_memory_percent=non_negative_int(
+                "GIT_STATE_MAX_MEMORY_PCT", DEFAULT_MAX_MEMORY_PERCENT),
+            big_file_threshold=positive_int(
+                "GIT_STATE_BIG_FILE_THRESHOLD_KB",
+                DEFAULT_BIG_FILE_THRESHOLD_BYTES // 1024) * 1024,
         )
 
     @property
     def remote_url(self) -> str:
+        if self.remote_url_override:
+            return self.remote_url_override
         repo = self.repo
         if repo.startswith("http://") or repo.startswith("https://"):
             host_path = repo.split("://", 1)[1]
@@ -470,6 +595,8 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
     window_memory = (config.pack_window_memory if config
                      else DEFAULT_PACK_WINDOW_MEMORY_BYTES)
     pack_threads = config.pack_threads if config else DEFAULT_PACK_THREADS
+    big_file_threshold = (config.big_file_threshold if config
+                          else DEFAULT_BIG_FILE_THRESHOLD_BYTES)
     base = [
         "git",
         "-c", "user.name=hermes-state",
@@ -491,6 +618,18 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", f"pack.windowMemory={window_memory}",
         "-c", "pack.deltaCacheSize=32m",
         "-c", f"pack.threads={max(1, int(pack_threads))}",
+        # The single biggest memory lever in this backend, and not an obvious
+        # one: git *mmaps* any blob at or under core.bigFileThreshold (512 MB
+        # by default on 64-bit) to hash and delta-compress it, so one changed
+        # file costs resident memory equal to its own size. Measured on a
+        # 146 MB sessions.db: `git hash-object` peaked at 148.5 MB with the
+        # default and 11.0 MB with the threshold at 1 MB -- because a "big"
+        # file is streamed and stored undeltified instead. The state mirror is
+        # pushed as a delta of what changed, and the large files in it (a
+        # SQLite database) do not delta-compress usefully anyway, so giving up
+        # delta compression on them costs almost nothing and removes the one
+        # operation that could take the whole 512 MB container down.
+        "-c", f"core.bigFileThreshold={big_file_threshold}",
     ]
     timeout = (config.git_timeout_seconds if config
                else DEFAULT_GIT_TIMEOUT_SECONDS)
@@ -550,6 +689,13 @@ def ensure_safe_to_push(config: GitConfig) -> None:
     if config._visibility_checked:
         return
     if config.allow_public:
+        config._visibility_checked = True
+        return
+    if config.remote_url_override:
+        # The operator named the remote explicitly (self-hosted Gitea/GitLab,
+        # an SSH remote, a local bare repo). GitHub's visibility API says
+        # nothing about those, and failing closed would silently disable the
+        # backup for anyone not using GitHub.
         config._visibility_checked = True
         return
     private = repo_is_private(config)
@@ -1595,8 +1741,28 @@ def manifest_differs_from_head(workdir: Path, config: GitConfig) -> bool:
     return head != current
 
 
+# One push at a time, process-wide. The daemon loop is single threaded, but
+# `sync_once` is also reachable from the CLI (`sync`), from the shutdown flush
+# and from a failover handoff push -- and two `git` processes writing the same
+# clone/index at once corrupts the mirror. Non-blocking on purpose: a caller
+# that finds a push already running should back off, not queue up behind it
+# and then start a second push of a tree that has moved on.
+_SYNC_LOCK = threading.Lock()
+
+
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
+    if not _SYNC_LOCK.acquire(blocking=False):
+        LOG.info("another state push is already running; skipping this round")
+        return True
+    try:
+        return _sync_once_locked(data_dir, config, force=force, seed=seed)
+    finally:
+        _SYNC_LOCK.release()
+
+
+def _sync_once_locked(data_dir: Path, config: GitConfig, *, force: bool = False,
+                      seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
         LOG.debug("standby instance; not pushing state")
         return True
@@ -1954,6 +2120,22 @@ def run_daemon(data_dir: Path, config: GitConfig,
         watcher = None
 
     def push(reason: str) -> None:
+        # A backup is worth less than the conversation in progress. A push is
+        # also the only routine thing here that allocates in a hurry (pack
+        # build + HTTP post buffer), so under memory pressure it waits instead
+        # of pushing the container closer to the OOM killer -- which does not
+        # discriminate between this worker and the gateway.
+        if config.max_memory_percent:
+            reading = container_memory_percent()
+            if reading is not None and reading[2] >= config.max_memory_percent:
+                LOG.info(
+                    "deferring %s: container at %dMB/%dMB (%d%%) of its memory "
+                    "cap; chat and the gateway outrank the backup",
+                    reason, reading[0], reading[1], reading[2],
+                )
+                if watcher is not None:
+                    watcher.defer(config.retry_seconds)
+                return
         # Snapshot first: whatever is written while the push is in flight is
         # not part of the commit, so it has to stay pending afterwards.
         snapshot = watcher.snapshot() if watcher is not None else None
@@ -1976,17 +2158,30 @@ def run_daemon(data_dir: Path, config: GitConfig,
     while not stop.is_set():
         now = time.time()
         try:
-            if config.failover:
-                if now - last_heartbeat >= config.heartbeat_interval:
-                    try:
-                        claim_lease(config)
-                        last_heartbeat = now
-                    except Exception as exc:
-                        LOG.warning("lease heartbeat failed: %s", redact(str(exc)))
+            # Lease renewal and role evaluation share ONE round trip, on the
+            # heartbeat cadence.
+            #
+            # They used to be two separate things, and because this loop ticks
+            # every `watch_seconds` the role check forked a `git ls-remote`
+            # against GitHub on *every* tick: measured at ~190 ms of CPU and
+            # ~25 MB of child RSS per call, i.e. roughly 40% of a Render Free
+            # container's whole 0.1 CPU budget spent forever on coordination,
+            # plus a transient child competing for RAM every few seconds.
+            # claim_lease() already reads every lease ref to renew ours, so
+            # deciding the role from that same read is free; the trade is that
+            # a peer appearing or disappearing is noticed within
+            # heartbeat_interval (120s) rather than watch_seconds (5s), which
+            # is well inside the 600s lease TTL the decision already assumes.
+            if config.failover and now - last_heartbeat >= config.heartbeat_interval:
+                # Throttle success and failure alike: an unreachable remote
+                # must not turn into a fork-a-git-every-tick retry storm,
+                # which is precisely the load this restructure removes.
+                last_heartbeat = now
                 try:
-                    role = current_role(config)
-                except Exception:
+                    role = claim_lease(config)
+                except Exception as exc:
                     role = config.role
+                    LOG.warning("lease heartbeat failed: %s", redact(str(exc)))
                 if role != config.role and now - last_switch >= config.role_switch_min:
                     previous, config.role = config.role, role
                     last_switch = now

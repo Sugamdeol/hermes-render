@@ -1,0 +1,379 @@
+# Hermes on Render Free (512 MB / 0.1 CPU) — optimization report
+
+Everything below is measured, not estimated. Each number came from the real
+gateway + dashboard running inside a real cgroup with `memory.max=512MB` and
+`cpu.max="10000 100000"` (0.1 CPU), driven by a real WebSocket chat client.
+The harness is in `tools/bench/` and is committed so any claim here can be
+reproduced.
+
+**Stability verdict: 🟢** — see the caveats at the end, which are real ones.
+
+---
+
+## 1. Root causes
+
+Ranked by what they actually cost, each with the measurement that found it.
+
+### 1.1 An orphaned interpreter per conversation (the OOM itself)
+
+`tui_gateway/server.py` `_SlashWorker.__init__` `Popen`s a **full Python
+interpreter** (`python -m tui_gateway.slash_worker`) plus two drain threads for
+every session. Three of the four `_SlashWorker(` construction sites were gated
+by `HERMES_TUI_DISABLE_SLASH_WORKER`; **the fourth was not** — a lazy fallback
+inside `slash.exec` (upstream L5489).
+
+Measured in a 512 MB cgroup: **57–85 MB RSS each, `ppid=1`** (orphaned, so
+nothing reaps them), six of them ≈ **408 MB**. Ten sequential conversations
+took the pristine image from ~150 MB idle to a kernel OOM kill by the 5th.
+
+This is why the four patches already in the repo were not enough: the gate was
+applied, but one path walked around it.
+
+### 1.2 Failover polling burned ~38% of the entire CPU budget, forever
+
+`HERMES_FAILOVER=1` is the shipped default in `render.yaml`. The daemon renewed
+its lease on **every watch tick**, forking `git ls-remote` — a full TLS
+handshake to GitHub — every ~5.4 s.
+
+Measured: **15 `git ls-remote` calls in 45 s**; each 552–607 ms wall,
+**186–200 ms CPU**, **25.2 MB** child RSS. That is ≈38% of a 0.1 CPU budget
+spent permanently on coordinating with instances that do not exist.
+
+### 1.3 git mmaps every file it hashes (the sync OOM)
+
+`core.bigFileThreshold` defaults to **512 MB**, and git mmaps any blob under it
+to hash and delta-compress it. So one changed file costs **resident memory
+equal to its own size**.
+
+Measured on a 146 MB `sessions.db`:
+
+| operation | default | threshold 1 MB |
+|---|---|---|
+| `git hash-object` / `git add -A` peak | **152.0 MB** | **5.9–11.0 MB** |
+| client-side max across a push | **152.0 MB** | **9.1 MB** (16.7×) |
+| whole-sync cgroup peak | **344 MB** | **184.8 MB** |
+
+A "big" blob is streamed and stored undeltified instead — slightly worse
+compression, and the difference between the sync fitting in the leftover
+budget and it eating a third of the container by itself.
+
+*(The residual 317 MB measured on a local remote was `git-receive-pack` /
+`unpack-objects` on the **receiving** side — that cost belongs to GitHub in
+production, not to this container.)*
+
+### 1.4 The session registry has no ceiling
+
+`tui_gateway._sessions` is a module-level dict. Each entry is a live
+`AIAgent`; only an explicit `session.close` or the disconnect patch ever
+removes one. A laptop sleeping, a phone backgrounding, a reload racing the
+socket — each leaves an entry behind and the growth is **linear in how many
+there are**.
+
+### 1.5 The agent cache was sized for a server, not a container
+
+Upstream `_AGENT_CACHE_MAX_SIZE = 128`, `_AGENT_CACHE_IDLE_TTL_SECS = 3600`.
+128 × ~20 MB ≈ **2.5 GB**. `_enforce_agent_cache_cap()` also skips
+`_running_agents`, so the cache can exceed even its own cap.
+
+### 1.6 `/api/status` was the health check *and* the keep-alive target
+
+It `copy.deepcopy`s `config.yaml` (~54 KB), calls `load_gateway_config()`,
+`read_runtime_status()`, and opens a fresh `SessionDB()` +
+`list_sessions_rich(limit=50)` — on every call, on a path Render polls on its
+own cadence and the keep-alive loop hit every 10 minutes.
+
+Measured: **0.092–0.096 s steady, 2.67 s cold**.
+
+### 1.7 The gateway was never OOM-ranked at boot
+
+`oom_protect_gateway()` existed but was only called from the guard's 30 s
+housekeeping tick. So: with `HERMES_MEMGUARD=0` it **never ran at all**, and
+even with the guard on, the first 30 s — exactly when the agent-runtime import
+(the largest single allocation on this image) lands — was unranked.
+
+### 1.8 Environment defaults had silently drifted
+
+`.env.example` shipped `HERMES_AGENT_CACHE_MAX_SIZE=8` / `IDLE_TTL_SECONDS=600`
+while `env/common.env` shipped `4` / `300`. `tests/test_env_defaults.py` was
+**already failing on the base commit** because of it.
+
+---
+
+## 2. File-by-file changes
+
+### `scripts/git-storage.py` (+215)
+Nine fixes. The important ones: `GIT_STATE_REMOTE_URL` read from env instead of
+re-deriving it; **shared failover lease** so `ls-remote` rides the existing
+120 s `claim_lease` instead of the watch tick; non-blocking `_SYNC_LOCK`; push
+deferral under pressure (`GIT_STATE_MAX_MEMORY_PCT`); `container_memory_percent()`;
+secret redaction in diagnostics; `core.bigFileThreshold` plumbing
+(`GIT_STATE_BIG_FILE_THRESHOLD_KB`).
+
+### `scripts/bootstrap.sh` (+272, now 1230 lines)
+`telemetry_snapshot()` (low-frequency `MEMORY:` line, no env vars touched);
+`oom_protect_gateway()` + **`oom_protect_gateway_when_ready()` called at boot**
+(condition-driven poll, not a fixed sleep); the memory guard rewritten from a
+3-level branch into a **5-level ladder** NORMAL → WATCH → HIGH → CRITICAL →
+EMERGENCY; `mg_housekeeping()` folded into the guard loop;
+`GIT_DAEMON_HOLD_FILE` so CRITICAL *stops* the sync daemon and holds its
+supervisor off restarting it; keep-alive retargeted to the cheap plugin
+`/health`; restore timeout 240→90 s and attempts 2→1 so a slow restore can't
+eat Render's port-scan window; sticky `mg_reported_offline` (was logging one
+line per tick); **`0` now disables any stage** consistently.
+
+### `scripts/patch-slash-worker.py` (+98)
+Added the missing **4th gate** (the lazy `slash.exec` fallback becomes an
+explicit `_err(rid, 5030, …)` refusal) and `ungated_sites()`, which re-scans
+after patching and **fails the build naming the line** if any `_SlashWorker(`
+construction still sits outside a gate. Verified against a pristine
+`git show HEAD:tui_gateway/server.py`: 4 construction sites, 4 gates.
+
+### `scripts/patch-session-cap.py` (new, 153 lines)
+Bounds `tui_gateway._sessions` at `HERMES_TUI_MAX_SESSIONS` (default 2),
+evicting oldest-first on `session.create`. Transcript is committed before the
+object is released, so an evicted chat re-opens via `session.resume`. **A
+session mid-turn is skipped** — evicting an agent under a live request would
+turn a memory problem into a crashed conversation.
+
+### `dashboard-plugins/hermes-chat-dashboard/dashboard/plugin_api.py` (+28)
+New `GET /health` returning the constant `{"ok": true}`. Reaches no DB, no
+config, no gateway. The auth middleware already exempts `/api/plugins/*`, so
+no auth change was needed and none was made — verified: `/capabilities` on the
+same router still returns **401**.
+
+### `Dockerfile` (+23)
+Wires `patch-session-cap.py`, with the measured reasoning inline.
+
+### `render.yaml` (+100) / `env/common.env` (+66) / `.env.example` (+43)
+`healthCheckPath` → the plugin `/health`; `HERMES_FAILOVER` **1→0**; restore
+attempts 2→1 with an explicit 90 s timeout; git cadence 5/10/20 →
+**15/20/60 s** and interval 300→900 s; new `GIT_STATE_BIG_FILE_THRESHOLD_KB`,
+`GIT_STATE_MAX_MEMORY_PCT`, `HERMES_TUI_MAX_SESSIONS`, `HERMES_MEMGUARD_CRITICAL`,
+`MALLOC_TRIM_THRESHOLD_`, `HERMES_KEEP_ALIVE_PATH`. Agent-cache defaults
+reconciled to 2/120 in all three files.
+
+### Tests (+282 across four files, plus a new 158-line module)
+`tests/test_env_defaults.py` now asserts that **36** keys agree between
+`.env.example` and `env/common.env` — every memory knob this image ships — so
+they cannot drift apart again the way the agent-cache pair did. `tests/test_bootstrap_supervision.py` restructured into a shared
+`_GuardHarness` (no tests, so slow cases don't run twice) plus
+`BootOomRankingTests`. `tests/test_patch_session_cap.py` and the
+drift test in `test_patch_slash_worker.py` are new.
+
+### `tools/bench/` (new, 657 lines)
+`cgroup-run.sh` (the 512 MB / 0.1 CPU limiter), `memwatch.py` (cgroup + per-proc
+sampler), `stress_chat.py` (real browser-chat driver over `/api/ws`).
+
+---
+
+## 3. Memory: before vs after
+
+All runs: 512 MB cgroup, 0.1 CPU, real WebSocket chat against a mock LLM.
+
+| | idle | peak | outcome |
+|---|---|---|---|
+| **A — pristine v2026.5.7** | 153.4 MB | **= 512 MB cap** | **OOM-killed by conv 5–6**; 5/10 turns completed |
+| **B — repo's four patches** | 151.8 MB | 249.3 MB | 10/10 turns, 0 failures |
+| **C — this work** | 142.8 MB | **212.0 MB** | 10/10 turns, 0 failures |
+
+Trace for C (10 conversations, 3 reconnect cycles):
+
+```
+   idle: 142.8   conv2: 209.0   conv4: 209.4   conv6: 210.7
+  conv8: 211.1  conv10: 212.0   reconnects: 212.0   settled: 211.9
+```
+
+### The failure mode that actually matters: abandoned tabs
+
+24 conversations, every WebSocket deliberately left open
+(`--keep-open`) — the laptop-sleep / phone-backgrounded case. Identical
+workload, two **clean** stacks:
+
+| | idle | after 24 | residual | growth per conversation |
+|---|---|---|---|---|
+| **session cap on (shipped)** | 126.6 MB | 216.0 MB | +89.4 MB | **0.20 MB — plateaus** |
+| session cap off (`=0`) | 126.9 MB | 231.1 MB | +104.2 MB | 0.97 MB — keeps climbing |
+
+Both pay the same one-time ~85 MB step (the agent-runtime import in the
+dashboard, never released). The difference is the tail: the capped curve
+flattens, the uncapped one is a straight line. At 0.77 MB per conversation of
+divergence, that is what separates a container that runs for weeks from one
+that OOMs after enough chats.
+
+### Git state sync
+
+| | before | after |
+|---|---|---|
+| `git ls-remote` calls / 45 s | 15 | **4** |
+| `git add -A` on a 146 MB file | 152.0 MB | **5.9 MB** |
+| client-side max across a push | 152.0 MB | **9.1 MB** |
+| whole-sync cgroup peak | 344 MB | **184.8 MB** |
+
+### Health endpoint
+
+| | before (`/api/status`) | after (`/health`) |
+|---|---|---|
+| steady | 0.092–0.096 s | **0.0010–0.0014 s** (~90×) |
+| cold | 2.67 s | 0.0026 s |
+
+---
+
+## 4. Actual process tree
+
+Captured from `/sys/fs/cgroup/hbF/cgroup.procs`, idle, 512 MB / 0.1 CPU:
+
+```
+pid=85142 ppid=85120 rss=1  MB thr=1  sh run-stack.sh
+pid=85153 ppid=85142 rss=64 MB thr=6  python3 hermes dashboard --host 0.0.0.0 --port 10000
+pid=85154 ppid=85142 rss=86 MB thr=4  python3 hermes gateway run
+```
+
+**3 processes, 11 threads, 113 MB** cgroup `memory.current` and `memory.peak`.
+In production the `sh` is replaced by `tini -g` → `bootstrap.sh`, and the git
+sync daemon appears as a fourth process when `GIT_STATE_REPO` is set.
+
+Compare the failure case: Baseline A accumulated **6 orphaned
+`slash_worker` interpreters at `ppid=1`**, 57–85 MB each, on top of this tree.
+
+Startup to port bind at 0.1 CPU: **~13–14 s**.
+
+---
+
+## 5. Remaining risks
+
+1. **The state backup's peak RSS is the largest file in `/opt/data`.** With
+   `core.bigFileThreshold` at 1 MB the client side is ~9 MB, but a 146 MB
+   `sessions.db` still has to be read, committed and transferred. SQLite never
+   shrinks. If that file grows past a few hundred MB the sync will need
+   `VACUUM`/retention policy work, not just tuning.
+2. **The ~85 MB one-time agent-runtime import is never released.** It is a
+   floor, not a leak — but it means the realistic ceiling for everything else
+   is ~300 MB, not 512.
+3. **`HERMES_FAILOVER=0` is now the default.** If you ever run a second
+   instance (e.g. `run-local.sh --takeover` from a laptop) sharing
+   `GIT_STATE_REPO`, you must set it back to `1` or the two will not
+   coordinate.
+4. **The guard has not been observed firing in production.** Its stages are
+   unit-tested against synthetic cgroups, and the OOM ranking is verified
+   end-to-end against the real kernel, but no run here actually crossed 87%.
+   The workload never got close enough.
+5. **Docker image not built.** Docker Hub egress is blocked in this sandbox, so
+   the `Dockerfile` itself was never built or run. Every patch was verified
+   against a pristine `git show HEAD:` copy of the pinned upstream, and all
+   four apply cleanly and idempotently — but the layer ordering is unproven.
+6. **No real LLM.** Chat was driven against a mock OpenAI-compatible server.
+   Real providers stream differently and a large tool output could behave
+   differently than the mock's.
+
+---
+
+## 6. Render environment variables
+
+**Keep / set these.** Everything else in `render.yaml` is already correct.
+
+| Variable | Value | Why |
+|---|---|---|
+| `HERMES_FAILOVER` | `0` | Was `1`. Frees ~38% of the CPU budget. |
+| `GIT_STATE_BIG_FILE_THRESHOLD_KB` | `1024` | **The single biggest win.** 16.7× less sync memory. |
+| `GIT_STATE_MAX_MEMORY_PCT` | `80` | Backup stands down before competing with chat. |
+| `HERMES_TUI_MAX_SESSIONS` | `2` | Bounds the session registry. |
+| `HERMES_AGENT_CACHE_MAX_SIZE` | `2` | Was 8 in `.env.example`. |
+| `HERMES_AGENT_CACHE_IDLE_TTL_SECONDS` | `120` | Was 600. |
+| `MALLOC_TRIM_THRESHOLD_` | `131072` | Returns freed pages to the OS. |
+| `MALLOC_ARENA_MAX` | `2` | Already present; keep it. |
+| `HERMES_MEMGUARD_CRITICAL` | `87` | New CRITICAL stage. |
+| `HERMES_KEEP_ALIVE_PATH` | `/api/plugins/hermes-chat-dashboard/health` | ~90× cheaper keep-alive. |
+| `GIT_STATE_WATCH_SECONDS` / `DEBOUNCE` / `MIN_PUSH_INTERVAL` | `15` / `20` / `60` | Still lands in GitHub within ~1 min. |
+| `HERMES_RESTORE_ATTEMPTS` / `TIMEOUT_SECONDS` | `1` / `90` | Keeps restore inside Render's port-scan window. |
+
+**Secrets** (`GIT_STATE_TOKEN`, `GITHUB_TOKEN`, provider keys, Telegram
+tokens) stay exactly as they are — environment-based, and none of the new
+diagnostics read or print them. `telemetry_snapshot()` touches no environment
+variables at all (verified by grep).
+
+---
+
+## 7. Redeploy
+
+```bash
+git checkout arena/01a06bfc-hermes-render
+git push origin arena/01a06bfc-hermes-render
+```
+
+Then in Render: **Manual Deploy → Deploy latest commit**. The Blueprint picks
+up the `render.yaml` changes automatically; any variable you set by hand in the
+dashboard overrides the Blueprint, so check that the ones in §6 match.
+
+Nothing needs a manual migration. `/health` is additive; the health check path
+change is in `render.yaml`.
+
+---
+
+## 8. Diff summary
+
+```
+ .env.example                                       |  43 +++-
+ Dockerfile                                         |  23 ++
+ .../hermes-chat-dashboard/dashboard/plugin_api.py  |  28 +++
+ env/common.env                                     |  66 ++++-
+ render.yaml                                        | 100 +++++++-
+ scripts/bootstrap.sh                               | 272 +++++++++++++++++--
+ scripts/git-storage.py                             | 215 +++++++++++++++-
+ scripts/patch-slash-worker.py                      |  98 +++++++-
+ tests/test_bootstrap_supervision.py                | 195 ++++++++++++++-
+ tests/test_env_defaults.py                         |  18 ++
+ tests/test_patch_slash_worker.py                   |  69 +++++-
+ 11 files changed, 1069 insertions(+), 58 deletions(-)
+```
+
+New files: `scripts/patch-session-cap.py` (153),
+`tests/test_patch_session_cap.py` (158), `tools/bench/{cgroup-run.sh,
+memwatch.py, stress_chat.py}` (657).
+
+---
+
+## 9. Verification
+
+**241 tests pass across 12 files**, run file-by-file (whole-directory runs have
+pre-existing cross-file pollution unrelated to this work):
+
+```
+test_bootstrap_supervision.py   11 passed     test_git_storage.py        107 passed
+test_chat_dashboard_plugin.py    4 passed     test_patch_config.py         9 passed
+test_chat_dashboard_routes.py   36 passed     test_patch_model_discovery.py 2 passed
+test_env_defaults.py             1 passed     test_patch_session_cap.py    6 passed
+test_plugin_api.py              31 passed     test_patch_slash_worker.py   7 passed (+3 subtests)
+test_seed_env.py                24 passed     test_patch_ws_session_cleanup.py 3 passed
+```
+
+The `test_env_defaults.py` failure on the base commit is **fixed**.
+
+Integration checks:
+- All four patch scripts apply cleanly and **idempotently** to a pristine
+  `git show HEAD:` copy of upstream v2026.5.7; every result parses.
+- `sh -n scripts/bootstrap.sh` and `yaml.safe_load(render.yaml)` pass.
+- **Red/green proof for the boot-time OOM fix:** with the call removed, the new
+  test fails with `100 != -500` (the kernel's default score); restored, it
+  reads `-500`. The test asserts the value the kernel actually reports, so a
+  function that is defined but never called cannot pass.
+- `test_bootstrap_supervision.py` is timing-sensitive (real sleeps, 20–40 s
+  `_wait_for` timeouts). It failed 2/9 once while the stress stack was running
+  concurrently on a 2-CPU box, then passed 5 consecutive isolated runs. That
+  is load flakiness in the harness, not a regression — but it is worth knowing
+  before you trust a single CI run of that file.
+
+---
+
+## Stability verdict: 🟢
+
+Earned, with the caveats in §5 stated plainly.
+
+The workload that OOM-killed the pristine image by conversation 5 now completes
+10 sequential conversations plus reconnect cycles at a **212 MB peak**, and 24
+deliberately-abandoned tabs at **216 MB** with a flat plateau — inside a real
+cgroup with `memory.max=512MB` and `cpu.max=0.1`, never approaching the cap.
+
+It is 🟢 rather than unqualified because the Docker image itself was never
+built (Docker Hub is unreachable here) and the guard's HIGH/CRITICAL/EMERGENCY
+stages have never been observed firing under genuine pressure. Both are
+honest gaps, and neither is a reason to expect a regression.

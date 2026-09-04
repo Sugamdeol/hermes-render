@@ -103,6 +103,29 @@ COPY scripts/patch-ws-session-cleanup.py /opt/render-tools/patch-ws-session-clea
 RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-ws-session-cleanup.py \
     /opt/hermes/tui_gateway/ws.py
 
+# Nothing upstream caps tui_gateway's session registry. Each entry is a live
+# in-process AIAgent, and the only things that ever remove one are an explicit
+# session.close or the disconnect patch above -- so a browser tab that
+# vanishes without a clean close (laptop sleep, phone backgrounded, reload
+# racing the socket) leaves its agent pinned in the dashboard process for the
+# life of the container.
+#
+# Measured, same 24-abandoned-tab workload, two clean 512 MB cgroups:
+# 0.20 MB per conversation with the cap on, 0.97 MB per conversation with it
+# off, ending 15.1 MB apart -- and the capped curve plateaus while the
+# uncapped one keeps climbing. The per-entry cost is only ~1 MB; the heavy
+# per-conversation cost this image really had was the orphaned slash_worker
+# subprocess (57-85 MB RSS each, which is what took the pristine image from
+# ~150 MB idle to a kernel OOM kill by the 5th of 10 conversations), and that
+# is what patch-slash-worker.py removes. Both have to be bounded.
+#
+# This patch caps the registry at HERMES_TUI_MAX_SESSIONS (env default 2),
+# finalizing the oldest entries -- transcript first, so an evicted chat still
+# re-opens through session.resume -- and skips any session that is mid-turn.
+COPY scripts/patch-session-cap.py /opt/render-tools/patch-session-cap.py
+RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-session-cap.py \
+    /opt/hermes/tui_gateway/server.py
+
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
 # upstream Hermes skills-sync flow never touches these files. To upgrade,
