@@ -141,6 +141,13 @@ config, no gateway. The auth middleware already exempts `/api/plugins/*`, so
 no auth change was needed and none was made — verified: `/capabilities` on the
 same router still returns **401**.
 
+### `scripts/patch-config.py` (+47)
+The injected Render MCP entry now carries `connect_timeout`
+(`HERMES_RENDER_MCP_CONNECT_TIMEOUT`, default 10) instead of inheriting
+upstream's 60 s. Unparsable or non-positive values fall back to the default
+rather than raising — this runs at boot, so a typo in one environment variable
+must not stop the container from starting.
+
 ### `Dockerfile` (+23)
 Wires `patch-session-cap.py`, with the measured reasoning inline.
 
@@ -264,6 +271,52 @@ Startup to port bind at 0.1 CPU: **~13–14 s**.
 6. **No real LLM.** Chat was driven against a mock OpenAI-compatible server.
    Real providers stream differently and a large tool output could behave
    differently than the mock's.
+7. **MCP tool output is not size-bounded — verified, not fixed.** Reading
+   `tools/mcp_tool.py` `_call()` (upstream v2026.5.7): it concatenates every
+   `TextContent` block from a tool result and returns the whole thing as JSON.
+   There is no truncation, and no `MAX_TOOL_OUTPUT`-style cap anywhere in the
+   codebase. A single chatty MCP tool returning a multi-megabyte payload would
+   be resident in the dashboard process and in the conversation history. I did
+   **not** patch this, because I could not measure it: `mcp.render.com` needs
+   an API key this sandbox does not have, and adding an unmeasured limit to
+   tool output would be exactly the kind of blind change that trades a
+   memory risk for silently truncated answers. The fix needs a real MCP
+   server to measure against.
+
+Two things I checked, one of which turned out to be a **real bug I then
+fixed**, and one of which was already fine:
+
+- **MCP discovery blocks chat startup for up to 60 s — found and fixed.** I
+  first wrote in this report that MCP discovery was lazy and off the critical
+  path. That was **wrong**, and reading the actual call sites showed it:
+  `tui_gateway/entry.py` calls `discover_mcp_tools()` **synchronously before
+  emitting `gateway.ready`** — the very event the browser Chat tab waits on —
+  and `gateway/run.py` awaits it before `runner.start()`. Upstream's
+  `_DEFAULT_CONNECT_TIMEOUT` is **60 s**, and the Render MCP entry the
+  patcher injects set no override, so it inherited it.
+
+  Measured against a non-routable address:
+
+  | `connect_timeout` | `discover_mcp_tools()` | result |
+  |---|---|---|
+  | default (60) | **60.05 s blocked** | `[]` |
+  | 5 | **5.03 s blocked** | `[]` |
+
+  So a slow or unreachable `mcp.render.com` at boot left the dashboard's chat
+  unusable for a full minute of a cold start — on a Free instance that has
+  just spun up. `patch-config.py` now injects `connect_timeout: 10`
+  (`HERMES_RENDER_MCP_CONNECT_TIMEOUT`), capping the worst case at a sixth of
+  upstream's. This bounds how long boot **waits**; it does not disable the
+  server. The tools still register once it answers, and discovery retries the
+  missing servers on its next call. A TLS round trip to GitHub measured
+  0.55–0.61 s wall on this 0.1 CPU budget, so 10 s is generous for a healthy
+  MCP initialize.
+
+- **Thread pools are already at single-user scale.** The only
+  `ThreadPoolExecutor` in the gateway/TUI/dashboard paths is `tui_gateway`'s
+  RPC pool, sized `max(2, HERMES_TUI_RPC_POOL_WORKERS or 4)` — which
+  `env/common.env` pins to **2**. Measured: 11 threads total across the whole
+  idle process tree.
 
 ---
 
@@ -285,6 +338,7 @@ Startup to port bind at 0.1 CPU: **~13–14 s**.
 | `HERMES_KEEP_ALIVE_PATH` | `/api/plugins/hermes-chat-dashboard/health` | ~90× cheaper keep-alive. |
 | `GIT_STATE_WATCH_SECONDS` / `DEBOUNCE` / `MIN_PUSH_INTERVAL` | `15` / `20` / `60` | Still lands in GitHub within ~1 min. |
 | `HERMES_RESTORE_ATTEMPTS` / `TIMEOUT_SECONDS` | `1` / `90` | Keeps restore inside Render's port-scan window. |
+| `HERMES_RENDER_MCP_CONNECT_TIMEOUT` | `10` | Was inheriting upstream's 60 s, which blocked `gateway.ready` — and therefore browser chat — for that long if `mcp.render.com` was slow at boot. |
 
 **Secrets** (`GIT_STATE_TOKEN`, `GITHUB_TOKEN`, provider keys, Telegram
 tokens) stay exactly as they are — environment-based, and none of the new
@@ -311,35 +365,46 @@ change is in `render.yaml`.
 
 ## 8. Diff summary
 
+Against the base commit `22ca8b7` (excluding this report):
+
 ```
- .env.example                                       |  43 +++-
+ .env.example                                       |  55 ++++-
  Dockerfile                                         |  23 ++
  .../hermes-chat-dashboard/dashboard/plugin_api.py  |  28 +++
- env/common.env                                     |  66 ++++-
- render.yaml                                        | 100 +++++++-
+ env/common.env                                     |  79 +++++-
+ render.yaml                                        | 116 ++++++++-
  scripts/bootstrap.sh                               | 272 +++++++++++++++++--
  scripts/git-storage.py                             | 215 +++++++++++++++-
+ scripts/patch-config.py                            |  43 ++++
+ scripts/patch-session-cap.py                       | 153 ++++++++++++
  scripts/patch-slash-worker.py                      |  98 +++++++-
- tests/test_bootstrap_supervision.py                | 195 ++++++++++++++-
- tests/test_env_defaults.py                         |  18 ++
+ tests/test_bootstrap_supervision.py                | 195 +++++++++++++-
+ tests/test_env_defaults.py                         |  19 ++
+ tests/test_patch_config.py                         |  42 ++++
+ tests/test_patch_session_cap.py                    | 158 ++++++++++++
  tests/test_patch_slash_worker.py                   |  69 +++++-
- 11 files changed, 1069 insertions(+), 58 deletions(-)
+ tools/bench/cgroup-run.sh                          | 167 ++++++++++++
+ tools/bench/memwatch.py                            | 224 +++++++++++++++++
+ tools/bench/stress_chat.py                         | 266 ++++++++++++++++++
+ 18 files changed, 2164 insertions(+), 58 deletions(-)
 ```
 
 New files: `scripts/patch-session-cap.py` (153),
 `tests/test_patch_session_cap.py` (158), `tools/bench/{cgroup-run.sh,
 memwatch.py, stress_chat.py}` (657).
 
----
+Every upstream patch is exact-match and **fails the build** if the pinned
+source moves; `patch-slash-worker.py` additionally re-scans after patching and
+names the offending line if any ungated `_SlashWorker(` reappears.
 
 ## 9. Verification
 
-**241 tests pass across 12 files**, run file-by-file (whole-directory runs have
+**243 tests pass across 12 files**, run file-by-file (whole-directory runs have
 pre-existing cross-file pollution unrelated to this work):
 
 ```
 test_bootstrap_supervision.py   11 passed     test_git_storage.py        107 passed
-test_chat_dashboard_plugin.py    4 passed     test_patch_config.py         9 passed
+test_chat_dashboard_plugin.py    4 passed     test_patch_config.py        11 passed
 test_chat_dashboard_routes.py   36 passed     test_patch_model_discovery.py 2 passed
 test_env_defaults.py             1 passed     test_patch_session_cap.py    6 passed
 test_plugin_api.py              31 passed     test_patch_slash_worker.py   7 passed (+3 subtests)

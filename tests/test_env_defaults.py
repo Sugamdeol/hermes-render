@@ -58,5 +58,6 @@ def test_env_example_matches_boot_defaults_for_chat_and_free_tier_guards():
         "GIT_STATE_HTTP_POST_BUFFER_MB",
         "GIT_STATE_BIG_FILE_THRESHOLD_KB",
         "GIT_STATE_MAX_MEMORY_PCT",
+        "HERMES_RENDER_MCP_CONNECT_TIMEOUT",
     ):
         assert example.get(key) == common.get(key), f"{key} drifted between .env.example and env/common.env"

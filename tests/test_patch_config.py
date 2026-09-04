@@ -27,6 +27,48 @@ class PatchConfigTests(unittest.TestCase):
 
         self.assertNotIn("tools", render_entry)
 
+    def test_render_mcp_entry_bounds_the_connect_timeout(self):
+        """tui_gateway/entry.py calls discover_mcp_tools() synchronously
+        before emitting `gateway.ready` -- the event the browser Chat tab
+        waits on. Upstream's connect timeout is 60 s, measured to block
+        discover_mcp_tools() for 60.05 s against an unreachable server, which
+        would leave chat unusable for a full minute of a cold boot. The
+        injected entry must therefore carry an explicit bound."""
+        patch_config = load_patch_config()
+
+        entry = patch_config._render_entry()
+
+        self.assertIn("connect_timeout", entry)
+        self.assertLess(entry["connect_timeout"], 60)
+        self.assertGreater(entry["connect_timeout"], 0)
+        # the server itself is untouched -- this bounds the wait, it does not
+        # disable MCP
+        self.assertEqual(entry["url"], "https://mcp.render.com/mcp")
+
+    def test_render_mcp_connect_timeout_is_env_configurable(self):
+        patch_config = load_patch_config()
+        key = patch_config.RENDER_MCP_CONNECT_TIMEOUT_ENV
+        previous = os.environ.get(key)
+        try:
+            os.environ[key] = "4"
+            self.assertEqual(patch_config._render_entry()["connect_timeout"], 4.0)
+
+            # an unparsable or non-positive value must fall back rather than
+            # raise: this runs at boot, and a typo in one environment variable
+            # should not stop the container from starting
+            for bad in ("nonsense", "0", "-3", ""):
+                os.environ[key] = bad
+                self.assertEqual(
+                    patch_config._render_entry()["connect_timeout"],
+                    patch_config.RENDER_MCP_CONNECT_TIMEOUT_DEFAULT,
+                    f"{bad!r} should fall back to the default",
+                )
+        finally:
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
     def test_bynara_provider_uses_environment_key(self):
         patch_config = load_patch_config()
 
