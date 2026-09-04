@@ -237,6 +237,159 @@ class MainTests(unittest.TestCase):
         self.assertEqual(shlex.split(line)[1], "TRICKY=a b'c$d")
 
 
+class EvictKeysTests(unittest.TestCase):
+    def setUp(self):
+        self.seed_env = load_seed_env()
+
+    def test_removes_only_the_named_keys_and_keeps_everything_else_verbatim(self):
+        env_text = (
+            "# keep this comment\n"
+            "OPENROUTER_API_KEY=sk-keep\n"
+            "export HERMES_DASHBOARD_TUI=0\n"
+            "\n"
+            "UNRELATED=stays\n"
+            "HERMES_DASHBOARD_TUI=0\n"
+        )
+
+        new_text, removed = self.seed_env.evict_keys(env_text, {"HERMES_DASHBOARD_TUI"})
+
+        self.assertEqual(removed, ["HERMES_DASHBOARD_TUI"])
+        self.assertEqual(
+            new_text,
+            "# keep this comment\nOPENROUTER_API_KEY=sk-keep\n\nUNRELATED=stays\n",
+        )
+
+    def test_no_match_returns_text_unchanged(self):
+        env_text = "A=1\nB=2\n"
+
+        new_text, removed = self.seed_env.evict_keys(env_text, {"HERMES_DASHBOARD_TUI"})
+
+        self.assertEqual(removed, [])
+        self.assertEqual(new_text, env_text)
+
+    def test_prunes_managed_header_left_with_no_assignments(self):
+        header = self.seed_env.MANAGED_HEADER
+        env_text = (
+            "REAL_KEY=abc\n"
+            f"{header}\n"
+            "HERMES_DASHBOARD_TUI=0\n"
+            "PORT=10000\n"
+            f"{header}\n"
+            "RENDER_MCP_API_KEY=rnd\n"
+        )
+
+        new_text, removed = self.seed_env.evict_keys(env_text, {"HERMES_DASHBOARD_TUI", "PORT"})
+
+        self.assertEqual(sorted(removed), ["HERMES_DASHBOARD_TUI", "PORT"])
+        # The block that only held knobs is gone header and all; the block
+        # that still introduces a secret keeps its header.
+        self.assertEqual(new_text, f"REAL_KEY=abc\n{header}\nRENDER_MCP_API_KEY=rnd\n")
+
+    def test_file_that_only_held_knobs_becomes_empty(self):
+        header = self.seed_env.MANAGED_HEADER
+
+        new_text, removed = self.seed_env.evict_keys(f"{header}\nPORT=10000\n", {"PORT"})
+
+        self.assertEqual(removed, ["PORT"])
+        self.assertEqual(new_text, "")
+
+
+class KnobsModeTests(unittest.TestCase):
+    """--knobs: env/common.env must reach the process env but never .env.
+
+    Upstream loads $HERMES_HOME/.env with override=True on every start, so a
+    deploy knob persisted there outranks Render's Environment tab. That is how
+    a HERMES_DASHBOARD_TUI=0 seeded by an older image (and restored from the
+    state repo) kept the Chat tab off after the operator set it to 1.
+    """
+
+    def setUp(self):
+        self.seed_env = load_seed_env()
+
+    def run_knobs(self, knobs: str, env: str | None, environ: dict | None = None):
+        with TemporaryDirectory() as tmp:
+            knobs_path = Path(tmp) / "common.env"
+            env_path = Path(tmp) / ".env"
+            knobs_path.write_text(knobs, encoding="utf-8")
+            if env is not None:
+                env_path.write_text(env, encoding="utf-8")
+            stdout: list[str] = []
+            with mock.patch.dict(os.environ, environ or {}, clear=False):
+                for key in [k for k, _ in self.seed_env.parse_dotenv(knobs)]:
+                    if not (environ and key in environ):
+                        os.environ.pop(key, None)
+                with mock.patch.object(self.seed_env.sys, "stdout", new=_Capture(stdout)):
+                    code = self.seed_env.main(
+                        ["--knobs", str(knobs_path), "--env-file", str(env_path),
+                         "--print-exports"]
+                    )
+            final_env = env_path.read_text(encoding="utf-8") if env_path.exists() else None
+            mode = env_path.stat().st_mode & 0o777 if env_path.exists() else None
+            exported = {}
+            for line in "".join(stdout).splitlines():
+                if line.strip():
+                    k, v = line.removeprefix("export ").split("=", 1)
+                    exported[k] = v
+            return code, exported, final_env, mode
+
+    def test_stale_knob_in_env_file_is_removed_so_render_setting_wins(self):
+        header = self.seed_env.MANAGED_HEADER
+        stale_env = (
+            "OPENROUTER_API_KEY=sk-keep\n"
+            f"{header}\n"
+            "HERMES_DASHBOARD_TUI=0\n"
+            "HERMES_AGENT_CACHE_MAX_SIZE=16\n"
+        )
+
+        code, exported, final_env, mode = self.run_knobs(
+            "HERMES_DASHBOARD_TUI=1\nHERMES_AGENT_CACHE_MAX_SIZE=8\n",
+            stale_env,
+            environ={"HERMES_DASHBOARD_TUI": "1"},
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(final_env, "OPENROUTER_API_KEY=sk-keep\n")
+        self.assertEqual(mode, 0o600)
+        # The live environment owns HERMES_DASHBOARD_TUI, so it is not
+        # re-exported; the knob the environment lacks is.
+        self.assertEqual(exported, {"HERMES_AGENT_CACHE_MAX_SIZE": "8"})
+
+    def test_knobs_are_never_written_into_the_env_file(self):
+        code, exported, final_env, _ = self.run_knobs(
+            "HERMES_DASHBOARD_TUI=1\nPORT=10000\n", env="EXISTING=1\n"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(final_env, "EXISTING=1\n")
+        self.assertEqual(exported, {"HERMES_DASHBOARD_TUI": "1", "PORT": "10000"})
+
+    def test_missing_env_file_is_not_created_by_knobs_mode(self):
+        code, exported, final_env, _ = self.run_knobs("PORT=10000\n", env=None)
+
+        self.assertEqual(code, 0)
+        self.assertIsNone(final_env)
+        self.assertEqual(exported, {"PORT": "10000"})
+
+    def test_process_environment_beats_the_repo_knob(self):
+        code, exported, _, _ = self.run_knobs(
+            "HERMES_DASHBOARD_TUI=1\n", env="", environ={"HERMES_DASHBOARD_TUI": "0"}
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(exported, {})
+
+    def test_secrets_and_knobs_flags_are_mutually_exclusive(self):
+        quiet = _Capture([])
+        with TemporaryDirectory() as tmp:
+            with mock.patch.object(self.seed_env.sys, "stderr", new=quiet):
+                with self.assertRaises(SystemExit):
+                    self.seed_env.main(
+                        ["--secrets", "a", "--knobs", "b", "--env-file", str(Path(tmp) / ".env")]
+                    )
+                with self.assertRaises(SystemExit):
+                    self.seed_env.main(["--env-file", str(Path(tmp) / ".env")])
+
+
 class _Capture:
     def __init__(self, sink):
         self.sink = sink

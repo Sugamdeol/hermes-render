@@ -199,9 +199,24 @@ fi
 # patcher runs, so config.yaml substitutions like ${RENDER_MCP_API_KEY} can
 # resolve from a committed secret as well as from Render's Environment tab.
 #
-# Precedence (highest first): the live process environment, then the existing
-# $HERMES_HOME/.env, then the repo. Set RENDER_TOOLS_SECRETS_FORCE=1 to let the
-# repo win over .env, which is what a key rotation in git wants.
+# Two sources, handled differently on purpose:
+#
+#   env/common.env      Non-secret deploy knobs (ports, HERMES_DASHBOARD_TUI,
+#                       thread caps, cache sizes). Exported for the gateway
+#                       and dashboard, but kept OUT of $HERMES_HOME/.env --
+#                       and evicted from it if an older boot put them there.
+#                       Upstream loads that file with override=True on every
+#                       start, so a knob persisted in it would silently beat
+#                       Render's Environment tab: a stale HERMES_DASHBOARD_TUI=0
+#                       there is exactly why the Chat tab stayed off (and /chat
+#                       bounced to Sessions) after the operator set it to 1.
+#   env/secrets.enc.env Credentials. Merged into $HERMES_HOME/.env so the
+#                       dashboard's API Keys tab sees them.
+#
+# Precedence for secrets (highest first): the live process environment, then
+# the existing $HERMES_HOME/.env, then the repo. Set RENDER_TOOLS_SECRETS_FORCE=1
+# to let the repo win over .env, which is what a key rotation in git wants.
+# Knobs: the live process environment, then the repo; .env has no say.
 #
 # Values are never echoed. The decrypted file lives in a private tmpfs-ish
 # temp dir owned by hermes and is removed immediately after the merge.
@@ -219,8 +234,14 @@ seed_from_file() {
   gosu hermes "${SEEDER}" ${seed_args}
 }
 
+knobs_from_file() {
+  # $1 = plaintext dotenv of non-secret knobs. Emits exports on stdout; also
+  # scrubs any copy of those keys out of ${DATA_DIR}/.env (see above).
+  gosu hermes "${SEEDER}" --knobs "$1" --env-file "${DATA_DIR}/.env" --print-exports
+}
+
 if [ -x "${SEEDER}" ] && [ -f "${COMMON_ENV}" ]; then
-  if exports="$(seed_from_file "${COMMON_ENV}" 2>/dev/null)"; then
+  if exports="$(knobs_from_file "${COMMON_ENV}")"; then
     eval "${exports}"
     unset exports
   else

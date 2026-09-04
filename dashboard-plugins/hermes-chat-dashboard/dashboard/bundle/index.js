@@ -305,4 +305,44 @@
   }
 
   registry.register("hermes-chat-dashboard", ChatDashboard);
+
+  // The dashboard only wires a /chat route -- built-in or plugin override --
+  // when the server injected __HERMES_DASHBOARD_EMBEDDED_CHAT__=true (that is,
+  // the dashboard process saw HERMES_DASHBOARD_TUI=1). With it false, this
+  // plugin's manifest is still listed and its bundle still loads, but /chat
+  // has no route: the sidebar shows no Chat entry, the Plugins page's "Open
+  // tab" link points at /chat, and the catch-all silently redirects to
+  // /sessions. Nothing in the UI says why. Register a banner that explains
+  // the state and how to fix it, so the failure is diagnosable from the
+  // browser instead of looking like a broken link.
+  const embeddedChatEnabled = window.__HERMES_DASHBOARD_EMBEDDED_CHAT__ === true || window.__HERMES_DASHBOARD_TUI__ === true;
+  if (!embeddedChatEnabled && typeof registry.registerSlot === "function") {
+    function ChatDisabledBanner() {
+      const [dismissed, setDismissed] = useState(() => { try { return sessionStorage.getItem("hcd-disabled-banner") === "1"; } catch { return false; } });
+      const [visible, setVisible] = useState(() => location.pathname.replace(/\/$/, "") === "/chat" || location.pathname.replace(/\/$/, "") === "/sessions");
+      useEffect(() => {
+        // The dashboard is a client-side router; watch for the redirect to
+        // /sessions (and any later navigation) without a full page load.
+        const update = () => { const p = location.pathname.replace(/\/$/, ""); setVisible(p === "/chat" || p === "/sessions" || p === "/plugins"); };
+        const origPush = history.pushState, origReplace = history.replaceState;
+        history.pushState = function () { const r = origPush.apply(this, arguments); update(); return r; };
+        history.replaceState = function () { const r = origReplace.apply(this, arguments); update(); return r; };
+        window.addEventListener("popstate", update);
+        update();
+        return () => { history.pushState = origPush; history.replaceState = origReplace; window.removeEventListener("popstate", update); };
+      }, []);
+      if (dismissed || !visible) return null;
+      return h("div", { className: "hcd-disabled-banner", role: "alert" },
+        h("strong", null, "Chat tab is installed but switched off on this server."),
+        h("span", null,
+          " The dashboard only mounts /chat when it starts with ",
+          h("code", null, "HERMES_DASHBOARD_TUI=1"),
+          ", so the Chat link redirects here. Set ", h("code", null, "HERMES_DASHBOARD_TUI=1"),
+          " in Render's Environment tab (it may be overridden by a stale copy in ", h("code", null, "/opt/data/.env"),
+          " on images older than this fix -- redeploy on the current image and it is cleaned up automatically), then restart the service."),
+        h("button", { type: "button", onClick: () => { setDismissed(true); try { sessionStorage.setItem("hcd-disabled-banner", "1"); } catch {} } }, "Dismiss")
+      );
+    }
+    registry.registerSlot("hermes-chat-dashboard", "header-banner", ChatDisabledBanner);
+  }
 })();

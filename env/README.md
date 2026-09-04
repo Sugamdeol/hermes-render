@@ -21,6 +21,8 @@ Render's Environment tab, and logs that decryption was skipped.
 
 ## Precedence at boot
 
+For **secrets** (`secrets.enc.env`):
+
 1. **The process environment** — Render's Environment tab, or your shell.
    Always wins; the repo never overrides a live deploy knob.
 2. **An existing `$HERMES_HOME/.env`** — written by the dashboard's API Keys
@@ -30,6 +32,16 @@ Render's Environment tab, and logs that decryption was skipped.
 
 Set `RENDER_TOOLS_SECRETS_FORCE=1` to swap 2 and 3, which is what you want
 after rotating a key in git.
+
+For **knobs** (`common.env`) there is no step 2: they are exported for the
+gateway/dashboard processes but never written to `$HERMES_HOME/.env`, and any
+copy already in that file is removed at boot (`seed-env.py --knobs`). Upstream
+Hermes loads `.env` with `override=True` on every process start, so a knob
+persisted there would beat Render's Environment tab — which is how a stale
+`HERMES_DASHBOARD_TUI=0`, seeded by an older image and restored from the state
+backup, kept the dashboard's Chat tab switched off after the operator had set
+the variable to `1`. If you need a knob to differ from `common.env`, set it in
+the Environment tab (or your shell); do not put it in `.env`.
 
 ## Never commit
 
