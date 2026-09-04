@@ -260,28 +260,42 @@ Startup to port bind at 0.1 CPU: **~13–14 s**.
    instance (e.g. `run-local.sh --takeover` from a laptop) sharing
    `GIT_STATE_REPO`, you must set it back to `1` or the two will not
    coordinate.
-4. **The guard has not been observed firing in production.** Its stages are
-   unit-tested against synthetic cgroups, and the OOM ranking is verified
-   end-to-end against the real kernel, but no run here actually crossed 87%.
-   The workload never got close enough.
+4. **CRITICAL and EMERGENCY have not been observed firing.** HIGH has — see
+   §10. But no run here crossed 87% of the cap, so the CRITICAL (stop sync,
+   write the hold file) and EMERGENCY (recycle the dashboard) stages rest on
+   their unit tests against synthetic cgroups rather than on an observed
+   production transition. The workload never got close enough to them.
 5. **Docker image not built.** Docker Hub egress is blocked in this sandbox, so
    the `Dockerfile` itself was never built or run. Every patch was verified
    against a pristine `git show HEAD:` copy of the pinned upstream, and all
-   four apply cleanly and idempotently — but the layer ordering is unproven.
+   four apply cleanly and idempotently. The *runtime* tree was then verified
+   by reconstructing the image's filesystem layout (`/opt/render-tools/*`,
+   `/opt/hermes/*`) and running the real `bootstrap.sh` as root against it —
+   see §10 — but the layer ordering and the base image itself are unproven.
 6. **No real LLM.** Chat was driven against a mock OpenAI-compatible server.
    Real providers stream differently and a large tool output could behave
    differently than the mock's.
-7. **MCP tool output is not size-bounded — verified, not fixed.** Reading
-   `tools/mcp_tool.py` `_call()` (upstream v2026.5.7): it concatenates every
-   `TextContent` block from a tool result and returns the whole thing as JSON.
-   There is no truncation, and no `MAX_TOOL_OUTPUT`-style cap anywhere in the
-   codebase. A single chatty MCP tool returning a multi-megabyte payload would
-   be resident in the dashboard process and in the conversation history. I did
-   **not** patch this, because I could not measure it: `mcp.render.com` needs
-   an API key this sandbox does not have, and adding an unmeasured limit to
-   tool output would be exactly the kind of blind change that trades a
-   memory risk for silently truncated answers. The fix needs a real MCP
-   server to measure against.
+7. **MCP tool output bypasses the tool-output cap — verified, not fixed.**
+   This image *does* cap tool output: `patch-config.py` injects
+   `tool_output.max_bytes = 30000` (plus `max_lines` / `max_line_length`),
+   resolved through `tools/tool_output_limits.py`. But only two tools
+   actually consult it — `tools/file_operations.py` and
+   `tools/terminal_tool.py`. `tools/mcp_tool.py` never imports the limits
+   module, and `handle_function_call` in `model_tools.py` applies no central
+   truncation either; `_call()` concatenates every `TextContent` block from a
+   tool result and returns the whole thing as JSON.
+
+   So a chatty MCP tool returning a multi-megabyte payload would land in the
+   dashboard process and the conversation history uncapped, while a `cat` of
+   the same size through the terminal tool would be trimmed to 30 KB. The
+   inconsistency is the bug, not the absence of a mechanism.
+
+   I did **not** patch this, because I could not measure it: `mcp.render.com`
+   needs an API key this sandbox does not have, and picking a limit without a
+   real server to measure against trades a memory risk for silently truncated
+   answers. The fix is small and the right shape — route `_call()` through
+   `get_max_bytes()` like the other two tools do — but it needs a real MCP
+   server to verify against.
 
 Two things I checked, one of which turned out to be a **real bug I then
 fixed**, and one of which was already fine:
@@ -440,6 +454,80 @@ Integration checks:
 
 ---
 
+## 10. End-to-end run of the real bootstrap.sh
+
+Everything in §3 was measured with `tools/bench/run-stack.sh`, which starts the
+gateway and dashboard directly — it **bypassed `bootstrap.sh` entirely**, so
+the production process tree was untested. To close that, the sandbox was made
+to mirror the image (`/opt/render-tools/{bootstrap.sh,patch-config.py,
+git-storage.py,seed-env.py,env/,dashboard-plugins/,skills-local}`,
+`/opt/hermes/{.venv,docker,tools,skills}`) and the **real `bootstrap.sh` was
+run as root** inside a 512 MB / 0.1 CPU cgroup, dropping to `hermes` through a
+`gosu` double that genuinely changes UID.
+
+The whole boot path ran for real: state restore → `env/common.env` merged
+through `seed-env.py` (42 exports, no duplicates) → `patch-config.py` applied
+the Free-tier profile → dashboard plugins installed into `$HERMES_HOME/plugins`
+→ 89 bundled skills synced → the real `docker/entrypoint.sh` backgrounded the
+dashboard and exec'd the gateway.
+
+**The OOM ranking is correct in the running tree**, read straight out of
+`/proc`:
+
+```
+uid=999  rss=90 MB  oom_adj=-500   hermes gateway run
+uid=999  rss=65 MB  oom_adj= 250   hermes dashboard --host 0.0.0.0 --port 10000
+```
+
+**`/health` through the real boot:** `HTTP 200 {"ok":true}` in 2.2 ms, while
+`/capabilities` on the same router still returns **401** — auth intact.
+
+**Same 10-conversation stress, through the real bootstrap path:**
+
+```
+   idle: 134.3 MB   conv2: 215.8   conv4: 218.1   conv6: 218.7
+  conv8: 219.2 MB  conv10: 219.6   reconnects: 219.6   settled: 219.7
+RESULT: peak=219.7MB settled=219.7MB cgroup_peak=222.5MB turns=10 failures=0
+```
+
+Against 212.0 MB via `run-stack.sh`. The ~8 MB difference is the supervision
+tree itself — the real path runs 10 processes / 19–23 threads (bootstrap, the
+bash entrypoint, the `sed` log prefixer, the guard and watchdog loops) rather
+than 3 / 11. Both are far inside the 50–80 MB reserve the budget calls for.
+
+**The degradation ladder was observed firing.** Shrinking the live cgroup's
+`memory.max` from 512 MB to 265 MB put the same 220 MB of usage at 83%, and
+the guard reacted on its own 3 s tick:
+
+```
+[render-tools] memory guard: NORMAL -> HIGH at 220MB/265MB (83%);
+             gateway=92MB dashboard=152MB children=119MB procs=31 threads=48
+```
+
+Restoring the cap produced the matching recovery:
+
+```
+[render-tools] memory guard: HIGH -> NORMAL at 220MB/512MB (43%); ...
+```
+
+The stack stayed healthy across the excursion (`/health` still 200 in 2.2 ms,
+gateway still at `oom_adj=-500`), and the guard stayed silent the whole time
+usage was under 70% — telemetry only on transitions, as intended.
+
+Two things this run caught that unit tests could not:
+
+- **`gosu` must actually drop privileges.** A test double that merely ignores
+  the user argument sends `docker/entrypoint.sh` into an infinite
+  "Dropping root privileges" loop, because that script re-execs *itself*
+  through gosu and only the UID change stops the recursion. Worth knowing
+  before anyone writes a harness for this image.
+- **The `hermes` user needs to reach the venv.** `patch-config.py`'s shebang
+  is `#!/opt/hermes/.venv/bin/python`; if that path is unreadable by the
+  runtime user the patcher fails and the container boots with an unpatched
+  config. It degrades to a warning, not a crash — which is the right
+  behaviour, but it is silent, so it is worth checking after any base-image
+  bump.
+
 ## Stability verdict: 🟢
 
 Earned, with the caveats in §5 stated plainly.
@@ -450,6 +538,7 @@ deliberately-abandoned tabs at **216 MB** with a flat plateau — inside a real
 cgroup with `memory.max=512MB` and `cpu.max=0.1`, never approaching the cap.
 
 It is 🟢 rather than unqualified because the Docker image itself was never
-built (Docker Hub is unreachable here) and the guard's HIGH/CRITICAL/EMERGENCY
-stages have never been observed firing under genuine pressure. Both are
-honest gaps, and neither is a reason to expect a regression.
+built (Docker Hub is unreachable here), and while the guard's HIGH stage was
+observed firing end-to-end (§10), CRITICAL and EMERGENCY still rest on unit
+tests rather than an observed transition. Both are honest gaps, and neither is
+a reason to expect a regression.
