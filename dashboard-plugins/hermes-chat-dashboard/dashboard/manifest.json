@@ -1,9 +1,9 @@
 {
   "name": "hermes-chat-dashboard",
   "label": "Chat",
-  "description": "First-class ChatGPT-style Hermes web chat workspace backed by the real Hermes TUI gateway, tools, agents, memory, sessions, and streaming events.",
+  "description": "First-class ChatGPT-style Hermes web chat workspace backed by the real Hermes TUI gateway: streaming, tools & approvals, subagent trees, steering, compaction, slash commands, folders/tags/shares, and read-only history that survives gateway restarts.",
   "icon": "MessageSquare",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "tab": {
     "path": "/chat",
     "override": "/chat",

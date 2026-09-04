@@ -308,6 +308,31 @@ def ensure_free_resource_defaults(config: dict, *, fresh: bool = False) -> list[
     return changed
 
 
+def dedupe_enabled_toolsets(config: dict) -> list[str]:
+    """Drop toolsets the pinned runtime rejects as duplicates.
+
+    At v2026.5.7, a config that enables both ``web`` and ``web-search`` makes
+    the tool registry reject ``web`` with
+    "Tool registration REJECTED: 'web_search' (toolset 'web') would shadow
+    existing tool from toolset 'web-search'" -- noisy, order-dependent, and
+    confusing in the logs. The registry keeps ``web-search``'s tool either
+    way, so removing ``web`` from the enabled list changes nothing at
+    runtime. Opt out with HERMES_DEDUPE_TOOLSETS=0.
+    """
+    if os.environ.get("HERMES_DEDUPE_TOOLSETS") == "0":
+        return []
+    tools = config.get("tools")
+    if not isinstance(tools, dict):
+        return []
+    enabled = tools.get("enabled_toolsets")
+    if not isinstance(enabled, list):
+        return []
+    if "web-search" in enabled and "web" in enabled:
+        tools["enabled_toolsets"] = [t for t in enabled if t != "web"]
+        return ["tools.enabled_toolsets -= web (shadowed by web-search)"]
+    return []
+
+
 def ensure_external_skill_dirs(config: dict) -> list[str]:
     """Append the render-tools skill dirs to skills.external_dirs if missing.
 
@@ -365,7 +390,8 @@ def main() -> int:
         config, fresh=apply_free_defaults
     )
     added_dirs = ensure_external_skill_dirs(config)
-    if changed_mcp or changed_bynara or changed_bynara_default or resource_defaults or added_dirs:
+    deduped = dedupe_enabled_toolsets(config)
+    if changed_mcp or changed_bynara or changed_bynara_default or resource_defaults or added_dirs or deduped:
         save_config(path, config)
         parts = []
         if changed_mcp:
@@ -377,6 +403,7 @@ def main() -> int:
         parts.extend(resource_defaults)
         for dir_path in added_dirs:
             parts.append(f"skills.external_dirs += {dir_path}")
+        parts.extend(deduped)
         print(f"[render-tools] patched {path}: {', '.join(parts)}")
     else:
         print(f"[render-tools] {path} already has render MCP + skill dirs; nothing to do")

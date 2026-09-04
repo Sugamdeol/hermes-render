@@ -210,10 +210,12 @@ services:
         value: -j1
       # Bound the pinned gateway's cached per-session agent objects. These
       # values are read by the small Dockerfile source patch at process import.
+      # 4 / 5min held the gateway comfortably inside Free's 512MB even with a
+      # web chat open at the same time; raise both on a paid instance.
       - key: HERMES_AGENT_CACHE_MAX_SIZE
-        value: "8"
+        value: "4"
       - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
-        value: "600"
+        value: "300"
       # Git state-sync memory. git eagerly mallocs http.postBuffer on every
       # push and pack-objects defaults to unbounded delta windows with one
       # thread per core; the shipped defaults can spike one push far past

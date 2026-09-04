@@ -3,11 +3,19 @@
 
 The UI talks to the real Hermes ``tui_gateway`` WebSocket for conversation
 creation, resume, streaming, tool events, cancellation, model switching, tool
-configuration, background jobs, and voice controls.  This plugin adds the small
+configuration, steering, compaction, slash commands, subagent observability,
+background jobs, and voice controls.  This plugin adds the small
 web-dashboard-specific layer that upstream does not own yet: capability
 presentation, durable UI metadata (pins/stars/tags/folders/archive), secure
-share/export helpers, and browser file uploads that are handed back to the
-existing Hermes attachment/context-reference pipeline.
+share/export helpers, folder + tag registries, bulk actions, branch lineage,
+usage rollups, and browser file uploads that are handed back to the existing
+Hermes attachment/context-reference pipeline.
+
+Every helper degrades gracefully on the pinned runtime: ``SessionDB`` method
+surfaces differ between releases (``search_sessions`` vs ``search_messages``,
+``get_messages`` with/without pagination), so calls are feature-detected with
+``getattr`` and wrapped defensively.  History listing NEVER requires the
+gateway — it keeps working read-only while ``tui_gateway`` restarts.
 """
 from __future__ import annotations
 
@@ -30,6 +38,10 @@ META_FILE = "chat_dashboard_meta.json"
 SETTINGS_FILE = "chat_dashboard_settings.json"
 SHARES_FILE = "chat_dashboard_shares.json"
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# Tool/activity payloads are kept bounded so a long agent turn can never pin
+# hundreds of MB of transcript text in the dashboard process's memory.
+MAX_TOOL_ROWS = 400
+MAX_SESSION_ROWS = 500
 
 
 def _require_session(request: Request) -> None:
@@ -202,25 +214,193 @@ async def capabilities(request: Request):
     }
 
 
+# ── metadata (pins / stars / tags / folders / archive) ───────────────
+
+
+def _read_meta() -> dict:
+    meta = _read_json(META_FILE, {})
+    return meta if isinstance(meta, dict) else {}
+
+
 @router.get("/metadata")
 async def metadata(request: Request):
     _require_session(request)
-    return _read_json(META_FILE, {})
+    return _read_meta()
+
+
+META_FIELDS = {"pinned", "starred", "archived", "tags", "folder"}
+
+
+def _sanitize_tags(tags: Any) -> list[str]:
+    if not isinstance(tags, list):
+        return []
+    out: list[str] = []
+    for t in tags:
+        name = str(t or "").strip().lstrip("#")[:40]
+        if name and name not in out:
+            out.append(name)
+    return out[:24]
 
 
 @router.put("/metadata/{session_id}")
 async def put_metadata(request: Request, session_id: str, body: dict):
     _require_session(request)
-    meta = _read_json(META_FILE, {})
-    allowed = {"pinned", "starred", "archived", "tags", "folder"}
+    meta = _read_meta()
     entry = meta.get(session_id, {}) if isinstance(meta.get(session_id), dict) else {}
-    for key in allowed:
+    for key in META_FIELDS:
         if key in body:
-            entry[key] = body[key]
+            value = body[key]
+            if key == "tags":
+                value = _sanitize_tags(value)
+            elif key == "folder":
+                value = str(value or "").strip()[:60]
+            elif key in {"pinned", "starred", "archived"}:
+                value = bool(value)
+            entry[key] = value
     entry["updated_at"] = time.time()
     meta[session_id] = entry
     _write_json(META_FILE, meta)
     return {"ok": True, "metadata": entry}
+
+
+def _apply_meta_patch(meta: dict, session_id: str, patch: dict) -> None:
+    entry = meta.get(session_id, {}) if isinstance(meta.get(session_id), dict) else {}
+    for key in META_FIELDS:
+        if key not in patch:
+            continue
+        value = patch[key]
+        if key == "tags":
+            value = _sanitize_tags(value)
+        elif key == "folder":
+            value = str(value or "").strip()[:60]
+        elif key in {"pinned", "starred", "archived"}:
+            value = bool(value)
+        entry[key] = value
+    entry["updated_at"] = time.time()
+    meta[session_id] = entry
+
+
+@router.post("/metadata/bulk")
+async def bulk_metadata(request: Request, body: dict):
+    """Apply one metadata patch (or a delete) to many sessions at once.
+
+    Body: ``{"ids": [...], "patch": {...}}`` or ``{"ids": [...], "delete": true}``.
+    Deletes go through SessionDB (the gateway refuses live sessions; those are
+    skipped and reported) and also drop the session's metadata row.
+    """
+    _require_session(request)
+    ids = [str(i) for i in (body or {}).get("ids") or [] if str(i or "").strip()][:200]
+    if not ids:
+        raise HTTPException(status_code=400, detail="ids required")
+    do_delete = bool((body or {}).get("delete"))
+    patch = (body or {}).get("patch")
+    if not do_delete and not isinstance(patch, dict):
+        raise HTTPException(status_code=400, detail="patch or delete required")
+
+    meta = _read_meta()
+    updated: list[str] = []
+    deleted: list[str] = []
+    skipped: list[str] = []
+    if do_delete:
+        db = None
+        try:
+            db = _session_db()
+        except HTTPException:
+            db = None
+        for sid in ids:
+            ok = False
+            if db is not None:
+                try:
+                    ok = bool(db.delete_session(sid, sessions_dir=_home() / "sessions"))
+                except Exception:
+                    ok = False
+            if ok:
+                deleted.append(sid)
+                meta.pop(sid, None)
+            else:
+                skipped.append(sid)
+        try:
+            if db is not None:
+                db.close()
+        except Exception:
+            pass
+    else:
+        for sid in ids:
+            _apply_meta_patch(meta, sid, patch)
+            updated.append(sid)
+    _write_json(META_FILE, meta)
+    return {"ok": True, "updated": updated, "deleted": deleted, "skipped": skipped}
+
+
+# ── folders registry ─────────────────────────────────────────────────
+
+
+def _folder_names(meta: dict) -> list[str]:
+    names = set()
+    reg = meta.get("folders") if isinstance(meta.get("folders"), list) else []
+    for name in reg:
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip()[:60])
+    for entry in meta.values():
+        if isinstance(entry, dict) and isinstance(entry.get("folder"), str) and entry["folder"].strip():
+            names.add(entry["folder"].strip()[:60])
+    return sorted(names)
+
+
+@router.get("/folders")
+async def list_folders(request: Request):
+    _require_session(request)
+    meta = _read_meta()
+    counts: dict[str, int] = {}
+    for entry in meta.values():
+        if isinstance(entry, dict) and isinstance(entry.get("folder"), str) and entry["folder"].strip():
+            counts[entry["folder"]] = counts.get(entry["folder"], 0) + 1
+    return {"folders": [{"name": n, "count": counts.get(n, 0)} for n in _folder_names(meta)]}
+
+
+@router.put("/folders/{name}")
+async def put_folder(request: Request, name: str, body: dict | None = None):
+    """Create a folder, or rename it when ``{"new_name": "..."}`` is given."""
+    _require_session(request)
+    name = str(name or "").strip()[:60]
+    new_name = str(((body or {}).get("new_name")) or "").strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400, detail="folder name required")
+    meta = _read_meta()
+    reg = [n for n in (meta.get("folders") if isinstance(meta.get("folders"), list) else []) if isinstance(n, str)]
+    if new_name:
+        if not new_name:
+            raise HTTPException(status_code=400, detail="new_name required")
+        if new_name in _folder_names(meta) and new_name != name:
+            raise HTTPException(status_code=409, detail="folder already exists")
+        for entry in meta.values():
+            if isinstance(entry, dict) and entry.get("folder") == name:
+                entry["folder"] = new_name
+        reg = [new_name if n == name else n for n in reg]
+        if new_name not in reg:
+            reg.append(new_name)
+    else:
+        if name not in reg:
+            reg.append(name)
+    meta["folders"] = reg
+    _write_json(META_FILE, meta)
+    return {"ok": True, "folders": _folder_names(meta)}
+
+
+@router.delete("/folders/{name}")
+async def delete_folder(request: Request, name: str):
+    """Remove a folder; sessions keep their transcripts and simply become unfiled."""
+    _require_session(request)
+    name = str(name or "").strip()
+    meta = _read_meta()
+    for entry in meta.values():
+        if isinstance(entry, dict) and entry.get("folder") == name:
+            entry["folder"] = ""
+    reg = [n for n in (meta.get("folders") if isinstance(meta.get("folders"), list) else [])
+           if isinstance(n, str) and n != name]
+    meta["folders"] = reg
+    _write_json(META_FILE, meta)
+    return {"ok": True, "folders": _folder_names(meta)}
 
 
 def _content_text(content: Any) -> str:
@@ -254,6 +434,87 @@ def _content_text(content: Any) -> str:
     return str(content)
 
 
+def _search_hits(db: Any, query: str) -> list[dict]:
+    """Full-text search across message content, tolerant of the pinned surface.
+
+    v2026.5.7 exposes ``search_messages``; some other releases call it
+    ``search_sessions``.  Feature-detect both and never raise.
+    """
+    query = str(query or "").strip()
+    if not query:
+        return []
+    for name in ("search_messages", "search_sessions"):
+        fn = getattr(db, name, None)
+        if not callable(fn):
+            continue
+        try:
+            hits = fn(query, limit=50) or []
+        except TypeError:
+            try:
+                hits = fn(query) or []
+            except Exception:
+                continue
+        except Exception:
+            continue
+        out = []
+        for hit in hits:
+            if isinstance(hit, dict):
+                out.append(hit)
+        if out:
+            return out[:50]
+    return []
+
+
+def _list_rows(db: Any, limit: int, offset: int) -> tuple[list[dict], bool]:
+    """One page of session rows plus a has_more hint, native-offset first."""
+    rich = getattr(db, "list_sessions_rich", None)
+    rows: list = []
+    if callable(rich):
+        try:
+            rows = list(rich(source=None, limit=limit + 1, offset=offset)) or []
+        except TypeError:
+            # Older pins without offset: fetch a superset and slice here,
+            # the same strategy the gateway's session.list uses.
+            try:
+                rows = list(rich(source=None, limit=limit + offset + 1)) or []
+                rows = rows[offset:offset + limit + 1]
+            except Exception:
+                rows = []
+        except Exception:
+            rows = []
+    if not rows:
+        plain = getattr(db, "list_sessions", None)
+        if callable(plain):
+            try:
+                rows = list(plain(limit=limit + offset + 1)) or []
+                rows = rows[offset:offset + limit + 1]
+            except Exception:
+                rows = []
+    has_more = len(rows) > limit
+    return [r for r in rows if isinstance(r, dict)][:limit], has_more
+
+
+def _row_summary(s: dict, snippet: str = "") -> dict:
+    src = str(s.get("source") or "").strip().lower()
+    return {
+        "id": s.get("id") or "",
+        "title": s.get("title") or "",
+        "preview": s.get("preview") or s.get("summary") or "",
+        "started_at": s.get("started_at") or s.get("created_at") or 0,
+        "last_active": s.get("last_active") or s.get("started_at") or 0,
+        "message_count": s.get("message_count") or s.get("msg_count") or 0,
+        "source": s.get("source") or "",
+        "model": s.get("model") or "",
+        "parent_session_id": s.get("parent_session_id") or "",
+        "input_tokens": s.get("input_tokens") or 0,
+        "output_tokens": s.get("output_tokens") or 0,
+        # child rows (sub-agent runs, compression continuations) are noise in
+        # a chat picker — same deny rule as the gateway's session.list.
+        "_child": src == "tool" or bool(s.get("parent_session_id")),
+        "snippet": str(snippet or ""),
+    }
+
+
 @router.get("/sessions")
 async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = ""):
     """List stored conversations (works even when the gateway WebSocket is down).
@@ -261,56 +522,33 @@ async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0
     Mirrors the gateway's ``session.list`` shape (id/title/preview/started_at/
     message_count/source) so the UI can browse and open history without a live
     TUI session.  ``q`` additionally runs a full-text search across message
-    content (via ``SessionDB.search_sessions`` when available) and merges the
-    matching sessions into the result, so stale titles never hide an old chat.
+    content (via ``SessionDB.search_messages`` on the pinned runtime) and merges
+    the matching sessions into the result, so stale titles never hide an old chat.
     """
     _require_session(request)
-    limit = max(1, min(int(limit or 120), 500))
+    limit = max(1, min(int(limit or 120), MAX_SESSION_ROWS))
     offset = max(0, int(offset or 0))
     query = str(q or "").strip()
     db = _session_db()
     try:
-        rich = getattr(db, "list_sessions_rich", None)
-        # ``list_sessions_rich`` may not accept offset on older pins; fetch a
-        # superset and slice client-side, same strategy as the gateway.
-        fetch_limit = limit + offset
-        if callable(rich):
-            rows = list(rich(source=None, limit=fetch_limit))
-        else:
-            rows = list(db.list_sessions(limit=fetch_limit))
-        rows = rows[offset : offset + limit]
+        rows, has_more = _list_rows(db, limit, offset)
         out = []
         for s in rows:
-            if not isinstance(s, dict):
+            entry = _row_summary(s)
+            if not entry["id"] or entry["_child"]:
                 continue
-            src = str(s.get("source") or "").strip().lower()
-            if src == "tool":  # sub-agent rows are noise in a chat picker
-                continue
-            out.append({
-                "id": s.get("id") or "",
-                "title": s.get("title") or "",
-                "preview": s.get("preview") or s.get("summary") or "",
-                "started_at": s.get("started_at") or s.get("created_at") or 0,
-                "message_count": s.get("message_count") or s.get("msg_count") or 0,
-                "source": s.get("source") or "",
-                "snippet": "",
-            })
+            out.append(entry)
 
         if query:
-            try:
-                hits = db.search_sessions(query) or []
-            except Exception:
-                hits = []
+            hits = _search_hits(db, query)
             if hits:
                 by_id = {s["id"]: s for s in out}
                 merged = list(out)
                 for hit in hits:
-                    if not isinstance(hit, dict):
-                        continue
                     sid = hit.get("session_id") or hit.get("id")
                     if not sid:
                         continue
-                    snippet = hit.get("snippet") or ""
+                    snippet = str(hit.get("snippet") or "")[:200]
                     if sid in by_id:
                         if snippet:
                             by_id[sid]["snippet"] = snippet
@@ -322,33 +560,48 @@ async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0
                         row = None
                     if not isinstance(row, dict):
                         continue
-                    merged.append({
-                        "id": sid,
-                        "title": row.get("title") or "",
-                        "preview": row.get("preview") or row.get("summary") or snippet,
-                        "started_at": row.get("started_at") or row.get("created_at") or 0,
-                        "message_count": row.get("message_count") or row.get("msg_count") or 0,
-                        "source": row.get("source") or "",
-                        "snippet": snippet,
-                    })
+                    entry = _row_summary(row, snippet)
+                    if entry["_child"]:
+                        continue
+                    merged.append(entry)
                 out = sorted(merged, key=lambda s: s.get("started_at") or 0, reverse=True)[:limit]
-        return {"sessions": out, "has_more": len(out) >= limit}
+        return {"sessions": out, "has_more": has_more and not query}
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
-@router.get("/sessions/{session_id}")
-async def get_chat_session(request: Request, session_id: str):
-    """Full transcript for one conversation (read-only; no gateway needed)."""
-    _require_session(request)
-    db = _session_db()
+def _get_messages_page(db: Any, session_id: str, limit: int, offset: int) -> tuple[list, int]:
+    """One chronological page of messages plus the total row count.
+
+    The pinned ``SessionDB.get_messages(session_id)`` takes no limit/offset, so
+    pagination is applied here (load once per request, return only the page —
+    transcripts are never retained between requests).  Newer surfaces that do
+    accept ``limit``/``offset`` are used directly.
+    """
+    fn = getattr(db, "get_messages", None)
+    if not callable(fn):
+        return [], 0
     try:
-        session = db.get_session(session_id)
-        if not session:
-            raise HTTPException(status_code=404, detail="session not found")
-        records = db.get_messages(session_id) or []
-    finally:
-        db.close()
+        rows = fn(session_id, limit=limit, offset=offset) or []
+        # With native pagination we cannot know the total cheaply; the
+        # session row's message_count is the best estimate.
+        return list(rows), max(len(rows) + offset, 0)
+    except TypeError:
+        pass  # pinned surface: get_messages(session_id) only
+    except Exception:
+        return [], 0
+    try:
+        rows = fn(session_id) or []
+    except Exception:
+        return [], 0
+    total = len(rows)
+    return list(rows[offset:offset + limit]), total
+
+
+def _message_rows(records: list, session_id: str, offset: int) -> list[dict]:
     messages = []
     tool_names: dict[str, str] = {}
     for i, m in enumerate(records):
@@ -363,16 +616,143 @@ async def get_chat_session(request: Request, session_id: str):
                 fn = tc.get("function") if isinstance(tc, dict) else None
                 if isinstance(fn, dict) and fn.get("name"):
                     tool_names[tc.get("id") or ""] = fn["name"]
+        row_id = m.get("id")
+        if row_id is None:
+            row_id = f"{session_id}-{offset + i}"
         messages.append({
-            "id": f"{session_id}-{i}",
+            "id": str(row_id),
             "role": role,
             "content": content,
             "tool_name": tool_name,
             "tool_call_id": tool_call_id,
             "tool_calls": m.get("tool_calls"),
+            "reasoning": m.get("reasoning") or "",
             "timestamp": m.get("timestamp") or m.get("created_at") or 0,
         })
-    return {"session": session, "messages": messages, "count": len(messages)}
+    return messages
+
+
+@router.get("/sessions/{session_id}")
+async def get_chat_session(request: Request, session_id: str, limit: int = 0, offset: int = 0):
+    """Transcript for one conversation (read-only; no gateway needed).
+
+    ``limit``/``offset`` page through the stored rows oldest-first.  ``limit=0``
+    (or absent) returns everything — the lazy-load path used when a saved chat
+    is first opened asks for the newest page only.
+    """
+    _require_session(request)
+    limit = int(limit or 0)
+    offset = int(offset or 0)
+    db = _session_db()
+    try:
+        session = db.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        fn = getattr(db, "get_messages", None)
+        if limit <= 0 or offset < 0:
+            # full fetch path: no pagination, or a negative offset which asks
+            # for the NEWEST page ("offset=-N&limit=N" → last N messages)
+            records = []
+            if callable(fn):
+                try:
+                    records = fn(session_id) or []
+                except Exception:
+                    records = []
+            total = len(records)
+            if limit <= 0:
+                messages = _message_rows(list(records), session_id, 0)
+                offset_out = 0
+            else:
+                limit = min(limit, MAX_SESSION_ROWS)
+                real = max(0, total + offset)
+                messages = _message_rows(records[real:real + limit], session_id, real)
+                offset_out = real
+        else:
+            limit = min(limit, MAX_SESSION_ROWS)
+            records, total = _get_messages_page(db, session_id, limit, offset)
+            messages = _message_rows(records, session_id, offset)
+            offset_out = offset
+        return {
+            "session": session,
+            "messages": messages,
+            "count": len(messages),
+            "total": total,
+            # has_more = more rows exist outside this page. For the UI's
+            # newest-page requests that means "older history can be loaded".
+            "offset": offset_out,
+            "has_more": offset_out > 0 or (offset_out + len(messages)) < total,
+        }
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+@router.get("/sessions/{session_id}/tree")
+async def get_session_tree(request: Request, session_id: str):
+    """Branch lineage: the parent session plus every direct child (branches,
+    compression continuations).  Children are discovered through
+    ``list_sessions_rich(include_children=True)`` when the pinned runtime
+    exposes it, and degrade to an empty list otherwise."""
+    _require_session(request)
+    db = _session_db()
+    try:
+        session = db.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        parent = None
+        parent_id = session.get("parent_session_id") or ""
+        if parent_id:
+            try:
+                parent = db.get_session(parent_id)
+            except Exception:
+                parent = None
+        children: list[dict] = []
+        rich = getattr(db, "list_sessions_rich", None)
+        if callable(rich):
+            try:
+                rows = list(rich(source=None, limit=MAX_SESSION_ROWS, include_children=True,
+                                 project_compression_tips=False)) or []
+                children = [
+                    {
+                        "id": r.get("id") or "",
+                        "title": r.get("title") or "",
+                        "started_at": r.get("started_at") or 0,
+                        "message_count": r.get("message_count") or 0,
+                        "end_reason": r.get("end_reason") or "",
+                    }
+                    for r in rows
+                    if isinstance(r, dict) and r.get("parent_session_id") == session_id
+                ]
+            except TypeError:
+                try:
+                    rows = list(rich(limit=MAX_SESSION_ROWS, include_children=True)) or []
+                    children = [
+                        {"id": r.get("id") or "", "title": r.get("title") or "",
+                         "started_at": r.get("started_at") or 0,
+                         "message_count": r.get("message_count") or 0,
+                         "end_reason": r.get("end_reason") or ""}
+                        for r in rows
+                        if isinstance(r, dict) and r.get("parent_session_id") == session_id
+                    ]
+                except Exception:
+                    children = []
+            except Exception:
+                children = []
+        children.sort(key=lambda c: c.get("started_at") or 0, reverse=True)
+        return {
+            "session": {"id": session.get("id"), "title": session.get("title") or ""},
+            "parent": ({"id": parent.get("id"), "title": parent.get("title") or "",
+                        "started_at": parent.get("started_at") or 0}
+                       if isinstance(parent, dict) else None),
+            "children": children[:50],
+        }
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @router.post("/sessions/{session_id}/rename")
@@ -391,7 +771,10 @@ async def rename_chat_session(request: Request, session_id: str, body: dict):
             raise HTTPException(status_code=400, detail=str(exc))
         return {"ok": bool(ok), "session_id": session_id, "title": title}
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @router.delete("/sessions/{session_id}")
@@ -414,14 +797,72 @@ async def delete_chat_session(request: Request, session_id: str):
         except Exception as exc:
             raise HTTPException(status_code=409, detail=f"delete failed: {exc}")
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
     if not deleted:
         raise HTTPException(status_code=409, detail="session could not be deleted (may be active)")
-    meta = _read_json(META_FILE, {})
+    meta = _read_meta()
     if isinstance(meta, dict) and session_id in meta:
         meta.pop(session_id, None)
         _write_json(META_FILE, meta)
     return {"ok": True, "deleted": session_id}
+
+
+@router.get("/usage")
+async def usage_summary(request: Request, days: int = 14):
+    """Token usage rollups (per day, per model) derived from session rows.
+
+    Cheap: one ``list_sessions_rich`` pass over the window — no message bodies
+    are read.  Degrades to empty when the helper is unavailable.
+    """
+    _require_session(request)
+    days = max(1, min(int(days or 14), 90))
+    cutoff = time.time() - days * 86400
+    db = _session_db()
+    try:
+        rich = getattr(db, "list_sessions_rich", None)
+        rows: list = []
+        if callable(rich):
+            try:
+                rows = list(rich(source=None, limit=MAX_SESSION_ROWS, include_children=True,
+                                 project_compression_tips=False)) or []
+            except TypeError:
+                try:
+                    rows = list(rich(limit=MAX_SESSION_ROWS, include_children=True)) or []
+                except Exception:
+                    rows = []
+            except Exception:
+                rows = []
+        per_day: dict[str, dict] = {}
+        per_model: dict[str, dict] = {}
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            started = r.get("started_at") or 0
+            if not started or started < cutoff:
+                continue
+            day = time.strftime("%Y-%m-%d", time.localtime(started))
+            model = str(r.get("model") or "unknown")
+            inp = int(r.get("input_tokens") or 0)
+            outp = int(r.get("output_tokens") or 0)
+            for key, bucket_map in ((day, per_day), (model, per_model)):
+                b = bucket_map.setdefault(key, {"input": 0, "output": 0, "sessions": 0})
+                b["input"] += inp
+                b["output"] += outp
+                b["sessions"] += 1
+        return {
+            "days": days,
+            "per_day": [{"key": k, **v} for k, v in sorted(per_day.items())],
+            "per_model": [{"key": k, **v} for k, v in
+                          sorted(per_model.items(), key=lambda kv: -(kv[1]["input"] + kv[1]["output"]))[:20]],
+        }
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @router.get("/settings")
@@ -518,9 +959,15 @@ async def branch_from_message(request: Request, body: dict):
     try:
         if not db.get_session(source):
             raise HTTPException(status_code=404, detail="session not found")
-        messages = db.get_messages(source)[: upto + 1]
-        new_id = secrets.token_hex(4)
-        db.create_session(new_id, source="web", parent_session_id=source)
+        try:
+            messages = (db.get_messages(source) or [])[: upto + 1]
+        except Exception:
+            messages = []
+        new_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
+        try:
+            db.create_session(new_id, source="web", parent_session_id=source)
+        except TypeError:
+            db.create_session(new_id, source="web")
         for msg in messages:
             db.append_message(new_id, msg.get("role", "user"), msg.get("content"), tool_name=msg.get("tool_name"), tool_calls=msg.get("tool_calls"), tool_call_id=msg.get("tool_call_id"))
         try:
@@ -533,7 +980,10 @@ async def branch_from_message(request: Request, body: dict):
             pass
         return {"ok": True, "session_id": new_id, "parent": source, "title": title}
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 @router.get("/export/{session_id}")
@@ -545,9 +995,15 @@ async def export_session(request: Request, session_id: str, format: str = "markd
         session = db.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="session not found")
-        messages = db.get_messages(session_id)
+        try:
+            messages = db.get_messages(session_id) or []
+        except Exception:
+            messages = []
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
     title = session.get("title") or session_id
     if fmt == "json":
         return {"session": session, "messages": messages}
@@ -556,10 +1012,13 @@ async def export_session(request: Request, session_id: str, format: str = "markd
     parts = [f"# {title}", ""] if fmt in {"markdown", "md"} else [f"{title}", ""]
     for msg in messages:
         role = (msg.get("role") or "message").title()
-        content = msg.get("content") or ""
+        content = _content_text(msg.get("content"))
         parts.extend([f"## {role}" if fmt in {"markdown", "md"} else f"[{role}]", str(content), ""])
     media = "text/markdown" if fmt in {"markdown", "md"} else "text/plain"
     return PlainTextResponse("\n".join(parts), media_type=f"{media}; charset=utf-8")
+
+
+# ── shares ───────────────────────────────────────────────────────────
 
 
 @router.post("/share/{session_id}")
@@ -570,8 +1029,13 @@ async def create_share(request: Request, session_id: str, body: dict | None = No
         if not db.get_session(session_id):
             raise HTTPException(status_code=404, detail="session not found")
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
     shares = _read_json(SHARES_FILE, {})
+    if not isinstance(shares, dict):
+        shares = {}
     token = secrets.token_urlsafe(24)
     shares[token] = {
         "session_id": session_id,
@@ -582,6 +1046,50 @@ async def create_share(request: Request, session_id: str, body: dict | None = No
     }
     _write_json(SHARES_FILE, shares)
     return {"ok": True, "token": token, "url": f"/api/plugins/hermes-chat-dashboard/shared/{token}"}
+
+
+@router.get("/shares")
+async def list_shares(request: Request):
+    """Every share (active + revoked) with its session title, for management."""
+    _require_session(request)
+    shares = _read_json(SHARES_FILE, {})
+    if not isinstance(shares, dict):
+        return {"shares": []}
+    titles: dict[str, str] = {}
+    db = None
+    try:
+        db = _session_db()
+    except HTTPException:
+        db = None
+    out = []
+    for token, share in shares.items():
+        if not isinstance(share, dict):
+            continue
+        sid = share.get("session_id") or ""
+        if sid and sid not in titles:
+            titles[sid] = ""
+            if db is not None:
+                try:
+                    row = db.get_session(sid)
+                    titles[sid] = (row or {}).get("title") or ""
+                except Exception:
+                    pass
+        out.append({
+            "token": token,
+            "session_id": sid,
+            "session_title": titles.get(sid, ""),
+            "created_at": share.get("created_at") or 0,
+            "revoked": bool(share.get("revoked")),
+            "revoked_at": share.get("revoked_at") or 0,
+            "label": share.get("label") or "",
+        })
+    if db is not None:
+        try:
+            db.close()
+        except Exception:
+            pass
+    out.sort(key=lambda s: s.get("created_at") or 0, reverse=True)
+    return {"shares": out}
 
 
 @router.delete("/share/{token}")
@@ -608,6 +1116,13 @@ async def get_shared(token: str):
         session = db.get_session(sid)
         if not session:
             raise HTTPException(status_code=404, detail="session not found")
-        return {"share": {k: v for k, v in share.items() if k != "session_id"}, "session": session, "messages": db.get_messages(sid)}
+        try:
+            messages = db.get_messages(sid) or []
+        except Exception:
+            messages = []
+        return {"share": {k: v for k, v in share.items() if k != "session_id"}, "session": session, "messages": messages}
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass

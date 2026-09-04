@@ -12,10 +12,14 @@
 #      Integration entries remain idempotent and insert-only.
 #   5. Starts the optional state-sync worker (supervised: if the worker
 #      process ever dies, it is restarted) and the optional Free-tier
-#      keep-alive ping.
-#   6. Runs the upstream entrypoint chain as a supervised child and, when it
-#      exits, holds the container open for a few bounded seconds so the sync
-#      daemon can land its final push before tini tears everything down.
+#      keep-alive ping, plus a health loop that restarts the dashboard
+#      side-process if it dies and logs memory pressure.
+#   6. Runs the upstream entrypoint chain as a supervised child. An
+#      unexpected gateway exit is restarted in place (bounded by
+#      HERMES_ENTRYPOINT_RESTARTS) instead of paying a full container
+#      restart cycle; clean stops and an exhausted budget fall through to
+#      the original path: hold the container open for a few bounded seconds
+#      so the sync daemon can land its final push before tini tears down.
 #
 # The upstream entrypoint also chowns /opt/data and drops to the hermes
 # user via gosu for the gateway process. Our chown here is redundant in
@@ -25,8 +29,10 @@
 set -eu
 
 DATA_DIR="${HERMES_HOME:-/opt/data}"
-PATCHER="/opt/render-tools/patch-config.py"
-GIT_SYNC="/opt/render-tools/git-storage.py"
+# The helper paths are overridable for dev/test runs of this script; the
+# image always uses the baked-in defaults.
+PATCHER="${HERMES_PATCHER:-/opt/render-tools/patch-config.py}"
+GIT_SYNC="${HERMES_GIT_SYNC:-/opt/render-tools/git-storage.py}"
 
 # Which backend keeps the durable copy of ${DATA_DIR}?
 #
@@ -320,7 +326,7 @@ fi
 # provider" card on the Models page is provided by render-api-providers.
 # Runs after state restore (a restored copy must not shadow the image) and
 # before the sync daemon starts (the image copy is what gets backed up).
-PLUGINS_SRC="/opt/render-tools/dashboard-plugins"
+PLUGINS_SRC="${HERMES_PLUGINS_SRC:-/opt/render-tools/dashboard-plugins}"
 PLUGINS_DST="${DATA_DIR}/plugins"
 if [ -d "${PLUGINS_SRC}" ]; then
   if mkdir -p "${PLUGINS_DST}" 2>/dev/null && chown hermes:hermes "${PLUGINS_DST}" 2>/dev/null; then
@@ -472,31 +478,237 @@ fi
 # whole process group: the gateway exits almost immediately, tini sees its
 # direct child (this script, in the old exec design) exit, and the container
 # is torn down -- SIGKILLing the sync daemon mid-final-push. Every restart
-# then silently dropped whatever had not been pushed in the last ~30s. From
-# here, after the gateway exits we hold the container open for a bounded
-# window (HERMES_SHUTDOWN_FLUSH_SECONDS, default 20s -- Render's stop grace
-# period is 30s) while the daemon flushes, then exit with the gateway's
-# status so a crash still restarts the service exactly as before.
+# then silently dropped whatever had not been pushed in the last ~30s.
+#
+# Crash recovery used to be "exit with the gateway's status and let Render
+# restart the container". On the Free tier that costs a full boot cycle
+# (state restore + skills sync + dashboard start, 1-2 minutes) during which
+# the chat tab and Telegram are dead -- observed in production as restarts
+# every ~3 minutes. Instead, an *unexpected* gateway exit is now restarted
+# in place, bounded by HERMES_ENTRYPOINT_RESTARTS (default 5) with a small
+# backoff:
+#   - when the dashboard side-process is still alive, only the gateway is
+#     restarted (the dashboard keeps the port bound, so the web chat only
+#     sees the gateway blip);
+#   - when the dashboard is gone too, the whole upstream entrypoint is
+#     re-run (it re-seeds config, re-syncs skills, starts a new dashboard).
+# Normal exits (clean stop, TERM/INT) and an exhausted restart budget still
+# fall through to the original path: flush the sync daemon's final push,
+# then exit with the child's status so Render restarts the service.
 UPSTREAM_ENTRYPOINT="${HERMES_UPSTREAM_ENTRYPOINT:-/opt/hermes/docker/entrypoint.sh}"
+HERMES_BIN="${HERMES_BIN:-/opt/hermes/.venv/bin/hermes}"
+
+# /proc scan for live processes whose command line contains a needle.
+# Pure POSIX (no ps/pkill dependency): the dashboard and gateway argv both
+# literally contain "hermes dashboard" / "hermes gateway" at the pinned tag.
+proc_pids_matching() {
+  proc_needle="$1"
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "${proc_dir}" ] || continue
+    proc_pid=${proc_dir#/proc/}
+    [ "${proc_pid}" != "$$" ] || continue
+    proc_cmd=$(tr "\000" " " < "${proc_dir}/cmdline" 2>/dev/null) || continue
+    case "${proc_cmd}" in
+      *"${proc_needle}"*) echo "${proc_pid}" ;;
+    esac
+  done
+}
+
+# One-shot memory context, logged on every gateway exit and (throttled)
+# whenever the box is close to its floor. This is what makes the next
+# "it crashed again" log actionable: a 137 next to "MemAvailable=9MB" is an
+# OOM kill, not a Hermes bug.
+memwatch_top_rss() {
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "${proc_dir}" ] || continue
+    proc_pid=${proc_dir#/proc/}
+    proc_rss=$(awk "/^VmRSS:/{print \$2; exit}" "${proc_dir}/status" 2>/dev/null)
+    case "${proc_rss}" in ""|*[!0-9]*) continue ;; esac
+    proc_name=$(awk "/^Name:/{print \$2; exit}" "${proc_dir}/status" 2>/dev/null)
+    echo "${proc_rss} ${proc_name:-?}(${proc_pid})"
+  done | sort -rn | head -n 3 | while read -r rss_rss rss_entry; do
+    echo "[render-tools]   ${rss_entry}: $((rss_rss / 1024))MB RSS"
+  done
+}
+
+memwatch_snapshot() {
+  mem_avail=$(awk "/^MemAvailable:/{printf \"%d\", \$2 / 1024; exit}" /proc/meminfo 2>/dev/null)
+  echo "[render-tools] memory at exit: MemAvailable=${mem_avail:-?}MB; top RSS:" >&2
+  memwatch_top_rss >&2
+}
+
+# Dashboard + memory health loop. The upstream entrypoint backgrounds the
+# dashboard and never watches it: if the dashboard process dies (the classic
+# 512MB OOM victim -- it hosts every web-chat agent), the gateway keeps
+# running but port 10000 goes dark and Render eventually recycles the
+# service. This loop notices within ~10s and restarts the dashboard with the
+# exact upstream argv (including the "[dashboard]" log prefix), bounded and
+# with backoff, and resets its budget once it has stayed up for a while.
+# It also logs throttled memory-pressure lines (HERMES_MEMWATCH=0 disables).
+dashboard_enabled() {
+  case "${HERMES_DASHBOARD:-}" in
+    1|true|TRUE|True|yes|YES|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+start_dashboard_supervised() {
+  dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+  dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+  dash_args="dashboard --host ${dash_host} --port ${dash_port} --no-open"
+  case "${dash_host}" in
+    127.0.0.1|localhost) ;;
+    *) dash_args="${dash_args} --insecure" ;;
+  esac
+  echo "[render-tools] starting dashboard on ${dash_host}:${dash_port} (supervised)" >&2
+  if command -v stdbuf >/dev/null 2>&1; then
+    ( stdbuf -oL -eL gosu hermes "${HERMES_BIN}" ${dash_args} 2>&1 \
+      | sed -u "s/^/[dashboard] /" ) &
+  else
+    ( gosu hermes "${HERMES_BIN}" ${dash_args} 2>&1 \
+      | sed "s/^/[dashboard] /" ) &
+  fi
+}
+
+if dashboard_enabled; then
+  (
+    hw_boot=$(date +%s)
+    hw_attempts=0
+    hw_max="${HERMES_DASHBOARD_RESTARTS:-10}"
+    hw_last_start=0
+    hw_gave_up=0
+    hw_mem_last=0
+    hw_interval="${HERMES_HEALTH_INTERVAL_SECONDS:-10}"
+    case "${hw_interval}" in ""|*[!0-9]*) hw_interval=10 ;; esac
+    hw_thresh="${HERMES_MEMWATCH_MB:-100}"
+    case "${hw_thresh}" in ""|*[!0-9]*) hw_thresh=100 ;; esac
+    hw_grace="${HERMES_HEALTH_GRACE_SECONDS:-60}"
+    case "${hw_grace}" in ""|*[!0-9]*) hw_grace=60 ;; esac
+    while :; do
+      sleep "${hw_interval}"
+      # -- memory telemetry (throttled to one line per 2 minutes) --
+      if [ "${HERMES_MEMWATCH:-1}" = "1" ] && [ -r /proc/meminfo ]; then
+        hw_avail=$(awk "/^MemAvailable:/{print int(\$2 / 1024); exit}" /proc/meminfo 2>/dev/null)
+        case "${hw_avail}" in
+          ""|*[!0-9]*) ;;
+          *)
+            if [ "${hw_avail}" -lt "${hw_thresh}" ] \
+               && [ $(( $(date +%s) - hw_mem_last )) -ge 120 ]; then
+              hw_mem_last=$(date +%s)
+              echo "[render-tools] memory pressure: MemAvailable=${hw_avail}MB (floor ${hw_thresh}MB)" >&2
+              memwatch_top_rss >&2
+            fi
+            ;;
+        esac
+      fi
+      # -- dashboard watchdog (skips the grace window: the entrypoint is
+      #    still seeding/syncing before it starts the dashboard) --
+      [ $(( $(date +%s) - hw_boot )) -ge "${hw_grace}" ] || continue
+      if [ -n "$(proc_pids_matching "hermes dashboard")" ]; then
+        # it is up: once it has survived 5 minutes, forgive earlier crashes
+        if [ $(( $(date +%s) - hw_last_start )) -ge 300 ]; then
+          hw_attempts=0
+          hw_gave_up=0
+        fi
+        continue
+      fi
+      [ "${hw_gave_up}" -eq 0 ] || continue
+      hw_attempts=$((hw_attempts + 1))
+      if [ "${hw_attempts}" -gt "${hw_max}" ]; then
+        echo "[render-tools] warning: dashboard keeps exiting; leaving it down (Telegram/gateway unaffected)." >&2
+        echo "[render-tools] warning: a container restart retries it: HERMES_DASHBOARD_RESTARTS=${hw_max} exceeded." >&2
+        hw_gave_up=1
+        continue
+      fi
+      echo "[render-tools] warning: dashboard process not found; restarting (${hw_attempts}/${hw_max})" >&2
+      hw_last_start=$(date +%s)
+      start_dashboard_supervised
+    done
+  ) &
+fi
 
 stop_requested=0
 on_stop() { stop_requested=1; }
 trap on_stop TERM INT
 
-"${UPSTREAM_ENTRYPOINT}" "$@" &
-CHILD=$!
+restarts_max="${HERMES_ENTRYPOINT_RESTARTS:-5}"
+case "${restarts_max}" in ""|*[!0-9]*) restarts_max=5 ;; esac
+restarts_used=0
+# In-place "gateway only" restarts are only valid when the container command
+# really is the gateway (the image default). Any other CMD goes through the
+# full upstream entrypoint instead.
+is_gateway_cmd=0
+if [ "${1:-}" = "gateway" ] && [ "${2:-}" = "run" ]; then
+  is_gateway_cmd=1
+fi
 
-set +e
 child_status=0
-wait "${CHILD}"
-child_status=$?
-# A trapped signal interrupts `wait` without reaping the child; when that
-# happened, wait again for the child's real exit status (this returns
-# immediately if the child exited in the meantime).
-if kill -0 "${CHILD}" 2>/dev/null; then
+
+while :; do
+  if [ "${restarts_used}" -eq 0 ]; then
+    "${UPSTREAM_ENTRYPOINT}" "$@" &
+    CHILD=$!
+  elif [ "${is_gateway_cmd}" -eq 1 ] \
+       && [ -n "$(proc_pids_matching "hermes dashboard")" ]; then
+    echo "[render-tools] dashboard still up; restarting gateway only (${restarts_used}/${restarts_max})" >&2
+    gosu hermes "${HERMES_BIN}" gateway run &
+    CHILD=$!
+  else
+    echo "[render-tools] restarting upstream entrypoint (${restarts_used}/${restarts_max})" >&2
+    "${UPSTREAM_ENTRYPOINT}" "$@" &
+    CHILD=$!
+  fi
+  child_started=$(date +%s)
+
+  set +e
   wait "${CHILD}"
   child_status=$?
-fi
+  # A trapped signal interrupts `wait` without reaping the child; when that
+  # happened, wait again for the child's real exit status (this returns
+  # immediately if the child exited in the meantime).
+  if kill -0 "${CHILD}" 2>/dev/null; then
+    wait "${CHILD}"
+    child_status=$?
+  fi
+
+  child_uptime=$(( $(date +%s) - child_started ))
+  echo "[render-tools] gateway exited (status ${child_status}, uptime ${child_uptime}s)" >&2
+  if [ "${child_status}" -eq 137 ]; then
+    echo "[render-tools] status 137 = SIGKILL, which on this image is almost always the kernel OOM killer." >&2
+    echo "[render-tools] lower HERMES_AGENT_CACHE_MAX_SIZE / fewer concurrent chats, or upgrade the instance." >&2
+  fi
+  memwatch_snapshot
+
+  # Clean stop (container shutdown, failover handoff) or a clean exit:
+  # no restart, fall through to the flush path.
+  if [ "${stop_requested}" -eq 1 ]; then
+    break
+  fi
+  case "${child_status}" in
+    0|130|143) break ;;
+  esac
+
+  if [ "${restarts_used}" -ge "${restarts_max}" ]; then
+    echo "[render-tools] warning: gateway keeps exiting; giving up so Render restarts the container for a full boot" >&2
+    break
+  fi
+  restarts_used=$((restarts_used + 1))
+  restart_backoff=$((restarts_used * 5))
+  [ "${restart_backoff}" -gt 30 ] && restart_backoff=30
+  echo "[render-tools] unexpected exit; restarting in ${restart_backoff}s" >&2
+  restart_left="${restart_backoff}"
+  while [ "${restart_left}" -gt 0 ] && [ "${stop_requested}" -eq 0 ]; do
+    sleep 1
+    restart_left=$((restart_left - 1))
+  done
+  [ "${stop_requested}" -eq 0 ] || break
+  # Belt and braces: a straggler gateway from the dead run would fight the
+  # new one for platform polling (the exact "terminated by other
+  # getUpdates request" symptom when two pollers share a token).
+  for straggler in $(proc_pids_matching "hermes gateway"); do
+    kill -KILL "${straggler}" 2>/dev/null || true
+  done
+done
 
 # The gateway is gone. Make sure the sync daemon is stopping too -- a
 # failover role change kills only the gateway, and a daemon left running
