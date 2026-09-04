@@ -97,6 +97,57 @@ even with the guard on, the first 30 s — exactly when the agent-runtime import
 while `env/common.env` shipped `4` / `300`. `tests/test_env_defaults.py` was
 **already failing on the base commit** because of it.
 
+### 1.9 A safety valve pinned exactly to the instance size becomes a cliff
+
+`HERMES_MEMGUARD_MAX_ACTIVE_MB` had drifted to `512` in `env/common.env` while
+`.env.example` said `2048`, and the drift test did not cover that key, so
+nothing caught it. This one was introduced by this branch, and it is worth
+dwelling on because the failure is silent.
+
+`bootstrap.sh` gates auto-reclaim on:
+
+```sh
+if [ "${mg_limit_mb}" -gt "${mg_maxactive}" ]; then   # telemetry-only, never reclaims
+```
+
+So the knob is a *ceiling above which the guard refuses to kill anything* — a
+safety valve so a big dev box or an uncapped host never has processes killed
+out from under it. Pinned exactly to the instance size it stops being a valve
+and becomes a cliff: a cgroup that reads `513 MB` instead of `512` puts the
+guard into telemetry-only mode permanently, and it **never reclaims again** —
+on the one tier this whole change exists to protect. There is no error, no
+crash, no OOM; the protection just quietly stops working.
+
+Measured:
+
+| `MAX_ACTIVE_MB` | cgroup cap | guard behaviour |
+|---|---|---|
+| `512` | 512 MB | reclaims |
+| `512` | 513 MB | **telemetry-only, forever** |
+| `2048` | 512 / 513 / 520 MB | reclaims |
+
+Restored to `2048` — base's value in `.env.example` and `bootstrap.sh`'s own
+default.
+
+The comment that introduced `512` described a different variable entirely: the
+`HERMES_MEM_LIMIT_MB` RSS-estimate fallback, which is opt-in and only used when
+*no* cgroup cap is visible. Render's cap is visible, so that fallback is not
+even in play here. A comment attached to the wrong knob is how a wrong value
+survives review.
+
+Four further knobs `bootstrap.sh` has been reading with defaults since earlier
+in this branch appeared in **no** env file at all, so an operator could not see
+or tune the OOM ranking that keeps the gateway alive:
+`HERMES_OOM_PROTECT_WAIT_SECONDS` (60), `HERMES_OOM_SCORE_GATEWAY` (-500),
+`HERMES_OOM_SCORE_DASHBOARD` (250), `HERMES_MEMGUARD_DASHBOARD_GRACE` (5). All
+five are now declared in `env/common.env`, `.env.example` and `render.yaml`,
+and added to the drift test's list.
+
+`HERMES_SEEDER` / `HERMES_COMMON_ENV` / `HERMES_SECRETS_ENC` are deliberately
+left undeclared: they are image-internal path seams that exist so tests can
+point the script elsewhere, the same category as the pre-existing
+`HERMES_PATCHER` / `HERMES_GIT_SYNC` / `HERMES_PLUGINS_SRC`.
+
 ---
 
 ## 2. File-by-file changes
@@ -353,6 +404,11 @@ fixed**, and one of which was already fine:
 | `GIT_STATE_WATCH_SECONDS` / `DEBOUNCE` / `MIN_PUSH_INTERVAL` | `15` / `20` / `60` | Still lands in GitHub within ~1 min. |
 | `HERMES_RESTORE_ATTEMPTS` / `TIMEOUT_SECONDS` | `1` / `90` | Keeps restore inside Render's port-scan window. |
 | `HERMES_RENDER_MCP_CONNECT_TIMEOUT` | `10` | Was inheriting upstream's 60 s, which blocked `gateway.ready` — and therefore browser chat — for that long if `mcp.render.com` was slow at boot. |
+| `HERMES_MEMGUARD_MAX_ACTIVE_MB` | `2048` | Ceiling above which the guard refuses to auto-reclaim. **Do not pin to 512** — see §1.9: a cap reading one megabyte high silently disables reclaim forever. |
+| `HERMES_OOM_SCORE_GATEWAY` | `-500` | Keeps the kernel off the gateway. Newly declared; previously only a `bootstrap.sh` default. |
+| `HERMES_OOM_SCORE_DASHBOARD` | `250` | Dashboard goes first under pressure. Newly declared. |
+| `HERMES_OOM_PROTECT_WAIT_SECONDS` | `60` | Bounded boot wait so the ranking is applied to the gateway PID. Newly declared. |
+| `HERMES_MEMGUARD_DASHBOARD_GRACE` | `5` | EMERGENCY never recycles a dashboard still starting. Newly declared. |
 
 **Secrets** (`GIT_STATE_TOKEN`, `GITHUB_TOKEN`, provider keys, Telegram
 tokens) stay exactly as they are — environment-based, and none of the new
@@ -500,7 +556,7 @@ run as root** inside a 512 MB / 0.1 CPU cgroup, dropping to `hermes` through a
 `gosu` double that genuinely changes UID.
 
 The whole boot path ran for real: state restore → `env/common.env` merged
-through `seed-env.py` (42 exports, no duplicates) → `patch-config.py` applied
+through `seed-env.py` (46 exports, no duplicates) → `patch-config.py` applied
 the Free-tier profile → dashboard plugins installed into `$HERMES_HOME/plugins`
 → 89 bundled skills synced → the real `docker/entrypoint.sh` backgrounded the
 dashboard and exec'd the gateway.
