@@ -223,6 +223,166 @@ async def put_metadata(request: Request, session_id: str, body: dict):
     return {"ok": True, "metadata": entry}
 
 
+def _content_text(content: Any) -> str:
+    """Flatten OpenAI-style content parts (text/image/audio) to display text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (int, float)):
+        return str(content)
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            text = _content_text(part).strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        kind = content.get("type")
+        if kind in {"text", "input_text", "output_text"}:
+            return str(content.get("text") or content.get("content") or "")
+        if kind in {"image_url", "input_image", "image"}:
+            return "[image]"
+        if kind in {"input_audio", "audio"}:
+            return "[audio]"
+        if kind:
+            return f"[{kind}]"
+        if "text" in content:
+            return str(content.get("text") or "")
+        return "[structured content]"
+    return str(content)
+
+
+@router.get("/sessions")
+async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0):
+    """List stored conversations (works even when the gateway WebSocket is down).
+
+    Mirrors the gateway's ``session.list`` shape (id/title/preview/started_at/
+    message_count/source) so the UI can browse and open history without a live
+    TUI session.
+    """
+    _require_session(request)
+    limit = max(1, min(int(limit or 120), 500))
+    offset = max(0, int(offset or 0))
+    db = _session_db()
+    try:
+        rich = getattr(db, "list_sessions_rich", None)
+        # ``list_sessions_rich`` may not accept offset on older pins; fetch a
+        # superset and slice client-side, same strategy as the gateway.
+        fetch_limit = limit + offset
+        if callable(rich):
+            rows = list(rich(source=None, limit=fetch_limit))
+        else:
+            rows = list(db.list_sessions(limit=fetch_limit))
+        rows = rows[offset : offset + limit]
+        out = []
+        for s in rows:
+            if not isinstance(s, dict):
+                continue
+            src = str(s.get("source") or "").strip().lower()
+            if src == "tool":  # sub-agent rows are noise in a chat picker
+                continue
+            out.append({
+                "id": s.get("id") or "",
+                "title": s.get("title") or "",
+                "preview": s.get("preview") or s.get("summary") or "",
+                "started_at": s.get("started_at") or s.get("created_at") or 0,
+                "message_count": s.get("message_count") or s.get("msg_count") or 0,
+                "source": s.get("source") or "",
+            })
+        return {"sessions": out, "has_more": len(out) >= limit}
+    finally:
+        db.close()
+
+
+@router.get("/sessions/{session_id}")
+async def get_chat_session(request: Request, session_id: str):
+    """Full transcript for one conversation (read-only; no gateway needed)."""
+    _require_session(request)
+    db = _session_db()
+    try:
+        session = db.get_session(session_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="session not found")
+        records = db.get_messages(session_id) or []
+    finally:
+        db.close()
+    messages = []
+    tool_names: dict[str, str] = {}
+    for i, m in enumerate(records):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role") or "message"
+        content = _content_text(m.get("content"))
+        tool_call_id = m.get("tool_call_id") or ""
+        tool_name = m.get("tool_name") or tool_names.get(tool_call_id) or ""
+        if role == "assistant" and m.get("tool_calls"):
+            for tc in m["tool_calls"] or []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if isinstance(fn, dict) and fn.get("name"):
+                    tool_names[tc.get("id") or ""] = fn["name"]
+        messages.append({
+            "id": f"{session_id}-{i}",
+            "role": role,
+            "content": content,
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "tool_calls": m.get("tool_calls"),
+            "timestamp": m.get("timestamp") or m.get("created_at") or 0,
+        })
+    return {"session": session, "messages": messages, "count": len(messages)}
+
+
+@router.post("/sessions/{session_id}/rename")
+async def rename_chat_session(request: Request, session_id: str, body: dict):
+    _require_session(request)
+    title = str((body or {}).get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    db = _session_db()
+    try:
+        if not db.get_session(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
+        try:
+            ok = db.set_session_title(session_id, title)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"ok": bool(ok), "session_id": session_id, "title": title}
+    finally:
+        db.close()
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_chat_session(request: Request, session_id: str):
+    """Delete a stored conversation.
+
+    The UI first asks the gateway (``session.delete``) so sessions that are
+    live in this process are refused safely; this endpoint is the fallback for
+    history that is not bound to an active gateway session.
+    """
+    _require_session(request)
+    db = _session_db()
+    try:
+        if not db.get_session(session_id):
+            raise HTTPException(status_code=404, detail="session not found")
+        try:
+            deleted = db.delete_session(
+                session_id, sessions_dir=_home() / "sessions"
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"delete failed: {exc}")
+    finally:
+        db.close()
+    if not deleted:
+        raise HTTPException(status_code=409, detail="session could not be deleted (may be active)")
+    meta = _read_json(META_FILE, {})
+    if isinstance(meta, dict) and session_id in meta:
+        meta.pop(session_id, None)
+        _write_json(META_FILE, meta)
+    return {"ok": True, "deleted": session_id}
+
+
 @router.get("/settings")
 async def get_settings(request: Request):
     _require_session(request)

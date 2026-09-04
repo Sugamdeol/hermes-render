@@ -69,3 +69,21 @@ def test_safe_filename_blocks_path_traversal_and_weird_chars():
     mod = load_chat_plugin()
     assert mod._safe_filename("../../secret?.txt") == "secret_.txt"
     assert mod._safe_filename("!!!") == "upload"
+
+
+def test_content_text_flattens_openai_style_parts():
+    mod = load_chat_plugin()
+    assert mod._content_text(None) == ""
+    assert mod._content_text("plain") == "plain"
+    assert (
+        mod._content_text(
+            [
+                {"type": "text", "text": "hello"},
+                {"type": "image_url", "image_url": {"url": "x"}},
+                {"type": "input_audio"},
+            ]
+        )
+        == "hello\n[image]\n[audio]"
+    )
+    assert mod._content_text({"type": "output_text", "text": "ok"}) == "ok"
+    assert mod._content_text({"type": "weird"}) == "[weird]"
