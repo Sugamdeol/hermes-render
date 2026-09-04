@@ -83,8 +83,74 @@ exit 0
 FAKE_GOSU = "#!/bin/sh\n# real gosu is `gosu USER CMD...`; drop the user and exec the rest\nshift\nexec \"$@\"\n"
 
 
+def _reap_stale_fixtures() -> None:
+    """Kill fixture processes orphaned by an earlier, interrupted run.
+
+    bootstrap.sh locates its children by substring-matching /proc/*/cmdline
+    against needles such as "hermes dashboard". The fixture binary is named
+    ``fake-hermes``, so a ``fake-hermes dashboard`` left behind by a run that
+    was killed (a timeout, a Ctrl-C) satisfies that needle, and the *next*
+    run's watchdog concludes a dashboard is already up and never starts its
+    own. tearDown only kills its own process group, so an interrupted run
+    leaks, and the following run then fails in a way that looks like a
+    bootstrap bug rather than a dirty machine.
+
+    Only processes whose command line names a sandbox directory that no
+    longer exists are killed, and only processes whose HERMES_HOME points at
+    a directory that no longer exists -- so a test running concurrently in
+    its own live sandbox is never touched.
+    """
+    me = os.getpid()
+    victims: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            cmdline = (
+                Path(f"/proc/{entry}/cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        stale = False
+        if "fake-hermes" in cmdline or "fake-entrypoint.sh" in cmdline:
+            dirs = {
+                Path(tok).parent
+                for tok in cmdline.split()
+                if "fake-hermes" in tok or "fake-entrypoint.sh" in tok
+            }
+            stale = bool(dirs) and not any(d.exists() for d in dirs)
+        if not stale:
+            # an orphaned bootstrap.sh names no fixture on its command line,
+            # but its HERMES_HOME still points into the dead sandbox
+            try:
+                environ = Path(f"/proc/{entry}/environ").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                environ = ""
+            for kv in environ.split("\0"):
+                if kv.startswith("HERMES_HOME="):
+                    stale = not Path(kv.split("=", 1)[1]).exists()
+                    break
+        if stale:
+            victims.append(pid)
+    for pid in victims:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
 class BootstrapSupervisionTests(unittest.TestCase):
     def setUp(self):
+        _reap_stale_fixtures()
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-boot-sup-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
@@ -323,6 +389,7 @@ class _GuardHarness(unittest.TestCase):
     """
 
     def setUp(self):
+        _reap_stale_fixtures()
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-oom-guard-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
