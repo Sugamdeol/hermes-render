@@ -413,50 +413,53 @@ names the offending line if any ungated `_SlashWorker(` reappears.
 
 ## 9. Verification
 
-**252 tests collected across 13 files; 250 pass, 2 fail**, run file-by-file
-(whole-directory runs have pre-existing cross-file pollution unrelated to this
-work):
+**252 tests pass across 13 files**, run file-by-file (whole-directory runs have
+pre-existing cross-file pollution unrelated to this work):
 
 ```
-test_bootstrap_supervision.py   9 passed, 2 FAILED   test_patch_mcp_output_cap.py    8 passed
-test_chat_dashboard_plugin.py    4 passed            test_patch_model_discovery.py   2 passed
-test_chat_dashboard_routes.py   36 passed            test_patch_session_cap.py       6 passed
-test_env_defaults.py             2 passed            test_patch_slash_worker.py      7 passed (+3 subtests)
-test_git_storage.py            107 passed            test_patch_ws_session_cleanup.py 3 passed
-test_patch_config.py            11 passed            test_plugin_api.py             31 passed
-                                                     test_seed_env.py               24 passed
+test_bootstrap_supervision.py   11 passed     test_patch_mcp_output_cap.py    8 passed
+test_chat_dashboard_plugin.py    4 passed     test_patch_model_discovery.py   2 passed
+test_chat_dashboard_routes.py   36 passed     test_patch_session_cap.py       6 passed
+test_env_defaults.py             2 passed     test_patch_slash_worker.py      7 passed (+3 subtests)
+test_git_storage.py            107 passed     test_patch_ws_session_cleanup.py 3 passed
+test_patch_config.py            11 passed     test_plugin_api.py             31 passed
+                                              test_seed_env.py               24 passed
 ```
 
 The `test_env_defaults.py` failure on the base commit is **fixed**.
 
-**The 2 failures are environmental and pre-existing, not caused by this work.**
-Both are in `test_bootstrap_supervision.py`
-(`test_dashboard_watchdog_restarts_dead_dashboard`,
-`test_exhausted_restart_budget_exits_for_full_container_restart`). I verified
-this rather than assuming it, by checking out the **base commit `22ca8b7` into
-a separate worktree** and running the same file there: it fails and then hangs
-on the identical two tests (`F`, exit 124). The knobs those tests drive
-(`HERMES_HEALTH_INTERVAL_SECONDS`, `HERMES_HEALTH_GRACE_SECONDS`,
-`HERMES_ENTRYPOINT_RESTARTS`, `HERMES_DASHBOARD_PORT`) appear the same number
-of times in `bootstrap.sh` on my branch as on base, and `dashboard_enabled()`
-is unchanged — so this is not a regression in the supervision logic.
+Two supervision tests (`test_dashboard_watchdog_restarts_dead_dashboard`,
+`test_exhausted_restart_budget_exits_for_full_container_restart`) failed
+intermittently on the development machine while this work was in progress.
+Worth recording, because the first diagnosis was wrong and the second one is a
+genuine test defect that would have bitten anyone else:
 
-What I did fix here is a real hermeticity bug those tests had: `SEEDER`,
-`COMMON_ENV` and `SECRETS_ENC` were the last three hardcoded absolute paths in
-`bootstrap.sh`, so the tests silently depended on `/opt/render-tools` **not**
-existing on the machine running them. Once that directory was present (I
-created it for the §10 integration run), bootstrap merged the real
-`env/common.env` into the test sandbox, the fake binaries stopped behaving like
-the fixtures, and a 37 s test file stopped finishing at all. All three paths
-are now `${HERMES_*:-default}` like every other path in the script, and both
-test harnesses point them at nonexistent paths. That took the file from
-"never completes" back to 53 s.
+- **Not** a supervision-logic bug. Running the failing test's launch path
+  directly, with the machine clean, passes — the watchdog starts the dashboard,
+  `start_dashboard_supervised` runs once, the loop iterates.
+- The real cause: `bootstrap.sh` locates its children by **substring-matching
+  `/proc/*/cmdline`** against needles like `"hermes dashboard"`, and the fixture
+  binary is named `fake-hermes`. A `fake-hermes dashboard` orphaned by an
+  earlier run that was killed (a timeout, a Ctrl-C) satisfies that needle, so
+  the *next* run's watchdog concludes a dashboard is already up and never starts
+  its own. `tearDown` only kills its own process group, so an interrupted run
+  leaks. The failure that follows looks like a bootstrap bug on a dirty machine.
+- Fixed by `_reap_stale_fixtures()`, called from both harnesses' `setUp`. It
+  kills only processes whose command line names a fixture inside a sandbox
+  directory that **no longer exists**, or whose `HERMES_HOME` points at a
+  directory that no longer exists — so a test running concurrently in its own
+  live sandbox is never touched.
 
-The 2 remaining failures reproduce on base in this sandbox and I did **not**
-get to the bottom of them. They should be re-run in a clean CI container before
-this is merged — that environment has neither `/opt/render-tools` nor
-`/opt/hermes`, which is the condition under which they passed earlier in this
-work (11/11, five consecutive runs).
+Verified red/green, not assumed: a script leaves a stale fixture alive with its
+sandbox deleted, the matcher is shown to match it (the exact mechanism), the
+reaper is shown to kill it, and the two tests then pass on a deliberately
+re-poisoned machine — `2 passed, 9 deselected in 10.37s`.
+
+The general lesson is worth keeping: **any test that asserts on what a script
+can see in `/proc` is coupled to every other process on the machine.** Two
+earlier mistakes in this work had the same shape — `pkill -f <pattern>` and
+`ps | awk '/literal/'` both matched the invoking shell, because the pattern
+text was itself in the command line.
 
 One more thing the end-to-end check caught: running `seed-env.py --knobs`
 against the real `env/common.env` — the production path that turns that file
