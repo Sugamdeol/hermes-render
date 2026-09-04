@@ -210,12 +210,38 @@ services:
         value: -j1
       # Bound the pinned gateway's cached per-session agent objects. These
       # values are read by the small Dockerfile source patch at process import.
-      # 4 / 5min held the gateway comfortably inside Free's 512MB even with a
-      # web chat open at the same time; raise both on a paid instance.
+      # Free's 512MB container kept OOM-restarting with the previous 4-agent
+      # cache, so the baseline here is 2 agents evicted after 2min idle. A
+      # single web/Telegram chat is served fine at this; raise both on a paid
+      # instance that can hold more concurrent sessions.
       - key: HERMES_AGENT_CACHE_MAX_SIZE
-        value: "4"
+        value: "2"
       - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
-        value: "300"
+        value: "120"
+
+      # Proactive OOM guard (memory_guard_loop in bootstrap.sh). On a cgroup
+      # cap at or under HERMES_MEMGUARD_MAX_ACTIVE_MB it polls memory every few
+      # seconds and reclaims BEFORE the kernel OOM-kills the container:
+      # telemetry at WARN%, SIGSTOP the git state-sync daemon at PAUSE_SYNC%
+      # (resuming once usage falls to RESUME_SYNC%), and as an emergency last
+      # resort it drops the dashboard (which holds the web-chat agents) at
+      # DASHBOARD_PCT% -- confirmed across 3 consecutive samples and
+      # rate-limited -- so the watchdog restarts it. Dropping the dashboard is
+      # far cheaper than letting the kernel OOM-kill the whole container (a
+      # full 1-2min restore+boot). Set HERMES_MEMGUARD_DASHBOARD_PCT=0 to
+      # disable that stage if you prefer never to recycle the dashboard.
+      - key: HERMES_MEMGUARD
+        value: "1"
+      - key: HERMES_MEMGUARD_INTERVAL_SECONDS
+        value: "3"
+      - key: HERMES_MEMGUARD_WARN
+        value: "70"
+      - key: HERMES_MEMGUARD_PAUSE_SYNC
+        value: "80"
+      - key: HERMES_MEMGUARD_RESUME_SYNC
+        value: "62"
+      - key: HERMES_MEMGUARD_DASHBOARD_PCT
+        value: "92"
       # Git state-sync memory. git eagerly mallocs http.postBuffer on every
       # push and pack-objects defaults to unbounded delta windows with one
       # thread per core; the shipped defaults can spike one push far past
