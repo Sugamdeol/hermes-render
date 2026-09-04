@@ -493,6 +493,72 @@ agent sleep between messages — accepting a cold start on the next one — set
 `HERMES_KEEP_ALIVE=0` in Render's **Environment** tab. Sessions and files
 still survive the sleep either way when the git state sync is enabled.
 
+## Troubleshooting: reading the Render logs
+
+The boot wrapper (`scripts/bootstrap.sh`) prefixes its own lines with
+`[render-tools]`; everything else is Hermes itself. The lines you are most
+likely to see and what they mean:
+
+**`Telegram polling conflict … terminated by other getUpdates request`** —
+a *second* process somewhere is polling the same bot token: not two
+containers of this service, but another Hermes instance entirely — most
+commonly a `run-local.sh` container on your own machine that is still
+running, or a second deployment created from an old copy of this repo. Both
+instances fight over Telegram forever (every ~16 s), and both may answer the
+same message. Fix: stop the other instance, or make it join the failover
+lease (`HERMES_FAILOVER=1` on both sides, sharing the same state repo — the
+non-lease holder then strips its platform tokens and stays a dashboard-only
+standby). This service already logs its role at boot
+(`[render-tools] role=active` / `role=standby`).
+
+**`[render-tools] gateway exited (status 137 …)` + `OOM` hint** — the kernel
+OOM-killed the gateway (SIGKILL = 137). The line right below prints
+`MemAvailable` and the top-RSS processes at that moment. On the Free tier
+the usual cause is concurrent chats on one 512 MB box; the cached-agent
+budget (`HERMES_AGENT_CACHE_MAX_SIZE`, lowered to 4 in this repo) and the
+web-chat session cleanup on WebSocket disconnect exist for exactly this.
+Raise both on a paid instance.
+
+**Repeated `[hermes-git-state] restored N file(s)` blocks without a
+`==> Deploying...` line** — the *container* was restarting (a full
+restore → skills-sync → dashboard → gateway boot each time, ~1–2 minutes of
+downtime per cycle; that is what "crashing again and again" looked like in
+the chat tab). The wrapper now restarts a crashed gateway **in place**
+(gateway-only when the dashboard side-process is still alive) and restarts
+a dead dashboard within ~10 s, so a crash costs seconds, not minutes:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `HERMES_ENTRYPOINT_RESTARTS` | `5` | In-place gateway restarts before letting Render do a full container restart (`0` restores the old behavior) |
+| `HERMES_DASHBOARD_RESTARTS` | `10` | Dashboard restart attempts before it is left down (the gateway/Telegram keep working) |
+| `HERMES_HEALTH_INTERVAL_SECONDS` | `10` | How often the dashboard/memory health loop checks |
+| `HERMES_MEMWATCH` | `1` | `0` disables the memory-pressure telemetry |
+| `HERMES_MEMWATCH_MB` | `100` | Floor below which memory lines are logged (throttled to 1 per 2 min) |
+
+**`Tool registration REJECTED: 'web_search' (toolset 'web') would shadow
+existing tool from toolset 'web-search'`** — the config enabled both the
+`web` and `web-search` toolsets. The boot config patcher now removes the
+duplicate automatically (the registry kept `web-search`'s tool either way,
+so nothing changes at runtime); opt out with `HERMES_DEDUPE_TOOLSETS=0`.
+
+**`Cron job 'Autopilot Daemon': skill not found`** — a cron entry in your
+own config references skills (`autopilot`, `terminal`, `file`,
+`delegation`, `web`, `cronjob`) that are not installed in `$HERMES_HOME`.
+Harmless noise, but it retries on every cron tick; remove the job or
+install the skills it names.
+
+**`committing .env in the clear (GIT_STATE_ENV_MODE=plaintext)`** — every
+API key in `.env` is stored unencrypted in the (private) state repo's
+history. Anyone who can read that repo — now or via a future fork/export —
+has those keys. Set `GIT_STATE_ENV_MODE=encrypt` with
+`GIT_STATE_AGE_RECIPIENT` (age is already installed in the image) or
+`omit`, and rotate keys that were committed in the clear.
+
+**`API call failed … Service temporarily overloaded`** — the configured
+model provider (seen with NVIDIA's `nemotron-3-ultra`) was overloaded; the
+agent retries with backoff (`agent.api_max_retries`). Not a crash — but if
+it dominates the log, switch models in the dashboard.
+
 ## Keeping files between restarts
 
 Render Free cannot attach a persistent disk: when the service restarts, the

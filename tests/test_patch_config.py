@@ -119,3 +119,45 @@ class PatchConfigTests(unittest.TestCase):
         # objects defaults to unbounded windows) so a sync cannot OOM the box.
         self.assertIn("key: GIT_STATE_HTTP_POST_BUFFER_MB", service)
         self.assertIn("key: GIT_STATE_PACK_WINDOW_MEMORY_MB", service)
+
+
+class ToolsetDedupeTests(unittest.TestCase):
+    def _config(self, enabled):
+        return {"tools": {"enabled_toolsets": list(enabled)}}
+
+    def test_web_removed_when_web_search_also_enabled(self):
+        patch_config = load_patch_config()
+        cfg = self._config(["code", "web", "web-search", "memory"])
+
+        changed = patch_config.dedupe_enabled_toolsets(cfg)
+
+        self.assertEqual(changed, ["tools.enabled_toolsets -= web (shadowed by web-search)"])
+        self.assertEqual(cfg["tools"]["enabled_toolsets"], ["code", "web-search", "memory"])
+
+    def test_web_kept_when_web_search_absent(self):
+        patch_config = load_patch_config()
+        cfg = self._config(["web", "code"])
+
+        changed = patch_config.dedupe_enabled_toolsets(cfg)
+
+        self.assertEqual(changed, [])
+        self.assertEqual(cfg["tools"]["enabled_toolsets"], ["web", "code"])
+
+    def test_noop_without_tools_section(self):
+        patch_config = load_patch_config()
+        self.assertEqual(patch_config.dedupe_enabled_toolsets({}), [])
+        self.assertEqual(patch_config.dedupe_enabled_toolsets({"tools": {}}), [])
+
+    def test_opt_out_env(self):
+        patch_config = load_patch_config()
+        old = os.environ.get("HERMES_DEDUPE_TOOLSETS")
+        try:
+            os.environ["HERMES_DEDUPE_TOOLSETS"] = "0"
+            cfg = self._config(["web", "web-search"])
+            self.assertEqual(patch_config.dedupe_enabled_toolsets(cfg), [])
+            self.assertEqual(cfg["tools"]["enabled_toolsets"], ["web", "web-search"])
+        finally:
+            if old is None:
+                os.environ.pop("HERMES_DEDUPE_TOOLSETS", None)
+            else:
+                os.environ["HERMES_DEDUPE_TOOLSETS"] = old
