@@ -74,7 +74,9 @@ function rest(url, opts) {
   opts = opts || {};
   const u = new URL(url, "https://dashboard.test");
   const p = u.pathname;
-  const body = opts.body ? JSON.parse(opts.body) : {};
+  // The plugin passes plain objects; the real SDK serialises them to JSON, so
+  // accept both (mirrors fetchJSON behaviour).
+  const body = opts.body ? (typeof opts.body === "string" ? JSON.parse(opts.body) : opts.body) : {};
   const json = (v) => ({ __json: true, value: v });
 
   if (p === "/api/plugins/hermes-chat-dashboard/capabilities") return json(state.capabilities);
@@ -735,6 +737,103 @@ scenarios.errorBoundary = async () => {
   await flush(60);
   if (mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-crash")).length) throw new Error("errorBoundary: crash card did not clear");
   if (!mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-welcome")).length) throw new Error("errorBoundary: chat did not recover");
+};
+
+// Model switching on the pinned gateway is `config.set {key:"model", value,
+// session_id}` against a LIVE session.  Picking a model in a brand-new chat
+// (no gateway session yet) must be queued and applied to the session that is
+// created on the first send — before prompt.submit — so the reply uses it.
+scenarios.modelSwitchNewChat = async () => {
+  FakeWebSocket.connectFails = false;
+  await flush(120);
+  // open the composer model picker
+  const modelBtn = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-model-btn"));
+  if (!modelBtn.length) throw new Error("modelSwitchNewChat: model button missing");
+  clickNode(modelBtn[0]);
+  await flush(40);
+  const rows = mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-model-row"));
+  const m2 = rows.find((e) => mini.textOf(e.node).includes("m-2"));
+  if (!m2) throw new Error("modelSwitchNewChat: m-2 row missing");
+  clickNode(m2); // selects prov:m-2
+  await flush(60);
+  // no gateway session should exist yet (fresh chat), so nothing is sent now
+  const early = wsCurrent.sent.filter((m) => m.method === "config.set" && m.params && m.params.key === "model");
+  if (early.length) throw new Error(`modelSwitchNewChat: model config.set sent before any session: ${JSON.stringify(early)}`);
+  // send the first message -> ensureSession() creates a session then must apply the pending model
+  const ta = mini.findAll((n) => n.type === "textarea" && n.props.onChange)[0];
+  ta.node.props.onChange({ target: { value: "first message" } });
+  rerender();
+  clickNode(byText("Send")[0]);
+  await flush(200);
+  const modelSets = wsCurrent.sent.filter((m) => m.method === "config.set" && m.params && m.params.key === "model");
+  const submits = wsCurrent.sent.filter((m) => m.method === "prompt.submit");
+  if (!modelSets.length) throw new Error("modelSwitchNewChat: pending model was never applied to the new session");
+  const set = modelSets[0];
+  if (set.params.value !== "prov:m-2" || !set.params.session_id) throw new Error(`modelSwitchNewChat: wrong config.set params: ${JSON.stringify(set.params)}`);
+  const idxSet = wsCurrent.sent.indexOf(modelSets[0]);
+  const idxSub = submits.length ? wsCurrent.sent.indexOf(submits[0]) : -1;
+  if (idxSub < 0 || idxSet >= idxSub) throw new Error("modelSwitchNewChat: config.set not sent before the first prompt.submit");
+  // badge should reflect the chosen model
+  const btn2 = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-model-btn"));
+  if (!btn2.length || !mini.textOf(btn2[0].node).includes("prov/m-2")) throw new Error("modelSwitchNewChat: model badge did not update");
+};
+
+scenarios.toolDumpRendering = async () => {
+  // a stored turn with a huge raw tool dump + a normal assistant reply
+  const big = "{\"success\": true, \"payload\": \"" + "x".repeat(20000) + "\"}";
+  seedSession("s-dump", "Dump chat", 900, [
+    { role: "user", content: "create a theme" },
+    { role: "tool", content: big, tool_name: "some_tool" },
+    { role: "assistant", content: "I created the theme for you **here**." },
+  ]);
+  FakeWebSocket.connectFails = false;
+  await flush(120);
+  const row = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-conv") && !String(n.props.className).includes("more") && mini.textOf(n).includes("Dump chat"));
+  if (!row.length) throw new Error("toolDumpRendering: Dump chat row missing");
+  clickNode(row[0]);
+  await flush(200);
+  // assistant reply body must be present and readable
+  const md = mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-markdown")).map((e) => (e.node.props && e.node.props.dangerouslySetInnerHTML && e.node.props.dangerouslySetInnerHTML.__html) || "");
+  if (!md.some((h) => h.includes("I created the theme"))) throw new Error("toolDumpRendering: assistant reply not rendered");
+  // the huge tool dump must be collapsed into a .hcd-outline pre (not full markdown)
+  const outlines = mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-outline"));
+  if (!outlines.length) throw new Error("toolDumpRendering: big tool output not collapsed");
+  const preText = mini.textOf(outlines[0].node);
+  if (preText.length < 2000) throw new Error("toolDumpRendering: tool pre appears truncated in the DOM");
+};
+
+scenarios.modelSwitchBusyGuard = async () => {
+  FakeWebSocket.connectFails = false;
+  await flush(120);
+  // open Today chat (live resumed session live-2)
+  const row = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-conv") && !String(n.props.className).includes("more") && mini.textOf(n).includes("Today chat"));
+  if (!row.length) throw new Error("modelSwitchBusyGuard: Today chat row missing");
+  clickNode(row[0]);
+  await flush(250);
+  // simulate the gateway rejecting the mid-session switch (4009 busy)
+  wsMode = "script";
+  wsCurrent.onServerRequest = (req) => {
+    if (req.method === "config.set" && req.params && req.params.key === "model") {
+      wsCurrent._respondErr(req.id, "session busy — /interrupt the current turn before switching models");
+    } else {
+      wsCurrent._respond(req.id, { ok: true });
+    }
+  };
+  const modelBtn = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-model-btn"));
+  clickNode(modelBtn[0]);
+  await flush(40);
+  const rows = mini.findAll((n) => n.props && String(n.props.className || "").includes("hcd-model-row"));
+  const m1 = rows.find((e) => mini.textOf(e.node).includes("m-1"));
+  if (!m1) throw new Error("modelSwitchBusyGuard: m-1 row missing");
+  clickNode(m1);
+  await flush(100);
+  wsMode = "ok";
+  wsCurrent.onServerRequest = null;
+  // a rejected switch must not leave the badge stuck on the unapplied choice
+  const btn2 = mini.findAll((n) => n.props && typeof n.props.onClick === "function" && String(n.props.className || "").includes("hcd-model-btn"));
+  if (!btn2.length) throw new Error("modelSwitchBusyGuard: model button missing after failure");
+  const label = mini.textOf(btn2[0].node);
+  if (label.includes("prov/m-1")) throw new Error(`modelSwitchBusyGuard: badge stuck on rejected model: ${label}`);
 };
 
 // ── runner ───────────────────────────────────────────────────────────

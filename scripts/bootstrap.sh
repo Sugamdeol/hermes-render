@@ -13,7 +13,10 @@
 #   5. Starts the optional state-sync worker (supervised: if the worker
 #      process ever dies, it is restarted) and the optional Free-tier
 #      keep-alive ping, plus a health loop that restarts the dashboard
-#      side-process if it dies and logs memory pressure.
+#      side-process if it dies and logs memory pressure. On a cgroup-capped
+#      container a proactive memory guard (memory_guard_loop) reclaims
+#      headroom before the kernel OOM-kills the whole service (HERMES_MEMGUARD=0
+#      disables it).
 #   6. Runs the upstream entrypoint chain as a supervised child. An
 #      unexpected gateway exit is restarted in place (bounded by
 #      HERMES_ENTRYPOINT_RESTARTS) instead of paying a full container
@@ -537,6 +540,247 @@ memwatch_snapshot() {
   memwatch_top_rss >&2
 }
 
+# Total resident set of the processes visible in this PID namespace, in KiB.
+# Only meaningful when the namespace is isolated (the usual container case);
+# the memory guard uses it as an opt-in fallback when no cgroup cap is visible
+# and HERMES_MEM_LIMIT_MB is set. Leaves the sum in TOT_RSS_KB.
+proc_total_rss_kb() {
+  TOT_RSS_KB=0
+  for proc_dir in /proc/[0-9]*; do
+    [ -d "${proc_dir}" ] || continue
+    proc_rss=$(awk "/^VmRSS:/{print \$2; exit}" "${proc_dir}/status" 2>/dev/null)
+    case "${proc_rss}" in ""|*[!0-9]*) continue ;; esac
+    TOT_RSS_KB=$(( TOT_RSS_KB + proc_rss ))
+  done
+}
+
+# Container-local memory budget.
+#
+# /proc/meminfo "MemAvailable" reflects the HOST's free memory, not this
+# container's cgroup cap, so the older telemetry above cannot predict a
+# *container* OOM-kill on Render. To reclaim *before* the kernel kills the
+# whole cgroup we must read the real accounting from the cgroup filesystem.
+# This resolves this process's own cgroup (v2 first, then v1) and exposes:
+#   LMT_OK      1 when a finite cap was found (0 = host/unlimited: no budget)
+#   LMT_LIMIT_KB  the cgroup memory cap in KiB
+#   LMT_USED_KB   current cgroup memory usage in KiB
+mem_container_limits() {
+  LMT_OK=0; LMT_LIMIT_KB=0; LMT_USED_KB=0
+  # Root and cgroup path are overridable so tests can point the reader at a
+  # synthetic cgroup tree (HERMES_CGROUP_ROOT/HERMES_CGROUP_PATH); production
+  # always reads the real /sys/fs/cgroup and this process's own cgroup.
+  cg_root="${HERMES_CGROUP_ROOT:-/sys/fs/cgroup}"
+  cg_path=""
+  if [ -n "${HERMES_CGROUP_PATH:-}" ]; then
+    cg_path="${HERMES_CGROUP_PATH}"
+  elif [ -r /proc/self/cgroup ]; then
+    cg_line=$(grep -E '^0::' /proc/self/cgroup 2>/dev/null || true)
+    case "${cg_line}" in
+      0::*) cg_path=${cg_line#0::} ;;
+      *)    cg_path=$(printf '%s' "${cg_line}" | sed -n 's/^[^:]*:[^:]*://p') ;;
+    esac
+  fi
+  # v2: memory.current + memory.max (finite cap under 1 TiB only)
+  if [ -n "${cg_path}" ] && [ -r "${cg_root}${cg_path}/memory.current" ] \
+     && [ -r "${cg_root}${cg_path}/memory.max" ]; then
+    LMT_USED_KB=$(( $(cat "${cg_root}${cg_path}/memory.current" 2>/dev/null || echo 0) / 1024 ))
+    lmt_max=$(cat "${cg_root}${cg_path}/memory.max" 2>/dev/null || echo max)
+    case "${lmt_max}" in
+      ""|max|*[!0-9]*) ;;
+      *)
+        if [ "${lmt_max}" -gt 0 ] && [ "$(( lmt_max / 1099511627776 ))" -eq 0 ]; then
+          LMT_LIMIT_KB=$(( lmt_max / 1024 ))
+          [ "${LMT_LIMIT_KB}" -gt 0 ] && LMT_OK=1
+        fi
+        ;;
+    esac
+    return
+  fi
+  # v2 fallback when the process is at the cgroup namespace root
+  if [ -r "${cg_root}/memory.current" ] && [ -r "${cg_root}/memory.max" ]; then
+    LMT_USED_KB=$(( $(cat "${cg_root}/memory.current" 2>/dev/null || echo 0) / 1024 ))
+    lmt_max=$(cat "${cg_root}/memory.max" 2>/dev/null || echo max)
+    case "${lmt_max}" in
+      ""|max|*[!0-9]*) ;;
+      *)
+        if [ "${lmt_max}" -gt 0 ] && [ "$(( lmt_max / 1099511627776 ))" -eq 0 ]; then
+          LMT_LIMIT_KB=$(( lmt_max / 1024 ))
+          [ "${LMT_LIMIT_KB}" -gt 0 ] && LMT_OK=1
+        fi
+        ;;
+    esac
+    return
+  fi
+  # cgroup v1
+  if [ -r "${cg_root}/memory/memory.limit_in_bytes" ] \
+     && [ -r "${cg_root}/memory/memory.usage_in_bytes" ]; then
+    LMT_USED_KB=$(( $(cat "${cg_root}/memory/memory.usage_in_bytes" 2>/dev/null || echo 0) / 1024 ))
+    lmt_max=$(cat "${cg_root}/memory/memory.limit_in_bytes" 2>/dev/null || echo 0)
+    case "${lmt_max}" in
+      ""|*[!0-9]*) ;;
+      *)
+        if [ "${lmt_max}" -gt 0 ] && [ "$(( lmt_max / 1099511627776 ))" -eq 0 ]; then
+          LMT_LIMIT_KB=$(( lmt_max / 1024 ))
+          [ "${LMT_LIMIT_KB}" -gt 0 ] && LMT_OK=1
+        fi
+        ;;
+    esac
+  fi
+}
+
+# ── proactive OOM guard ──────────────────────────────────────────────
+#
+# The dashboard watchdog and memwatch above only act AFTER the dashboard is
+# dead and only REPORT pressure. This loop is the proactive counterpart: on a
+# container with a real cgroup cap it polls memory every few seconds and
+# reclaims headroom BEFORE the kernel OOM-kills the whole cgroup (which is the
+# "restored N file(s)" crash-and-reboot cycle this service kept hitting).
+#
+# Reclaim is deliberately staged and never touches the gateway (the thing the
+# health check and every platform depend on):
+#   1. warning      (>= HERMES_MEMGUARD_WARN % of the cap): throttled telemetry.
+#   2. ease the sync (>= HERMES_MEMGUARD_PAUSE_SYNC %): SIGSTOP the git state
+#      daemon so it cannot start another memory-spiking push; resume once usage
+#      drops below HERMES_MEMGUARD_RESUME_SYNC %. The daemon is OOM-scored as
+#      the preferred victim already; pausing it is free headroom.
+#   3. shed the dashboard (>= HERMES_MEMGUARD_DASHBOARD_PCT %): the dashboard
+#      hosts every web-chat agent and is the single largest reclaimable RSS.
+#      SIGKILL it (the separate watchdog restarts it) so its agents free pages
+#      instead of the kernel taking the whole container down. Confirmed across
+#      a few consecutive samples and rate-limited to avoid flapping.
+# A final trap resumes a paused sync daemon on shutdown so the last push still
+# lands.
+#
+# Auto-reclaim only ever engages on a *measured* cap that is at most
+# HERMES_MEMGUARD_MAX_ACTIVE_MB (so a big dev box or unlimited host never gets
+# processes killed). Disable entirely with HERMES_MEMGUARD=0.
+memory_guard_loop() {
+  set +e
+  mg_interval="${HERMES_MEMGUARD_INTERVAL_SECONDS:-3}"
+  case "${mg_interval}" in ""|*[!0-9]*) mg_interval=3 ;; esac
+  mg_warn="${HERMES_MEMGUARD_WARN:-70}"
+  case "${mg_warn}" in ""|*[!0-9]*) mg_warn=70 ;; esac
+  mg_pause="${HERMES_MEMGUARD_PAUSE_SYNC:-80}"
+  case "${mg_pause}" in ""|*[!0-9]*) mg_pause=80 ;; esac
+  mg_resume="${HERMES_MEMGUARD_RESUME_SYNC:-62}"
+  case "${mg_resume}" in ""|*[!0-9]*) mg_resume=62 ;; esac
+  mg_dashpct="${HERMES_MEMGUARD_DASHBOARD_PCT:-92}"
+  case "${mg_dashpct}" in ""|*[!0-9]*) mg_dashpct=92 ;; esac
+  mg_dashcool="${HERMES_MEMGUARD_DASHBOARD_COOLDOWN:-150}"
+  case "${mg_dashcool}" in ""|*[!0-9]*) mg_dashcool=150 ;; esac
+  mg_maxactive="${HERMES_MEMGUARD_MAX_ACTIVE_MB:-2048}"
+  case "${mg_maxactive}" in ""|*[!0-9]*) mg_maxactive=2048 ;; esac
+  mg_logint="${HERMES_MEMGUARD_LOG_INTERVAL:-90}"
+  case "${mg_logint}" in ""|*[!0-9]*) mg_logint=90 ;; esac
+  mg_synced_paused=0
+  mg_dash_armed=0
+  mg_dash_confirms=0
+  mg_dash_last=0
+  mg_log_last=0
+  mg_reported_offline=0
+
+  # On our way out (container stop), never leave the sync daemon frozen.
+  mg_resume_sync() {
+    if [ "${mg_synced_paused}" -eq 1 ]; then
+      mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
+      if [ -n "${mg_dpid}" ]; then
+        kill -CONT "${mg_dpid}" 2>/dev/null || true
+      fi
+    fi
+  }
+  trap 'mg_resume_sync' TERM INT EXIT
+
+  while :; do
+    sleep "${mg_interval}"
+    mem_container_limits
+    if [ "${LMT_OK}" -ne 1 ]; then
+      # No cgroup cap visible (host / namespace hides it / v1 absent). If the
+      # operator supplies the known instance budget (HERMES_MEM_LIMIT_MB),
+      # fall back to measuring total container RSS. Opt-in on purpose: it is
+      # only trustworthy when this PID namespace is isolated.
+      mg_est_limit="${HERMES_MEM_LIMIT_MB:-0}"
+      case "${mg_est_limit}" in ""|*[!0-9]*) mg_est_limit=0 ;; esac
+      if [ "${mg_est_limit}" -gt 0 ]; then
+        proc_total_rss_kb
+        LMT_USED_KB=${TOT_RSS_KB:-0}
+        LMT_LIMIT_KB=$(( mg_est_limit * 1024 ))
+        LMT_OK=1
+        if [ "${mg_reported_offline}" -eq 0 ]; then
+          echo "[render-tools] memory guard: no cgroup cap visible — using RSS estimate against HERMES_MEM_LIMIT_MB=${mg_est_limit}MB" >&2
+          mg_reported_offline=1
+        fi
+      fi
+    fi
+    if [ "${LMT_OK}" -ne 1 ]; then
+      # No measurable container budget at all: stay observational only.
+      if [ "${mg_reported_offline}" -eq 0 ]; then
+        echo "[render-tools] memory guard: no container cgroup cap visible; telemetry-only mode (set HERMES_MEM_LIMIT_MB to reclaim by RSS)" >&2
+        mg_reported_offline=1
+      fi
+      continue
+    fi
+    mg_limit_mb=$(( LMT_LIMIT_KB / 1024 ))
+    mg_used_mb=$(( LMT_USED_KB / 1024 ))
+    mg_pct=$(( LMT_USED_KB * 100 / LMT_LIMIT_KB ))
+    # never auto-reclaim on a big/loose budget
+    if [ "${mg_limit_mb}" -gt "${mg_maxactive}" ]; then
+      if [ "${mg_reported_offline}" -eq 0 ]; then
+        echo "[render-tools] memory guard: cap ${mg_limit_mb}MB > ${mg_maxactive}MB; telemetry-only mode (HERMES_MEMGUARD_MAX_ACTIVE_MB to widen)" >&2
+        mg_reported_offline=1
+      fi
+      continue
+    fi
+    mg_reported_offline=0
+
+    # 1. throttled warning telemetry
+    if [ "${mg_pct}" -ge "${mg_warn}" ] \
+       && [ $(( $(date +%s) - mg_log_last )) -ge "${mg_logint}" ]; then
+      mg_log_last=$(date +%s)
+      echo "[render-tools] memory guard: ${mg_used_mb}MB / ${mg_limit_mb}MB (${mg_pct}%) — reclaiming before OOM; top RSS:" >&2
+      memwatch_top_rss >&2
+    fi
+
+    # 2. pause the git sync daemon under pressure, resume when it clears
+    if [ "${mg_pct}" -ge "${mg_pause}" ] && [ "${mg_synced_paused}" -eq 0 ]; then
+      mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
+      if [ -n "${mg_dpid}" ] && kill -0 "${mg_dpid}" 2>/dev/null; then
+        if kill -STOP "${mg_dpid}" 2>/dev/null; then
+          mg_synced_paused=1
+          echo "[render-tools] memory guard: ${mg_pct}% >= ${mg_pause}% — pausing git state sync (daemon ${mg_dpid})" >&2
+        fi
+      fi
+    elif [ "${mg_synced_paused}" -eq 1 ] && [ "${mg_pct}" -le "${mg_resume}" ]; then
+      mg_dpid=$(cat "${GIT_DAEMON_PIDFILE}" 2>/dev/null || true)
+      kill -CONT "${mg_dpid}" 2>/dev/null || true
+      mg_synced_paused=0
+      echo "[render-tools] memory guard: ${mg_pct}% <= ${mg_resume}% — resumed git state sync" >&2
+    fi
+
+    # 3. shed the dashboard (holds every web-chat agent) only as a last resort
+    if [ "${mg_dashpct}" -gt 0 ] && [ "${mg_pct}" -ge "${mg_dashpct}" ]; then
+      mg_dash_confirms=$((mg_dash_confirms + 1))
+    else
+      mg_dash_confirms=0
+    fi
+    if [ "${mg_dash_confirms}" -ge 3 ] && [ "${mg_dash_armed}" -eq 0 ] \
+       && [ $(( $(date +%s) - mg_dash_last )) -ge "${mg_dashcool}" ]; then
+      mg_dashboard_pids=$(proc_pids_matching "hermes dashboard")
+      if [ -n "${mg_dashboard_pids}" ]; then
+        mg_dash_last=$(date +%s)
+        echo "[render-tools] memory guard: ${mg_pct}% >= ${mg_dashpct}% (${mg_dash_confirms} samples) — dropping dashboard to free web-chat agents; watchdog will restart it" >&2
+        for mg_dp in ${mg_dashboard_pids}; do
+          kill -KILL "${mg_dp}" 2>/dev/null || true
+        done
+        mg_dash_armed=1
+      fi
+    fi
+    # re-arm the shed stage only after the box has really recovered
+    if [ "${mg_dash_armed}" -eq 1 ] && [ "${mg_pct}" -le "${mg_resume}" ]; then
+      mg_dash_armed=0
+    fi
+  done
+}
+
 # Dashboard + memory health loop. The upstream entrypoint backgrounds the
 # dashboard and never watches it: if the dashboard process dies (the classic
 # 512MB OOM victim -- it hosts every web-chat agent), the gateway keeps
@@ -625,6 +869,14 @@ if dashboard_enabled; then
       start_dashboard_supervised
     done
   ) &
+fi
+
+# Proactive OOM guard (see memory_guard_loop): reclaims headroom on a
+# cgroup-capped container before the kernel OOM-kills the whole service.
+# No-op / telemetry-only when no finite cap is measurable (HERMES_MEMGUARD=0
+# disables entirely).
+if [ "${HERMES_MEMGUARD:-1}" = "1" ]; then
+  memory_guard_loop &
 fi
 
 stop_requested=0

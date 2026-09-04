@@ -1756,3 +1756,109 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
   .hcd-topbar { padding: 8px 10px; min-height: 52px; }
   .hcd-topbar-right { gap: 4px; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * Legibility guards.
+ *
+ * The reply/message body is injected into `.hcd-markdown` via
+ * dangerouslySetInnerHTML, so bare HTML tags (<p>, <code>, <li>, headers…)
+ * inside it can be restyled by the HOST dashboard's own global rules — which
+ * is what turned Hermes' answer text black on the dark panel. These rules
+ * pin the text colour on every injected descendant so a message can never
+ * render unreadable, while leaving the accent links / muted blockquote /
+ * status-pill special cases intact (re-declared below at equal or higher
+ * specificity, in this later position).
+ *
+ * The foreground token prefers this dashboard's "midground" (its primary
+ * text layer) before falling back to standard foreground vars, and always
+ * ends in a guaranteed-legible dark-panel colour so nothing ever resolves
+ * to near-black on near-black.
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+.hcd {
+  --hcd-fg: var(--color-midground, var(--color-foreground, var(--color-popover-foreground, #e8e2d4)));
+  --hcd-muted: var(--color-muted-foreground, var(--color-midground, rgba(232, 226, 212, 0.62)));
+}
+
+.hcd .hcd-message,
+.hcd .hcd-bubble,
+.hcd .hcd-markdown,
+.hcd .hcd-markdown p,
+.hcd .hcd-markdown li,
+.hcd .hcd-markdown h1,
+.hcd .hcd-markdown h2,
+.hcd .hcd-markdown h3,
+.hcd .hcd-markdown h4,
+.hcd .hcd-markdown h5,
+.hcd .hcd-markdown h6,
+.hcd .hcd-markdown td,
+.hcd .hcd-markdown th,
+.hcd .hcd-markdown dd,
+.hcd .hcd-markdown dt,
+.hcd .hcd-markdown summary {
+  color: var(--hcd-fg, #e8e2d4);
+}
+
+/* keep inline code readable and honour highlight colours inside fenced code */
+.hcd .hcd-markdown code { color: inherit; }
+.hcd .hcd-code pre,
+.hcd .hcd-code pre code { color: #d7e0e8; }
+.hcd .hcd-code .hl-kw { color: #c792ea; }
+.hcd .hcd-code .hl-str { color: #a5e07f; }
+.hcd .hcd-code .hl-num { color: #f78c6c; }
+.hcd .hcd-code .hl-cmt { color: #63777f; }
+
+/* special cases must stay visually distinct from body copy */
+.hcd .hcd-markdown a { color: var(--hcd-accent, #7fa4ff); }
+.hcd .hcd-markdown blockquote,
+.hcd .hcd-markdown blockquote p { color: var(--hcd-muted, rgba(232, 226, 212, 0.62)); }
+.hcd .hcd-markdown del { color: var(--hcd-muted, rgba(232, 226, 212, 0.62)); }
+.hcd .hcd-reasoning summary { color: var(--hcd-muted, rgba(232, 226, 212, 0.62)); }
+.hcd .hcd-reasoning pre { color: var(--hcd-muted, rgba(232, 226, 212, 0.72)); }
+.hcd .hcd-actions button { color: var(--hcd-muted, rgba(232, 226, 212, 0.62)); }
+
+/* Text typed into inputs/selects/the composer must be readable too. */
+.hcd input,
+.hcd select,
+.hcd textarea { color: var(--hcd-fg, #e8e2d4); }
+.hcd input::placeholder,
+.hcd textarea::placeholder,
+.hcd select::placeholder { color: var(--hcd-muted, rgba(232, 226, 212, 0.5)); }
+
+/* user messages read a touch softer against the panel so the author label
+   still stands out, but stay comfortably above the dark background */
+.hcd-user .hcd-markdown,
+.hcd-user .hcd-markdown p,
+.hcd-user .hcd-markdown li { color: var(--hcd-fg, #e8e2d4); }
+
+/* ── compact raw tool/system output in the transcript ──────────────── */
+.hcd-outline {
+  margin: 6px 0 0;
+  border: 1px solid var(--hcd-border, rgba(148, 163, 184, 0.16));
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.18);
+  overflow: hidden;
+}
+.hcd-outline summary {
+  cursor: pointer;
+  padding: 7px 12px;
+  font-size: 11.5px;
+  color: var(--hcd-muted, rgba(232, 226, 212, 0.62));
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+.hcd-outline[open] summary { border-bottom: 1px solid var(--hcd-border, rgba(148, 163, 184, 0.16)); }
+.hcd-outline pre {
+  margin: 0;
+  padding: 10px 12px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  color: #d7e0e8;
+}
+.hcd-system-note { font-size: 12.5px; color: var(--hcd-muted, rgba(232, 226, 212, 0.72)); }
+.hcd-system-note code { color: inherit; }
