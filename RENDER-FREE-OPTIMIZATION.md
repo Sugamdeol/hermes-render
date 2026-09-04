@@ -317,36 +317,61 @@ Startup to port bind at 0.1 CPU: **~13–14 s**.
    their unit tests against synthetic cgroups rather than on an observed
    production transition. The workload never got close enough to them.
 5. **Docker image not built.** Docker Hub egress is blocked in this sandbox, so
-   the `Dockerfile` itself was never built or run. Every patch was verified
-   against a pristine `git show HEAD:` copy of the pinned upstream, and all
-   four apply cleanly and idempotently. The *runtime* tree was then verified
-   by reconstructing the image's filesystem layout (`/opt/render-tools/*`,
-   `/opt/hermes/*`) and running the real `bootstrap.sh` as root against it —
-   see §10 — but the layer ordering and the base image itself are unproven.
+   the `Dockerfile` itself was never built or run, and neither `docker` nor a
+   Dockerfile linter is installed here. What *was* verified instead, against
+   pristine `git show v2026.5.7:` copies of the five upstream files the image
+   patches:
+   - all five `scripts/patch-*.py` apply cleanly **in exact Dockerfile order**,
+     and every one is idempotent on re-run (a layer cache rebuild cannot
+     corrupt a file);
+   - the `Dockerfile`'s one **inline** Python patch — the agent-cache constants
+     in `gateway/run.py`, which is the only patch not backed by a script with
+     its own loud failure — matches its anchor exactly once in the pristine
+     pinned source;
+   - all five patched files still `ast.parse`.
+
+   The *runtime* tree was then verified by reconstructing the image's
+   filesystem layout (`/opt/render-tools/*`, `/opt/hermes/*`) and running the
+   real `bootstrap.sh` as root against it — see §10. Still unproven: the base
+   image itself, layer ordering and cache behaviour, and that the two `apt-get
+   update` calls in the git/`age` step resolve in Render's build environment.
+
+   One caution for whoever bumps the upstream pin: my working copy of
+   `hermes-upstream` is **dirty from patching it in place** during this work.
+   Checking an anchor against the working tree reports a false failure; check
+   `git show v2026.5.7:<path>` instead.
 6. **No real LLM.** Chat was driven against a mock OpenAI-compatible server.
    Real providers stream differently and a large tool output could behave
    differently than the mock's.
-7. **MCP tool output bypasses the tool-output cap — verified, not fixed.**
+7. **MCP tool output bypassed the tool-output cap — now fixed, but not measured
+   against a real server.**
    This image *does* cap tool output: `patch-config.py` injects
    `tool_output.max_bytes = 30000` (plus `max_lines` / `max_line_length`),
    resolved through `tools/tool_output_limits.py`. But only two tools
-   actually consult it — `tools/file_operations.py` and
-   `tools/terminal_tool.py`. `tools/mcp_tool.py` never imports the limits
+   actually consulted it — `tools/file_operations.py` and
+   `tools/terminal_tool.py`. `tools/mcp_tool.py` never imported the limits
    module, and `handle_function_call` in `model_tools.py` applies no central
    truncation either; `_call()` concatenates every `TextContent` block from a
    tool result and returns the whole thing as JSON.
 
-   So a chatty MCP tool returning a multi-megabyte payload would land in the
+   So a chatty MCP tool returning a multi-megabyte payload landed in the
    dashboard process and the conversation history uncapped, while a `cat` of
-   the same size through the terminal tool would be trimmed to 30 KB. The
-   inconsistency is the bug, not the absence of a mechanism.
+   the same size through the terminal tool was trimmed to 30 KB. The
+   inconsistency was the bug, not the absence of a mechanism.
 
-   I did **not** patch this, because I could not measure it: `mcp.render.com`
-   needs an API key this sandbox does not have, and picking a limit without a
-   real server to measure against trades a memory risk for silently truncated
-   answers. The fix is small and the right shape — route `_call()` through
-   `get_max_bytes()` like the other two tools do — but it needs a real MCP
-   server to verify against.
+   `scripts/patch-mcp-output-cap.py` closes it by routing MCP results through
+   the operator's **existing** setting — same key, same 40/60 head-tail split,
+   same `[OUTPUT TRUNCATED ...]` notice as `terminal_tool` — so no new knob is
+   added and no limit is invented. `structuredContent` is left untouched, and a
+   missing limits helper means "leave it alone" rather than "guess a cap".
+   Verified against a pristine `tools/mcp_tool.py`: 1000 chars → 168 with head
+   and tail preserved, results at or under the limit byte-identical, and the
+   patch refuses to run if upstream grows a second `text_result` assembly site.
+
+   **What remains unproven:** the truncation was verified against a stubbed
+   `get_max_bytes()`, not a live `mcp.render.com` — that needs an API key this
+   sandbox does not have. So the code path is correct in isolation but has never
+   carried a real multi-megabyte MCP payload.
 
 Two things I checked, one of which turned out to be a **real bug I then
 fixed**, and one of which was already fine:
