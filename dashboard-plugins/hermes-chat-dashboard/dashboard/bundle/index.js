@@ -1040,14 +1040,23 @@
     }, [msg.streaming]);
     const isHermes = msg.role === "assistant";
     const isUser = msg.role === "user";
+    const isTool = msg.role === "tool";
+    const isSystem = msg.role === "system";
+    const contentText = str(msg.content || "");
+    // Oversized raw tool/system dumps (the agent's own tool transcripts are
+    // huge JSON/blocks) are shown in a compact, scrollable, collapsible block
+    // instead of being rendered as full-width markdown that buries the real
+    // conversation. Live-streaming ones stay open; stored ones start closed.
+    const compactRaw = (isTool || (isSystem && contentText.length > 600)) && !active;
     const reasoning = str(msg.reasoning || "");
     const thinking = str(msg.thinking || "");
     const hasStreamedThought = (reasoning || thinking).trim().length > 0;
+    const bodyContent = renderMarkdown(contentText || (active ? "▌" : "")) + (active && contentText ? '<span class="hcd-cursor">▌</span>' : "");
 
     return h(
       "article",
       { className: cn("hcd-message", `hcd-${msg.role || "assistant"}`), id: msg.id || undefined },
-      h("div", { className: "hcd-avatar", title: roleLabel(msg.role) }, isHermes ? "H" : isUser ? "🧑" : msg.role === "tool" ? "⚙️" : "ℹ️"),
+      h("div", { className: "hcd-avatar", title: roleLabel(msg.role) }, isHermes ? "H" : isUser ? "🧑" : isTool ? "⚙️" : "ℹ️"),
       h(
         "div",
         { className: "hcd-bubble" },
@@ -1066,9 +1075,16 @@
               "div",
               { className: "hcd-message-error" },
               h("strong", null, "Something went wrong"),
-              h("details", null, h("summary", null, "View details"), h("pre", null, str(msg.error))),
+              h("details", null, h("summary", null, "View details"), h("pre", null, contentText)),
             )
-          : h("div", { ref: bodyRef, className: "hcd-markdown", dangerouslySetInnerHTML: { __html: renderMarkdown(msg.content || (active ? "▌" : "")) + (active && msg.content ? '<span class="hcd-cursor">▌</span>' : "") } }),
+          : compactRaw
+            ? h("details", { className: "hcd-outline", open: !!msg.streaming },
+                h("summary", null, isTool ? "⚙️ Tool output" : "Output"),
+                h("pre", null, contentText || (active ? "▌" : "")),
+              )
+            : isSystem && !compactRaw
+              ? h("div", { className: "hcd-markdown hcd-system-note", dangerouslySetInnerHTML: { __html: bodyContent } })
+              : h("div", { ref: bodyRef, className: "hcd-markdown", dangerouslySetInnerHTML: { __html: bodyContent } }),
         hasStreamedThought
           ? h(
               "details",
@@ -2004,6 +2020,7 @@
     const gwRef = useRef(null);
     const selRef = useRef(null);      // selected mirror for event filter
     const gwSidRef = useRef(null);    // gateway-side session id (may differ after resume)
+    const pendingModelRef = useRef(null); // model chosen before a gateway session exists (applied on first send/resume)
     const generatingRef = useRef(false);
     const queryTimer = useRef(null);
     const sessionsRef = useRef([]);
@@ -2366,6 +2383,7 @@
       setRenderLimit(RENDER_WINDOW);
       setGoal(null);
       gwSidRef.current = null;
+      pendingModelRef.current = null;
       setAttachments([]);
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
     }, []);
@@ -2386,6 +2404,7 @@
       setOlderOffset(0);
       setRenderLimit(RENDER_WINDOW);
       setSessionsError("");
+      pendingModelRef.current = null;
       // newest page first; older pages load on demand when scrolling up
       try {
         const res = await fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}?limit=${PAGE}&offset=-${PAGE}`);
@@ -2419,16 +2438,43 @@
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
     }, [sessions, toast]);
 
+    // A model chosen while no live gateway session existed yet (a brand-new
+    // chat, or a conversation opened but not yet resumed) is queued in
+    // pendingModelRef.  config.set {key:"model", session_id} only switches a
+    // live session on the pinned v2026.5.7 gateway, so the pending choice is
+    // flushed here the moment the conversation gets its gateway session id —
+    // before the first prompt.submit runs, so the first reply already uses it.
+    const flushPendingModel = useCallback(async (sid) => {
+      const want = pendingModelRef.current;
+      if (!want || want === "auto") return;
+      const gw = gwRef.current;
+      if (!gw || !sid) return;
+      try {
+        await gw.request("config.set", { key: "model", value: want, session_id: sid }, 30000);
+        pendingModelRef.current = null;
+        setSelected((s) => s && { ...s, model: want });
+      } catch (e) {
+        // best-effort: don't block the send; leave the toast + model picker
+        // state to surface the failure to the user.
+        const m = str((e && e.message) || e);
+        if (!/busy|4009/i.test(m)) pendingModelRef.current = null;
+      }
+    }, []);
+
     const ensureSession = useCallback(async () => {
       const sel = selRef.current;
       if (sel) {
-        if (gwSidRef.current) return { session_id: gwSidRef.current, key: sel.key || sel.id };
+        if (gwSidRef.current) {
+          await flushPendingModel(gwSidRef.current);
+          return { session_id: gwSidRef.current, key: sel.key || sel.id };
+        }
         const gw = gwRef.current;
         if (!gw) throw new Error("gateway is not connected");
         await gw.connect();
         try {
           const res = await gw.request("session.resume", { session_id: sel.id }, 60000);
           gwSidRef.current = str((res && res.session_id) || sel.id);
+          await flushPendingModel(gwSidRef.current);
           return { session_id: gwSidRef.current, key: sel.key || sel.id };
         } catch {
           setSelected((s) => s && { ...s, readOnly: true });
@@ -2452,8 +2498,9 @@
       gwSidRef.current = sid;
       const title = str((res && res.title) || "New conversation");
       setSelected({ id: sid, key: sid, title, readOnly: false, model: (res && res.model) || "" });
+      await flushPendingModel(sid);
       return { session_id: sid, key: sid };
-    }, [settings]);
+    }, [settings, flushPendingModel]);
 
     // ── attachments ──────────────────────────────────────────────────
 
@@ -2791,12 +2838,25 @@
       if (name === "share") { createShare(); return; }
       if (name === "model") {
         if (!arg) { pushSystem(`Current model: ${str((selRef.current && selRef.current.model) || "auto")}`); return; }
+        const gw = gwRef.current;
+        const live = gwSidRef.current;
         try {
-          await gwRef.current.request("config.set", { key: "model", value: arg, ...(sid() ? { session_id: sid() } : {}) }, 30000);
-          pushSystem(`🧠 Model set to ${arg}`);
+          if (gw && live) {
+            await gw.request("config.set", { key: "model", value: arg, session_id: live }, 30000);
+            pushSystem(`🧠 Model set to ${arg}`);
+          } else {
+            // No live gateway session (new chat / not resumed) — queue it so
+            // the conversation starts on it, mirroring the model picker.
+            pendingModelRef.current = arg;
+            patchSettings({ defaultModel: arg });
+            pushSystem(`🧠 Model ${arg} queued — applies to this conversation`);
+          }
           setSelected((s) => s && { ...s, model: arg });
         } catch (e) {
-          toast(`Model switch failed: ${str(e.message || e)}`, "error");
+          const m = str((e && e.message) || e);
+          toast(/busy|4009/i.test(m)
+            ? "Stop the current reply first (■ Stop), then switch the model."
+            : `Model switch failed: ${m}`, "error");
         }
         return;
       }
@@ -2872,7 +2932,7 @@
         const m = str(e.message || e);
         pushSystem(`⚠ /${name}: ${m}${/unknown|not found|4018/i.test(m) ? " — this deployment disables the slash worker; quick commands only." : ""}`);
       }
-    }, [newChat, runRetry, runUndo, requestCompact, refreshUsage, steer, submitGatewayText, ensureSession, toast, usage]);
+    }, [newChat, runRetry, runUndo, requestCompact, refreshUsage, steer, submitGatewayText, ensureSession, toast, usage, patchSettings]);
 
     const usageMeterText = (u) => {
       if (!u || !(u.context_used || u.total)) return "Context usage unknown — send a message first.";
@@ -3173,21 +3233,45 @@
     // ── model ────────────────────────────────────────────────────────
 
     const changeModel = useCallback(async (id) => {
-      if (id === "auto") { setModelValue("auto"); return; }
-      setModelValue(id);
-      const sid = gwSidRef.current || (selRef.current && selRef.current.key);
-      try {
-        if (sid) {
-          await gwRef.current.request("config.set", { key: "model", value: id, session_id: sid }, 30000);
-        } else {
-          patchSettings({ defaultModel: id });
-        }
-        setSelected((s) => s && { ...s, model: id });
-        toast(`Model: ${id}`);
-      } catch (e) {
-        toast(`Model switch failed: ${str(e.message || e)} (applies to new chats)`, "error");
+      const prev = (selRef.current && selRef.current.model) || modelValue;
+      if (id === "auto") {
+        setModelValue("auto");
+        pendingModelRef.current = null;
+        setSelected((s) => s && { ...s, model: "" });
+        return;
       }
-    }, [patchSettings, toast]);
+      setModelValue(id);
+      setSelected((s) => s && { ...s, model: id });
+      // A real model switch is `config.set {key:"model", value, session_id}`
+      // against a LIVE gateway session (this is what the pinned v2026.5.7
+      // gateway uses to hot-swap the running agent).  Without a live
+      // session_id the write only updates global config for *new* sessions,
+      // so when none is active yet we queue the choice and apply it the
+      // moment the conversation gets its gateway session (see ensureSession).
+      const gw = gwRef.current;
+      const live = gwSidRef.current;
+      if (gw && live) {
+        try {
+          await gw.request("config.set", { key: "model", value: id, session_id: live }, 30000);
+          pendingModelRef.current = null;
+          setSelected((s) => s && { ...s, model: id });
+          toast(`Model: ${id}`);
+        } catch (e) {
+          const m = str((e && e.message) || e);
+          // revert the optimistic label so it never lies about the active model
+          setSelected((s) => s && { ...s, model: s.model === id ? prev : s.model });
+          setModelValue(prev);
+          toast(/busy|4009/i.test(m)
+            ? "Stop the current reply first (■ Stop), then switch the model."
+            : `Model switch failed: ${m}`, "error");
+        }
+        return;
+      }
+      // No live gateway session yet (new chat / not resumed): remember it.
+      pendingModelRef.current = id;
+      patchSettings({ defaultModel: id });
+      toast(`Model: ${id} — applies to this conversation`);
+    }, [modelValue, patchSettings, toast]);
 
     const changePinnedModels = useCallback((pins) => {
       setPinnedModels(pins);
