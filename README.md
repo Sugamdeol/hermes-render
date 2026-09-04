@@ -256,6 +256,17 @@ The dashboard's **Chat** tab is enabled by default. It is served by the bundled 
 
 The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
 
+### Chat plugin changelog
+
+**1.2.0** — stability + agent-control release.
+
+- *Crash containment:* the whole tab now renders inside an error boundary, so a single malformed payload can never blank the dashboard again — you get a recovery card and the rest of the UI keeps working. All tool/subagent strings are defensively coerced, the WebSocket connect has a hard timeout (a half-open socket can no longer pin the tab in "connecting" forever), a heartbeat (`config.get mtime`, the cheapest session-less read on the pinned gateway) marks dead transports "stale" and force-reconnects, and a failed send now **restores your draft** instead of eating it.
+- *Fixes on the pinned runtime (v2026.5.7):* server-side history search now calls `search_messages` (feature-detected; the previous release called a method that does not exist at this tag, silently returning no hits); transcript paging uses `limit`/`offset` with negative-offset "newest page" support; `respondPrompt` sends the correct parameter per prompt flavour (`clarify.respond → answer`, `sudo.respond → password`, `secret.respond → value`, `approval.respond → choice`) — approvals previously resolved as deny.
+- *Agent control:* steer a running turn from the composer, retry / edit-&-retry (rewind contract) / regenerate / continue, context compaction with a live context meter in the header, `undo turn`, a slash-command bridge over `command.dispatch` (never `slash.exec` — this deployment disables the slash worker), goal-mode pill, and a command palette (⌘K).
+- *Observability:* live subagent trees (per-agent interrupt), delegation status/pause, spawn-tree save/replay, streamed reasoning blocks, tool cards with diffs/todo lists.
+- *Organization:* sidebar folders (drag & drop, rename), tags with filter chips, bulk select actions, share-link manager, branch lineage panel, usage rollups, per-conversation drafts (localStorage), transcript lazy-loading for 1000+ message chats, attachment thumbnails.
+- Bumped from 1.1.0; REST-backed history still works read-only while the gateway restarts, and every new backend route keeps the dashboard session-token check.
+
 ## Run it locally
 
 [`run-local.sh`](./run-local.sh) is a single self-contained script that runs the
