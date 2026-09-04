@@ -328,6 +328,30 @@ services:
         value: "87"
       - key: HERMES_MEMGUARD_DASHBOARD_PCT
         value: "92"
+      # Auto-reclaim only engages on a *measured* cap at or below this, so a
+      # big dev box or an uncapped host never has processes killed out from
+      # under it. Kept well above the 512 MB Free cap on purpose: pinned
+      # exactly to the instance size, a cap reading even one megabyte high
+      # would silently drop the guard to telemetry-only forever.
+      - key: HERMES_MEMGUARD_MAX_ACTIVE_MB
+        value: "2048"
+      # Kernel OOM preference, applied at boot and re-applied after any
+      # restart (a new PID carries the kernel's default score). The gateway
+      # is pushed as far from the kill list as the kernel allows and the
+      # dashboard toward it, so pressure costs a dashboard recycle rather
+      # than the conversation in progress.
+      - key: HERMES_OOM_SCORE_GATEWAY
+        value: "-500"
+      - key: HERMES_OOM_SCORE_DASHBOARD
+        value: "250"
+      # Bounded wait for the gateway process to appear at boot so the ranking
+      # above can be applied to it. 0 disables the wait.
+      - key: HERMES_OOM_PROTECT_WAIT_SECONDS
+        value: "60"
+      # A dashboard must have been up at least this long before EMERGENCY
+      # will recycle it, so one still starting is never the thing killed.
+      - key: HERMES_MEMGUARD_DASHBOARD_GRACE
+        value: "5"
       # Git state-sync memory. git eagerly mallocs http.postBuffer on every
       # push and pack-objects defaults to unbounded delta windows with one
       # thread per core; the shipped defaults can spike one push far past
