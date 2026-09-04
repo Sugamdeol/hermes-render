@@ -83,8 +83,118 @@ exit 0
 FAKE_GOSU = "#!/bin/sh\n# real gosu is `gosu USER CMD...`; drop the user and exec the rest\nshift\nexec \"$@\"\n"
 
 
+def _reap_stale_fixtures() -> None:
+    """Kill fixture processes orphaned by an earlier, interrupted run.
+
+    bootstrap.sh locates its children by substring-matching /proc/*/cmdline
+    against needles such as "hermes dashboard". The fixture binary is named
+    ``fake-hermes``, so a ``fake-hermes dashboard`` left behind by a run that
+    was killed (a timeout, a Ctrl-C) satisfies that needle, and the *next*
+    run's watchdog concludes a dashboard is already up and never starts its
+    own. tearDown only kills its own process group, so an interrupted run
+    leaks, and the following run then fails in a way that looks like a
+    bootstrap bug rather than a dirty machine.
+
+    Only processes whose command line names a sandbox directory that no
+    longer exists are killed, and only processes whose HERMES_HOME points at
+    a directory that no longer exists -- so a test running concurrently in
+    its own live sandbox is never touched.
+    """
+    me = os.getpid()
+    victims: list[int] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        try:
+            cmdline = (
+                Path(f"/proc/{entry}/cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        stale = False
+        if "fake-hermes" in cmdline or "fake-entrypoint.sh" in cmdline:
+            dirs = {
+                Path(tok).parent
+                for tok in cmdline.split()
+                if "fake-hermes" in tok or "fake-entrypoint.sh" in tok
+            }
+            stale = bool(dirs) and not any(d.exists() for d in dirs)
+        if not stale:
+            # an orphaned bootstrap.sh names no fixture on its command line,
+            # but its HERMES_HOME still points into the dead sandbox
+            try:
+                environ = Path(f"/proc/{entry}/environ").read_bytes().decode("utf-8", "replace")
+            except OSError:
+                environ = ""
+            for kv in environ.split("\0"):
+                if kv.startswith("HERMES_HOME="):
+                    stale = not Path(kv.split("=", 1)[1]).exists()
+                    break
+        if stale:
+            victims.append(pid)
+    for pid in victims:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+
+def _live_hermes_conflicts() -> list[str]:
+    """Describe running processes that would satisfy bootstrap's own needles.
+
+    bootstrap.sh finds its children by substring-matching /proc/*/cmdline
+    against needles such as "hermes dashboard" and "hermes gateway". That scan
+    is whole-machine and cannot be namespaced from a test, so if a *real*
+    Hermes is running on this host -- a developer's local stack, an
+    integration run left up in another terminal -- the watchdog under test
+    sees that process, concludes a dashboard is already up, and never starts
+    its own. The resulting failure looks like a supervision bug and is not
+    one.
+
+    This suite's own fixtures are named ``fake-hermes`` and are excluded, so a
+    test running concurrently in its own sandbox does not cause a skip.
+    """
+    found: list[str] = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            cmdline = (
+                Path(f"/proc/{entry}/cmdline")
+                .read_bytes()
+                .replace(b"\0", b" ")
+                .decode("utf-8", "replace")
+            )
+        except OSError:
+            continue
+        if "fake-hermes" in cmdline:
+            continue
+        for needle in ("hermes dashboard", "hermes gateway"):
+            if needle in cmdline:
+                found.append(f"pid={entry} {cmdline.strip()[:80]}")
+                break
+    return found
+
+
 class BootstrapSupervisionTests(unittest.TestCase):
     def setUp(self):
+        _reap_stale_fixtures()
+        conflicts = _live_hermes_conflicts()
+        if conflicts:
+            self.skipTest(
+                "a real Hermes is running on this host, so bootstrap's "
+                "whole-machine /proc scan would match it instead of this "
+                "test's fixtures; stop it and re-run: " + "; ".join(conflicts)
+            )
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-boot-sup-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
@@ -125,6 +235,13 @@ class BootstrapSupervisionTests(unittest.TestCase):
             "HERMES_PATCHER": str(self.bin_dir / "patch-config"),
             "HERMES_GIT_SYNC": str(self.bin_dir / "patch-config"),
             "HERMES_PLUGINS_SRC": str(self.sandbox / "no-plugins"),
+            # Keep bootstrap off the real /opt/render-tools. Without these the
+            # script merges the machine's env/common.env into the sandbox and
+            # the fake binaries behave nothing like the fixtures -- which is
+            # how these tests came to depend on that directory NOT existing.
+            "HERMES_SEEDER": str(self.sandbox / "no-seed-env.py"),
+            "HERMES_COMMON_ENV": str(self.sandbox / "no-common.env"),
+            "HERMES_SECRETS_ENC": str(self.sandbox / "no-secrets.enc.env"),
             "HERMES_UPSTREAM_ENTRYPOINT": str(entrypoint),
             "HERMES_BIN": str(hermes_bin),
             "HERMES_ENTRYPOINT_RESTARTS": "5",
@@ -278,17 +395,54 @@ def _proc_state(pid: int):
     return None
 
 
-class OomGuardTests(unittest.TestCase):
-    """The proactive memory guard (memory_guard_loop) reclaims before a
-    container OOM.  These run the *real* bootstrap.sh but point the cgroup
-    reader at a synthetic, artificially-full budget and confirm the staged
-    reclaim fires (git state-sync daemon SIGSTOPped) instead of only logging.
+def _pids_matching(needle: str):
+    """The pids whose cmdline contains `needle` -- bootstrap's own matcher,
+    reimplemented here so the test checks what the script would find."""
+    found = []
+    for entry in Path("/proc").glob("[0-9]*"):
+        try:
+            cmdline = (entry / "cmdline").read_bytes().decode("utf-8", "replace")
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        if needle in cmdline.replace("\x00", " "):
+            try:
+                found.append(int(entry.name))
+            except ValueError:
+                continue
+    return found
 
-    bootstrap output is captured to a file (never a pipe) so the harness
-    cannot deadlock on backpressure, and teardown hard-kills the process
-    group the way a stopped container would."""
+
+def _oom_score_adj(pid: int):
+    """The kernel's OOM ranking for `pid`, or None if the process is gone."""
+    try:
+        return int(Path(f"/proc/{pid}/oom_score_adj").read_text().strip())
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        return None
+
+
+class _GuardHarness(unittest.TestCase):
+    """Shared sandbox for running the *real* bootstrap.sh with fake
+    gosu/entrypoint/hermes binaries and a synthetic, artificially-full cgroup.
+
+    bootstrap output is captured to a file (never a pipe) so the harness cannot
+    deadlock on backpressure, and teardown hard-kills the process group the way
+    a stopped container would.
+
+    No tests live here on purpose: a subclass would inherit them and run these
+    slow supervision cases twice.
+    """
 
     def setUp(self):
+        _reap_stale_fixtures()
+        conflicts = _live_hermes_conflicts()
+        if conflicts:
+            self.skipTest(
+                "a real Hermes is running on this host and bootstrap's "
+                "whole-machine /proc scan would match it; the guard's "
+                "EMERGENCY stage kills whatever that scan returns, so these "
+                "tests could terminate a live dashboard. Stop it and "
+                "re-run: " + "; ".join(conflicts)
+            )
         self.sandbox = Path(tempfile.mkdtemp(prefix="hcd-oom-guard-"))
         self.bin_dir = self.sandbox / "bin"
         self.bin_dir.mkdir()
@@ -355,6 +509,13 @@ class OomGuardTests(unittest.TestCase):
             "HERMES_PATCHER": str(self.bin_dir / "patch-config"),
             "HERMES_GIT_SYNC": str(self.bin_dir / "patch-config"),
             "HERMES_PLUGINS_SRC": str(self.sandbox / "no-plugins"),
+            # Keep bootstrap off the real /opt/render-tools. Without these the
+            # script merges the machine's env/common.env into the sandbox and
+            # the fake binaries behave nothing like the fixtures -- which is
+            # how these tests came to depend on that directory NOT existing.
+            "HERMES_SEEDER": str(self.sandbox / "no-seed-env.py"),
+            "HERMES_COMMON_ENV": str(self.sandbox / "no-common.env"),
+            "HERMES_SECRETS_ENC": str(self.sandbox / "no-secrets.enc.env"),
             "HERMES_UPSTREAM_ENTRYPOINT": str(self.bin_dir / "entrypoint"),
             "HERMES_BIN": str(self.bin_dir / "hermes"),
             "HERMES_ENTRYPOINT_RESTARTS": "5",
@@ -374,6 +535,12 @@ class OomGuardTests(unittest.TestCase):
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+
+class OomGuardTests(_GuardHarness):
+    """The proactive memory guard (memory_guard_loop) reclaims before a
+    container OOM. These point the cgroup reader at a synthetic,
+    artificially-full budget and confirm the staged reclaim fires (git
+    state-sync daemon SIGSTOPped) instead of only logging."""
 
     def test_guard_sigstops_sync_daemon_under_container_pressure(self):
         # a fake git state-sync daemon the guard must pause (its pid lives in
@@ -453,6 +620,10 @@ class OomGuardTests(unittest.TestCase):
                 "HERMES_MEMGUARD_WARN": "90",
                 "HERMES_MEMGUARD_PAUSE_SYNC": "20",
                 "HERMES_MEMGUARD_RESUME_SYNC": "5",
+                # Keep this case about the PAUSE stage. The synthetic budget
+                # is exceeded by orders of magnitude, so every later stage
+                # would fire too -- and 0 is how a stage is switched off.
+                "HERMES_MEMGUARD_CRITICAL": "0",
                 "HERMES_MEMGUARD_DASHBOARD_PCT": "0",
                 "HERMES_MEMGUARD_MAX_ACTIVE_MB": "2048",
             }
@@ -471,6 +642,148 @@ class OomGuardTests(unittest.TestCase):
         output = self.log_path.read_text(encoding="utf-8", errors="replace")
         self.assertIn("using RSS estimate", output)
         self.assertIn("pausing git state sync", output)
+
+    def test_guard_critical_stage_stops_sync_and_writes_hold(self):
+        """Above CRITICAL the guard gives up on the backup instead of pausing
+        it: a stopped daemon still holds its RSS. It must terminate the daemon
+        AND leave the hold file, otherwise the supervisor restarts it straight
+        back into the pressure that stopped it."""
+        self.daemon = subprocess.Popen(["/bin/sh", "-c", "sleep 300"], start_new_session=True)
+        pidfile = self.sandbox / "render-tools-git-daemon.pid"
+        pidfile.write_text(str(self.daemon.pid))
+        hold = self.sandbox / "render-tools-git-daemon.hold"
+        self._launch(
+            {
+                "HERMES_MEMGUARD": "1",
+                "TMPDIR": str(self.sandbox),
+                "HERMES_CGROUP_ROOT": str(self.sandbox / "empty-cg"),
+                "HERMES_CGROUP_PATH": "/",
+                "HERMES_MEM_LIMIT_MB": "4",
+                "HERMES_MEMGUARD_INTERVAL_SECONDS": "1",
+                "HERMES_MEMGUARD_WARN": "10",
+                "HERMES_MEMGUARD_PAUSE_SYNC": "20",
+                "HERMES_MEMGUARD_CRITICAL": "30",
+                "HERMES_MEMGUARD_RESUME_SYNC": "5",
+                "HERMES_MEMGUARD_DASHBOARD_PCT": "0",
+            }
+        )
+        deadline = time.monotonic() + 30
+        exited = False
+        while time.monotonic() < deadline:
+            if self.daemon.poll() is not None:
+                exited = True
+                break
+            time.sleep(0.2)
+        self.assertTrue(exited, "guard never stopped the sync daemon at CRITICAL")
+        self.assertTrue(hold.exists(), "no hold file: the supervisor would restart it")
+        output = self.log_path.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("CRITICAL", output)
+        self.assertIn("stopping git state sync", output)
+
+    def test_guard_reports_staged_level_transitions(self):
+        """The log must say which degradation level the container is in; a
+        reader should not have to infer it from which reclaim lines appeared."""
+        self.daemon = subprocess.Popen(["/bin/sh", "-c", "sleep 300"], start_new_session=True)
+        (self.sandbox / "render-tools-git-daemon.pid").write_text(str(self.daemon.pid))
+        self._launch(
+            {
+                "HERMES_MEMGUARD": "1",
+                "TMPDIR": str(self.sandbox),
+                "HERMES_CGROUP_ROOT": str(self.sandbox / "empty-cg"),
+                "HERMES_CGROUP_PATH": "/",
+                "HERMES_MEM_LIMIT_MB": "4",
+                "HERMES_MEMGUARD_INTERVAL_SECONDS": "1",
+                "HERMES_MEMGUARD_WARN": "10",
+                # Every reclaim stage off: this case is only about the level
+                # being reported, and 0 is how a stage is disabled.
+                "HERMES_MEMGUARD_PAUSE_SYNC": "0",
+                "HERMES_MEMGUARD_CRITICAL": "0",
+                "HERMES_MEMGUARD_DASHBOARD_PCT": "0",
+                "HERMES_MEMGUARD_MAX_ACTIVE_MB": "2048",
+            }
+        )
+        deadline = time.monotonic() + 30
+        output = ""
+        while time.monotonic() < deadline:
+            output = self.log_path.read_text(encoding="utf-8", errors="replace")
+            if "NORMAL -> WATCH" in output:
+                break
+            time.sleep(0.2)
+        self.assertIn("NORMAL -> WATCH", output)
+        # and the structured telemetry line that names the culprit process
+        self.assertRegex(output, r"procs=\d+ threads=\d+")
+
+
+class BootOomRankingTests(_GuardHarness):
+    """The kernel OOM ranking is applied at boot, not only by the guard.
+
+    Two failure modes this pins down, both of which were real before the
+    boot-time call existed:
+
+      * with HERMES_MEMGUARD=0 there is no guard loop and therefore no 30 s
+        housekeeping tick -- so the ranking would never be applied at all, and
+        the gateway would sit at the default score next to a dashboard that
+        the watchdog can restart in ten seconds;
+      * even with the guard on, the first half minute is unranked, and that is
+        exactly when the agent-runtime import (the largest single allocation
+        measured on this image) lands.
+
+    The assertion is on the value the kernel actually reports, so a function
+    that is defined but never called cannot pass.
+    """
+
+    def test_gateway_is_oom_ranked_at_boot_with_the_guard_disabled(self):
+        # an entrypoint that spawns a process whose argv keeps the
+        # "hermes gateway" needle bootstrap matches on
+        (self.bin_dir / "entrypoint").write_text(
+            "#!/bin/sh\n"
+            "bash -c 'exec -a \"/opt/hermes/.venv/bin/hermes gateway run\" "
+            "sleep 300' &\n"
+            "sleep 300\n"
+        )
+        os.chmod(self.bin_dir / "entrypoint", 0o755)
+        self._launch({"HERMES_MEMGUARD": "0"})
+
+        deadline = time.monotonic() + 40
+        score = None
+        pids = []
+        while time.monotonic() < deadline:
+            pids = _pids_matching("hermes gateway")
+            if pids:
+                score = _oom_score_adj(pids[0])
+                if score == -500:
+                    break
+            time.sleep(0.2)
+
+        self.assertTrue(pids, "the fake gateway never started; test setup is broken")
+        self.assertEqual(
+            score,
+            -500,
+            "gateway was never OOM-protected at boot (HERMES_OOM_SCORE_GATEWAY "
+            f"default is -500, kernel reports {score!r}). With HERMES_MEMGUARD=0 "
+            "the 30 s housekeeping tick that re-applies it does not run, so "
+            "this can only come from the boot-time call.",
+        )
+
+    def test_ranking_is_configurable_and_gives_up_on_a_dead_child(self):
+        """A non-default score is honoured, and the poller must not spin
+        forever when the child exits before a gateway ever appears."""
+        (self.bin_dir / "entrypoint").write_text("#!/bin/sh\nexit 0\n")
+        os.chmod(self.bin_dir / "entrypoint", 0o755)
+        self._launch(
+            {
+                "HERMES_MEMGUARD": "0",
+                "HERMES_OOM_SCORE_GATEWAY": "-250",
+                "HERMES_ENTRYPOINT_RESTARTS": "0",
+                "HERMES_OOM_PROTECT_WAIT_SECONDS": "2",
+            }
+        )
+        # the wrapper must exit rather than hang on the readiness poll
+        try:
+            code = self.proc.wait(timeout=40)
+        except subprocess.TimeoutExpired:
+            self.fail("bootstrap hung on oom_protect_gateway_when_ready after the child exited")
+        self.assertIsInstance(code, int)
 
 
 if __name__ == "__main__":

@@ -135,6 +135,34 @@ def _default_modes(toolsets: list[dict]) -> list[dict]:
     return modes
 
 
+@router.get("/health")
+async def health() -> dict:
+    """Liveness probe: "the dashboard process can answer HTTP". Nothing else.
+
+    This is the path render.yaml points Render's health check at, and the path
+    the keep-alive loop requests, so it is on a timer and must stay trivial.
+    It deliberately does NOT:
+
+      * touch the session database (``/api/status`` opens SQLite and scans the
+        50 most recent sessions on every call),
+      * load or parse config.yaml (``/api/status`` re-reads and deep-copies a
+        ~54 KB YAML document),
+      * load the gateway config, probe the gateway, or resolve any model.
+
+    Measured on a 0.1 CPU container, ``/api/status`` costs 180-700 ms per
+    call; this costs microseconds. Render polls the health path on its own
+    cadence and the keep-alive loop polls it every 10 minutes, so the
+    difference is CPU the gateway would otherwise spend answering a question
+    whose only real content is "still here".
+
+    Deliberately unauthenticated -- the dashboard's auth middleware exempts
+    ``/api/plugins/*``, which is what lets the platform reach it -- and
+    therefore deliberately empty: no version, no paths, no timings, nothing an
+    unauthenticated caller could use.
+    """
+    return {"ok": True}
+
+
 @router.get("/capabilities")
 async def capabilities(request: Request):
     _require_session(request)
