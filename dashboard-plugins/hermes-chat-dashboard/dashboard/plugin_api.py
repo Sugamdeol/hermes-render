@@ -202,6 +202,329 @@ async def capabilities(request: Request):
     }
 
 
+def _content_text(content: Any) -> str:
+    """Flatten an OpenAI-style content value (str | list of parts) to text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (int, float)):
+        return str(content)
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            text = _content_text(part).strip()
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        kind = content.get("type")
+        if kind in {"text", "input_text", "output_text"}:
+            return str(content.get("text") or content.get("content") or "")
+        if kind in {"image_url", "input_image", "image"}:
+            return "[image]"
+        if kind in {"input_audio", "audio"}:
+            return "[audio]"
+        if "text" in content:
+            return str(content.get("text") or "")
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except Exception:
+            return str(content)
+    return str(content)
+
+
+def _args_preview(name: str, args: dict, max_len: int = 160) -> str:
+    """Short human-readable preview of tool-call arguments.
+
+    Prefers upstream's ``build_tool_preview`` (same text the TUI shows) and
+    falls back to a compact key=value rendering when it is unavailable.
+    """
+    try:
+        from agent.display import build_tool_preview  # type: ignore
+        text = build_tool_preview(name, args, max_len=max_len) or ""
+        if text:
+            return text
+    except Exception:
+        pass
+    if not isinstance(args, dict) or not args:
+        return ""
+    for key in ("command", "cmd", "query", "url", "path", "file_path", "pattern", "prompt", "task", "content"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            val = " ".join(val.split())
+            return val if len(val) <= max_len else val[: max_len - 1] + "…"
+    try:
+        text = json.dumps(args, ensure_ascii=False)
+    except Exception:
+        text = str(args)
+    return text if len(text) <= max_len else text[: max_len - 1] + "…"
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} more chars)"
+
+
+def _build_transcript(rows: list[dict], result_limit: int = 4000) -> list[dict]:
+    """Turn raw session DB rows into display turns for the web UI.
+
+    Output is chronological.  Assistant tool calls are attached to the
+    assistant turn that issued them (``tools`` list, in call order) and the
+    matching ``tool`` rows fill in the result preview, so the UI can render
+    each turn as *steps → answer* instead of a flat, unordered pile.  Empty
+    assistant rows that only carried tool calls are folded into the tools of
+    the following visible assistant message when there is one.
+    """
+    turns: list[dict] = []
+    tools_by_call_id: dict[str, dict] = {}
+    pending_tools: list[dict] = []
+    counter = 0
+
+    def _new_turn(role: str, row: dict, text: str) -> dict:
+        nonlocal counter
+        counter += 1
+        turn = {
+            "id": f"m{counter}",
+            "role": role,
+            "content": text,
+            "timestamp": row.get("timestamp"),
+        }
+        return turn
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        role = row.get("role")
+        if role not in ("user", "assistant", "tool", "system"):
+            continue
+        text = _content_text(row.get("content"))
+
+        if role == "tool":
+            call_id = row.get("tool_call_id") or ""
+            entry = tools_by_call_id.get(call_id)
+            if entry is None:
+                entry = {
+                    "tool_id": call_id or f"tool-{len(tools_by_call_id) + 1}",
+                    "name": row.get("tool_name") or "tool",
+                    "context": "",
+                    "args": {},
+                    "status": "complete",
+                    "started_at": row.get("timestamp"),
+                }
+                tools_by_call_id[entry["tool_id"]] = entry
+                pending_tools.append(entry)
+            entry["status"] = "complete"
+            entry["result"] = _clip(text, result_limit)
+            entry["completed_at"] = row.get("timestamp")
+            if entry.get("started_at") and row.get("timestamp"):
+                try:
+                    entry["duration_s"] = max(0.0, float(row["timestamp"]) - float(entry["started_at"]))
+                except Exception:
+                    pass
+            continue
+
+        if role == "assistant":
+            calls = row.get("tool_calls") or []
+            new_tools = []
+            for tc in calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                name = fn.get("name") or tc.get("name") or "tool"
+                raw_args = fn.get("arguments", tc.get("arguments", "{}"))
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args or "{}")
+                    except Exception:
+                        args = {"_raw": raw_args}
+                else:
+                    args = raw_args if isinstance(raw_args, dict) else {}
+                call_id = tc.get("id") or f"call-{len(tools_by_call_id) + 1}"
+                entry = {
+                    "tool_id": call_id,
+                    "name": name,
+                    "context": _args_preview(name, args),
+                    "args": args,
+                    "status": "running",
+                    "started_at": row.get("timestamp"),
+                }
+                tools_by_call_id[call_id] = entry
+                new_tools.append(entry)
+            reasoning = row.get("reasoning") or row.get("reasoning_content") or ""
+            if not text.strip():
+                # Tool-only assistant step: keep its tools for the next visible turn.
+                pending_tools.extend(new_tools)
+                if reasoning and pending_tools:
+                    pending_tools[0].setdefault("reasoning", str(reasoning))
+                continue
+            turn = _new_turn("assistant", row, text)
+            tools = pending_tools + new_tools
+            pending_tools = []
+            if tools:
+                turn["tools"] = tools
+            if reasoning:
+                turn["reasoning"] = str(reasoning)
+            turns.append(turn)
+            continue
+
+        if not text.strip():
+            continue
+        if pending_tools and role == "user":
+            # Tools ran but the assistant produced no visible text (interrupted
+            # or errored turn).  Surface them as their own step block so the
+            # history still shows what happened.
+            counter += 1
+            turns.append({"id": f"m{counter}", "role": "assistant", "content": "", "timestamp": row.get("timestamp"), "tools": pending_tools, "incomplete": True})
+            pending_tools = []
+        turns.append(_new_turn(role, row, text))
+
+    if pending_tools:
+        counter += 1
+        turns.append({"id": f"m{counter}", "role": "assistant", "content": "", "timestamp": pending_tools[-1].get("completed_at") or pending_tools[-1].get("started_at"), "tools": pending_tools, "incomplete": True})
+    for turn in turns:
+        for tool in turn.get("tools") or []:
+            tool.pop("args", None)
+    return turns
+
+
+def _lineage_ids(db, session_id: str) -> list[str]:
+    """Root→tip chain of sessions (compression/branch continuations)."""
+    try:
+        chain = db._session_lineage_root_to_tip(session_id)  # noqa: SLF001 - upstream helper
+        if chain:
+            return [c for c in chain if c]
+    except Exception:
+        pass
+    return [session_id]
+
+
+@router.get("/sessions")
+async def list_sessions(request: Request, limit: int = 100, offset: int = 0):
+    """Session list for the chat sidebar.
+
+    Wraps ``list_sessions_rich`` (ordered by most recent activity, hiding
+    ``tool`` sub-agent runs) and merges the plugin's UI metadata so the
+    sidebar needs one round-trip.
+    """
+    _require_session(request)
+    limit = max(1, min(int(limit or 100), 500))
+    offset = max(0, int(offset or 0))
+    db = _session_db()
+    try:
+        try:
+            rows = db.list_sessions_rich(limit=limit * 2, offset=offset, order_by_last_active=True)
+        except TypeError:
+            rows = db.list_sessions_rich(limit=limit * 2, offset=offset)
+        try:
+            total = db.session_count()
+        except Exception:
+            total = None
+    finally:
+        db.close()
+    meta = _read_json(META_FILE, {})
+    now = time.time()
+    out = []
+    for s in rows:
+        if (s.get("source") or "").strip().lower() == "tool":
+            continue
+        sid = s.get("id")
+        m = meta.get(sid) if isinstance(meta.get(sid), dict) else {}
+        out.append({
+            "id": sid,
+            "title": s.get("title") or "",
+            "preview": s.get("preview") or "",
+            "source": s.get("source") or "",
+            "model": s.get("model") or "",
+            "started_at": s.get("started_at") or 0,
+            "last_active": s.get("last_active") or s.get("started_at") or 0,
+            "ended_at": s.get("ended_at"),
+            "end_reason": s.get("end_reason"),
+            "message_count": s.get("message_count") or 0,
+            "tool_call_count": s.get("tool_call_count") or 0,
+            "parent_session_id": s.get("parent_session_id"),
+            "is_active": s.get("ended_at") is None and (now - (s.get("last_active") or s.get("started_at") or 0)) < 300,
+            "pinned": bool(m.get("pinned")) or bool(m.get("starred")),
+            "archived": bool(m.get("archived")),
+            "tags": m.get("tags") or [],
+        })
+        if len(out) >= limit:
+            break
+    return {"sessions": out, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/transcript/{session_id}")
+async def get_transcript(request: Request, session_id: str):
+    """Read-only transcript for viewing a session without resuming it.
+
+    Resuming through ``session.resume`` builds a full agent (slow, and it
+    pins tens of MB per session); browsing history should not pay that.
+    """
+    _require_session(request)
+    db = _session_db()
+    try:
+        sid = None
+        try:
+            sid = db.resolve_session_id(session_id)
+        except Exception:
+            sid = None
+        session = db.get_session(sid or session_id)
+        if not session:
+            session = db.get_session_by_title(session_id) if hasattr(db, "get_session_by_title") else None
+            if not session:
+                raise HTTPException(status_code=404, detail="session not found")
+        sid = session.get("id") or sid or session_id
+        rows: list[dict] = []
+        for chain_id in _lineage_ids(db, sid):
+            try:
+                rows.extend(db.get_messages(chain_id))
+            except Exception:
+                continue
+    finally:
+        db.close()
+    rows.sort(key=lambda r: ((r.get("timestamp") or 0), (r.get("id") or 0)))
+    return {
+        "session": {k: session.get(k) for k in ("id", "title", "source", "model", "started_at", "ended_at", "end_reason", "message_count", "tool_call_count", "parent_session_id", "input_tokens", "output_tokens") if k in session},
+        "messages": _build_transcript(rows),
+    }
+
+
+@router.put("/sessions/{session_id}/title")
+async def rename_session(request: Request, session_id: str, body: dict):
+    _require_session(request)
+    title = str((body or {}).get("title") or "").strip()
+    db = _session_db()
+    try:
+        try:
+            if not db.set_session_title(session_id, title):
+                raise HTTPException(status_code=404, detail="session not found")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        db.close()
+    return {"ok": True, "title": title}
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(request: Request, session_id: str):
+    _require_session(request)
+    db = _session_db()
+    try:
+        try:
+            deleted = db.delete_session(session_id, sessions_dir=_home() / "sessions")
+        except TypeError:
+            deleted = db.delete_session(session_id)
+    finally:
+        db.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="session not found")
+    meta = _read_json(META_FILE, {})
+    if session_id in meta:
+        meta.pop(session_id, None)
+        _write_json(META_FILE, meta)
+    return {"ok": True}
+
+
 @router.get("/metadata")
 async def metadata(request: Request):
     _require_session(request)
@@ -347,11 +670,20 @@ async def export_session(request: Request, session_id: str, format: str = "markd
         return {"session": session, "messages": messages}
     if fmt not in {"markdown", "md", "txt", "text"}:
         raise HTTPException(status_code=400, detail="supported formats: markdown, json, txt")
-    parts = [f"# {title}", ""] if fmt in {"markdown", "md"} else [f"{title}", ""]
-    for msg in messages:
-        role = (msg.get("role") or "message").title()
-        content = msg.get("content") or ""
-        parts.extend([f"## {role}" if fmt in {"markdown", "md"} else f"[{role}]", str(content), ""])
+    md = fmt in {"markdown", "md"}
+    parts = [f"# {title}", ""] if md else [f"{title}", ""]
+    for turn in _build_transcript(messages, result_limit=1200):
+        role = "Hermes" if turn["role"] == "assistant" else turn["role"].title()
+        parts.append(f"## {role}" if md else f"[{role}]")
+        for tool in turn.get("tools") or []:
+            label = f"{tool.get('name')}" + (f" — {tool.get('context')}" if tool.get("context") else "")
+            parts.append(f"- 🛠 `{label}`" if md else f"  * tool: {label}")
+            if tool.get("result"):
+                body = str(tool["result"]).rstrip()
+                parts.append(f"\n  ```\n  {body.replace(chr(10), chr(10) + '  ')}\n  ```" if md else "    " + body.replace("\n", "\n    "))
+        if turn.get("content"):
+            parts.append(str(turn["content"]))
+        parts.append("")
     media = "text/markdown" if fmt in {"markdown", "md"} else "text/plain"
     return PlainTextResponse("\n".join(parts), media_type=f"{media}; charset=utf-8")
 

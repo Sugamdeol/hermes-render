@@ -3,7 +3,7 @@
   "label": "Chat",
   "description": "First-class ChatGPT-style Hermes web chat workspace backed by the real Hermes TUI gateway, tools, agents, memory, sessions, and streaming events.",
   "icon": "MessageSquare",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "tab": {
     "path": "/chat",
     "override": "/chat",
