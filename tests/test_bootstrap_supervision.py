@@ -125,6 +125,13 @@ class BootstrapSupervisionTests(unittest.TestCase):
             "HERMES_PATCHER": str(self.bin_dir / "patch-config"),
             "HERMES_GIT_SYNC": str(self.bin_dir / "patch-config"),
             "HERMES_PLUGINS_SRC": str(self.sandbox / "no-plugins"),
+            # Keep bootstrap off the real /opt/render-tools. Without these the
+            # script merges the machine's env/common.env into the sandbox and
+            # the fake binaries behave nothing like the fixtures -- which is
+            # how these tests came to depend on that directory NOT existing.
+            "HERMES_SEEDER": str(self.sandbox / "no-seed-env.py"),
+            "HERMES_COMMON_ENV": str(self.sandbox / "no-common.env"),
+            "HERMES_SECRETS_ENC": str(self.sandbox / "no-secrets.enc.env"),
             "HERMES_UPSTREAM_ENTRYPOINT": str(entrypoint),
             "HERMES_BIN": str(hermes_bin),
             "HERMES_ENTRYPOINT_RESTARTS": "5",
@@ -382,6 +389,13 @@ class _GuardHarness(unittest.TestCase):
             "HERMES_PATCHER": str(self.bin_dir / "patch-config"),
             "HERMES_GIT_SYNC": str(self.bin_dir / "patch-config"),
             "HERMES_PLUGINS_SRC": str(self.sandbox / "no-plugins"),
+            # Keep bootstrap off the real /opt/render-tools. Without these the
+            # script merges the machine's env/common.env into the sandbox and
+            # the fake binaries behave nothing like the fixtures -- which is
+            # how these tests came to depend on that directory NOT existing.
+            "HERMES_SEEDER": str(self.sandbox / "no-seed-env.py"),
+            "HERMES_COMMON_ENV": str(self.sandbox / "no-common.env"),
+            "HERMES_SECRETS_ENC": str(self.sandbox / "no-secrets.enc.env"),
             "HERMES_UPSTREAM_ENTRYPOINT": str(self.bin_dir / "entrypoint"),
             "HERMES_BIN": str(self.bin_dir / "hermes"),
             "HERMES_ENTRYPOINT_RESTARTS": "5",

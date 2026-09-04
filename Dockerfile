@@ -126,6 +126,20 @@ COPY scripts/patch-session-cap.py /opt/render-tools/patch-session-cap.py
 RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-session-cap.py \
     /opt/hermes/tui_gateway/server.py
 
+# Upstream caps tool output through tool_output.max_bytes (which
+# patch-config.py sets to 30000) but only wires it into terminal_tool and
+# file_operations. tools/mcp_tool.py never imports the limits module, and
+# handle_function_call applies no central truncation, so an MCP result comes
+# back at full size: `cat` of a 5 MB file returns 30 KB while an MCP tool
+# returning 5 MB lands whole in the dashboard process *and* in the agent's
+# history, where it is re-sent to the model on every later turn. This routes
+# MCP through the operator's existing setting -- same key, same 40/60
+# head-tail split, same notice as terminal_tool -- so no new knob is added and
+# no limit is invented. structuredContent is left untouched.
+COPY scripts/patch-mcp-output-cap.py /opt/render-tools/patch-mcp-output-cap.py
+RUN /opt/hermes/.venv/bin/python /opt/render-tools/patch-mcp-output-cap.py \
+    /opt/hermes/tools/mcp_tool.py
+
 # Pull the official Render skill bundle from github.com/render-oss/skills
 # at a pinned commit. Mounted via skills.external_dirs at boot, so the
 # upstream Hermes skills-sync flow never touches these files. To upgrade,

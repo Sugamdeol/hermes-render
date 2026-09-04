@@ -237,9 +237,16 @@ fi
 #
 # Values are never echoed. The decrypted file lives in a private tmpfs-ish
 # temp dir owned by hermes and is removed immediately after the merge.
-SEEDER="/opt/render-tools/seed-env.py"
-COMMON_ENV="/opt/render-tools/env/common.env"
-SECRETS_ENC="/opt/render-tools/env/secrets.enc.env"
+# Overridable like every other tool path above (HERMES_PATCHER, HERMES_GIT_SYNC,
+# HERMES_PLUGINS_SRC, ...). These were the last three hardcoded absolute paths
+# in the script, which made the supervision tests silently depend on
+# /opt/render-tools *not* existing on the machine running them: once that
+# directory was present, bootstrap merged the real env/common.env into the
+# test sandbox and the fake binaries behaved nothing like the fixtures. Point
+# them at a nonexistent path to run bootstrap with no repo env at all.
+SEEDER="${HERMES_SEEDER:-/opt/render-tools/seed-env.py}"
+COMMON_ENV="${HERMES_COMMON_ENV:-/opt/render-tools/env/common.env}"
+SECRETS_ENC="${HERMES_SECRETS_ENC:-/opt/render-tools/env/secrets.enc.env}"
 
 seed_from_file() {
   # $1 = plaintext dotenv path. Emits exports on stdout for eval by the caller.
