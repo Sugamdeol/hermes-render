@@ -61,22 +61,6 @@ RENDER_SKILL_DIRS = (
 )
 RENDER_MCP_URL = "https://mcp.render.com/mcp"
 RENDER_MCP_AUTH = "Bearer ${RENDER_MCP_API_KEY}"
-# Seconds the MCP client waits for the initial connection. Upstream's default
-# is 60 (_DEFAULT_CONNECT_TIMEOUT in tools/mcp_tool.py), and
-# tui_gateway/entry.py calls discover_mcp_tools() SYNCHRONOUSLY before it
-# emits `gateway.ready` -- the event the browser Chat tab waits on. So an
-# unreachable or slow mcp.render.com at boot leaves the dashboard's chat
-# unusable for the whole timeout.
-#
-# Measured against a non-routable address: discover_mcp_tools() blocked
-# 60.05 s at the default and 5.03 s with a 5 s bound, returning [] either way.
-# 10 s is generous for a healthy TLS + MCP initialize (a TLS round trip to
-# GitHub measured 0.55-0.61 s wall on this 0.1 CPU budget) while capping the
-# worst case at a sixth of upstream's. This bounds how long boot waits; it
-# does not disable the server -- the tools still register once it answers,
-# and discover_mcp_tools() retries the missing servers on its next call.
-RENDER_MCP_CONNECT_TIMEOUT_ENV = "HERMES_RENDER_MCP_CONNECT_TIMEOUT"
-RENDER_MCP_CONNECT_TIMEOUT_DEFAULT = 10.0
 BYNARA_BASE_URL = "https://router.bynara.id/v1"
 BYNARA_API_KEY_ENV = "BYNARA_API_KEY"
 BYNARA_DEFAULT_MODEL = "qwen-3.8-max-free"
@@ -103,37 +87,10 @@ def load_config(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _mcp_connect_timeout() -> float:
-    """Read the MCP connect timeout from the environment, falling back safely.
-
-    An unparsable value falls back to the default rather than raising: this
-    runs at boot, and a typo in one environment variable should not stop the
-    container from starting.
-    """
-    raw = os.environ.get(RENDER_MCP_CONNECT_TIMEOUT_ENV)
-    if raw is None or not str(raw).strip():
-        return RENDER_MCP_CONNECT_TIMEOUT_DEFAULT
-    try:
-        value = float(raw)
-    except (TypeError, ValueError):
-        print(
-            f"[render-tools] {RENDER_MCP_CONNECT_TIMEOUT_ENV}={raw!r} is not a "
-            f"number; using {RENDER_MCP_CONNECT_TIMEOUT_DEFAULT}",
-            file=sys.stderr,
-        )
-        return RENDER_MCP_CONNECT_TIMEOUT_DEFAULT
-    # A non-positive timeout would mean "wait forever" to some clients and
-    # "fail immediately" to others; refuse to guess.
-    if value <= 0:
-        return RENDER_MCP_CONNECT_TIMEOUT_DEFAULT
-    return value
-
-
 def _render_entry() -> dict:
     return {
         "url": RENDER_MCP_URL,
         "headers": {"Authorization": RENDER_MCP_AUTH},
-        "connect_timeout": _mcp_connect_timeout(),
     }
 
 

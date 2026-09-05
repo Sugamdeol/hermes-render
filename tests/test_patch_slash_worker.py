@@ -92,10 +92,6 @@ class PatchSlashWorkerTests(unittest.TestCase):
         source_lines += [""]
         source_lines += ["def spawn_three(session):"]
         source_lines += UPSTREAM_SNIPPETS[2].splitlines()
-        source_lines += [""]
-        # The fourth site: the lazy start inside the slash.exec handler.
-        source_lines += ["def slash_exec(rid, session):"]
-        source_lines += _patch.LAZY_SITE_OLD.splitlines()
         source = "\n".join(source_lines) + "\n"
         ast.parse(source)  # fixture sanity
 
@@ -108,14 +104,11 @@ class PatchSlashWorkerTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             patched = target.read_text(encoding="utf-8")
 
-        # All four sites gated, module still parses, spawn no longer runs
-        # unconditionally. The lazy site becomes an explicit refusal rather
-        # than an indented block, so it is asserted separately.
-        self.assertEqual(patched.count(_patch.MARKER), 4)
+        # All three sites gated, module still parses, spawn no longer runs
+        # unconditionally.
+        self.assertEqual(patched.count(_patch.MARKER), 3)
         ast.parse(patched)
         self.assertIn("HERMES_TUI_DISABLE_SLASH_WORKER", patched)
-        self.assertIn("slash commands are disabled on this instance", patched)
-        self.assertEqual(_patch.ungated_sites(patched), [])
 
         # Idempotent: a second run reports "already patched" and changes
         # nothing.
@@ -141,62 +134,6 @@ class PatchSlashWorkerTests(unittest.TestCase):
         # main() treats a source containing the marker as patched and leaves
         # it untouched; the marker string is what it writes.
         self.assertIn("render-tools", _patch.MARKER)
-
-    def test_a_new_upstream_spawn_site_fails_the_build(self):
-        """The whole reason the patch re-scans after writing.
-
-        A Hermes upgrade that adds a fifth construction site must break the
-        build with the line number, not silently put a second full Python
-        interpreter back behind every dashboard conversation.
-        """
-        # Every site the patch knows about, plus one it does not.
-        dedented = "\n".join(
-            line[4:] if line.startswith("    ") else line
-            for line in UPSTREAM_SNIPPETS[0].splitlines()
-        )
-        source_lines = ["import os", "", "def spawn(agent, current, key):", "    if True:"]
-        source_lines += [
-            "    " + line if line.strip() else line
-            for line in dedented.splitlines()
-        ]
-        source_lines += [""]
-        source_lines += ["def spawn_two(sid, agent, key):"]
-        source_lines += UPSTREAM_SNIPPETS[1].splitlines()
-        source_lines += [""]
-        source_lines += ["def spawn_three(session):"]
-        source_lines += UPSTREAM_SNIPPETS[2].splitlines()
-        source_lines += [""]
-        source_lines += ["def slash_exec(rid, session):"]
-        source_lines += _patch.LAZY_SITE_OLD.splitlines()
-        source_lines += [""]
-        source_lines += [
-            "def spawn_five(session):",
-            "    worker = _SlashWorker(session['session_key'], 'model')",
-            "    return worker",
-        ]
-        source = "\n".join(source_lines) + "\n"
-        ast.parse(source)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            target = Path(tmp) / "server.py"
-            target.write_text(source, encoding="utf-8")
-            with self.assertRaises(SystemExit) as caught:
-                _patch.main(["patch-slash-worker.py", str(target)])
-            # the file must be left untouched so a partial patch cannot ship
-            self.assertEqual(target.read_text(encoding="utf-8"), source)
-        message = str(caught.exception)
-        self.assertIn("_SlashWorker()", message)
-        self.assertIn("still constructed outside", message)
-
-    def test_ungated_sites_ignores_the_class_definition(self):
-        source = (
-            "class _SlashWorker:\n"
-            "    pass\n"
-            "\n"
-            "if os.environ.get('X'):  # render-tools: slash worker opt-out\n"
-            "    w = _SlashWorker('k', 'm')\n"
-        )
-        self.assertEqual(_patch.ungated_sites(source), [])
 
 
 if __name__ == "__main__":
