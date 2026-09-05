@@ -36,12 +36,7 @@ services:
     # no `dockerCommand` override is needed here.
     dockerfilePath: ./Dockerfile
     autoDeployTrigger: off
-    # NOT /api/status. That endpoint re-parses config.yaml, loads the gateway
-    # config and opens SQLite to count recent sessions -- measured at
-    # 180-700 ms per call on a 0.1 CPU container, on a path the platform polls
-    # on its own cadence. The plugin's /health answers the only question a
-    # health check asks ("is the process alive") without touching any of it.
-    healthCheckPath: /api/plugins/hermes-chat-dashboard/health
+    healthCheckPath: /api/status
 
     envVars:
       # Free instances lose /opt/data when they spin down or redeploy. Keep
@@ -97,38 +92,14 @@ services:
       # the fingerprint might miss. GIT_STATE_WATCH=0 disables the watcher.
       - key: GIT_STATE_WATCH
         value: "1"
-      # Deliberately slower than the old 5s/10s/20s. Every tick walks the whole
-      # state tree to fingerprint it (measured: ~11 ms per scan on a 600-file
-      # tree, and it grows with the tree), and every push forks git. On 0.1 CPU
-      # that background work competes directly with the chat that is actually
-      # being paid for. 15s/20s/60s still lands a change in GitHub inside about
-      # a minute -- close enough to "immediately" to be a real backup, and a
-      # fifth of the CPU churn.
       - key: GIT_STATE_WATCH_SECONDS
-        value: "15"
+        value: "5"
       - key: GIT_STATE_DEBOUNCE_SECONDS
-        value: "20"
+        value: "10"
       - key: GIT_STATE_MIN_PUSH_INTERVAL_SECONDS
-        value: "60"
-      # The safety net for a change the fingerprint might miss. 15 minutes is
-      # plenty for a net; the change watcher is what normally triggers a push.
+        value: "20"
       - key: GIT_STATE_INTERVAL_SECONDS
-        value: "900"
-      # git mmaps any blob up to core.bigFileThreshold (512 MB by default) in
-      # order to hash and delta-compress it, so one changed file costs resident
-      # memory equal to its own size. Measured on a 146 MB sessions.db:
-      # `git add -A` peaked at 152.0 MB with the default and 9.1 MB with the
-      # threshold at 1 MB, because a "big" blob is streamed and stored
-      # undeltified instead. This single setting is the difference between the
-      # state sync fitting in the leftover budget and it eating a third of the
-      # container by itself.
-      - key: GIT_STATE_BIG_FILE_THRESHOLD_KB
-        value: "1024"
-      # Stand the backup down above this share of the container's memory cap.
-      # A push is the only routine operation that allocates in a hurry, so it
-      # must lose every contest with the conversation in progress. 0 disables.
-      - key: GIT_STATE_MAX_MEMORY_PCT
-        value: "80"
+        value: "300"
       # History is squashed to a single commit after this many state commits,
       # so the repository cannot grow without bound.
       - key: GIT_STATE_MAX_COMMITS
@@ -136,16 +107,8 @@ services:
       # A failed state restore at boot (a transient GitHub blip) is retried
       # this many times while boot time allows, because one failure otherwise
       # disarms state sync until the next restart.
-      # One attempt, not two: everything before the port bind is inside
-      # Render's port-scan window, and a restore allowed to run for
-      # HERMES_RESTORE_TIMEOUT_SECONDS x attempts is a deploy that fails with
-      # "Port scan timeout reached, no open ports detected" -- losing the
-      # restored state AND the deploy. A restore that does not finish is
-      # retried by the next boot.
       - key: HERMES_RESTORE_ATTEMPTS
-        value: "1"
-      - key: HERMES_RESTORE_TIMEOUT_SECONDS
-        value: "90"
+        value: "2"
       # age public key. If set, /opt/data/.env is encrypted to it before being
       # committed. If unset, .env is simply left out of the backup -- it is
       # never committed in the clear.
@@ -159,22 +122,8 @@ services:
       # service at the lower priority so a laptop started with
       # `run-local.sh --takeover` wins, and this one resumes automatically
       # once the laptop stops and flushes its state.
-      # Failover. OFF by default: with one instance there is nothing to fail
-      # over to, and the lease costs real resources -- the daemon has to renew
-      # it by asking GitHub for every lease ref. That used to happen on every
-      # watch tick: a `git ls-remote` (a full TLS handshake, ~190 ms of CPU and
-      # ~25 MB of child RSS, measured) every 5 seconds forever, i.e. close to
-      # 40% of this container's entire 0.1 CPU budget spent on coordination.
-      # The renewal is now on the heartbeat cadence instead of the watch tick,
-      # which is a 24x reduction, but on a single-instance Free service the
-      # honest answer is still that it buys nothing.
-      #
-      # Set to "1" ONLY when a second instance (typically a laptop started with
-      # `run-local.sh --takeover`) shares GIT_STATE_REPO: the highest-priority
-      # instance holding a fresh lease handles chat and the others keep their
-      # dashboard with their chat tokens stripped at boot.
       - key: HERMES_FAILOVER
-        value: "0"
+        value: "1"
       - key: HERMES_INSTANCE_ID
         value: render
       - key: HERMES_INSTANCE_PRIORITY
@@ -193,11 +142,6 @@ services:
         value: "1"
       - key: HERMES_KEEP_ALIVE_SECONDS
         value: "600"
-      # The path the keep-alive loop requests. The cheap plugin /health, for
-      # the same reason the health check uses it: /api/status costs 180-700 ms
-      # of this container's CPU per call and answers nothing the ping needs.
-      - key: HERMES_KEEP_ALIVE_PATH
-        value: /api/plugins/hermes-chat-dashboard/health
 
       # Shutdown flush. When the service stops or redeploys, the container
       # stays up this many seconds after the gateway exits so the sync
@@ -243,18 +187,6 @@ services:
       # whole lifetime; transcripts persist and re-open via session.resume.
       - key: HERMES_TUI_CLOSE_SESSIONS_ON_DISCONNECT
         value: "1"
-      # Hard cap on live in-process chat sessions (the Dockerfile-patched
-      # tui_gateway registry). Nothing upstream bounds the registry, so a
-      # browser tab that vanishes without a clean close leaves its agent
-      # pinned in the dashboard for the life of the container and the growth
-      # is linear in the number of them. Measured over 24 abandoned tabs in a
-      # 512 MB cgroup: 0.20 MB per conversation capped, 0.97 MB uncapped, and
-      # only the capped curve plateaus. Over the cap the oldest sessions are
-      # finalized and dropped -- transcript first, so they re-open via
-      # session.resume -- and a session mid-turn is skipped rather than torn
-      # down. 2 is what one user on 512 MB can actually afford; 0 disables.
-      - key: HERMES_TUI_MAX_SESSIONS
-        value: "2"
 
       # Keep native runtimes from multiplying worker threads or retaining
       # large allocator arenas on the small Free instance.
@@ -262,14 +194,6 @@ services:
         value: --max-old-space-size=96
       - key: MALLOC_ARENA_MAX
         value: "2"
-      # glibc's malloc grows its trim threshold dynamically (up to 32 MB) when
-      # it sees a lot of freeing, which means freed memory is held instead of
-      # returned to the OS -- invisible to Python's gc and fatal in a container
-      # whose ceiling is 512 MB. Pinning the threshold keeps the allocator
-      # handing pages back. Verified as part of the bench run rather than
-      # assumed: see tools/bench.
-      - key: MALLOC_TRIM_THRESHOLD_
-        value: "131072"
       - key: OMP_NUM_THREADS
         value: "1"
       - key: OPENBLAS_NUM_THREADS
@@ -316,42 +240,8 @@ services:
         value: "80"
       - key: HERMES_MEMGUARD_RESUME_SYNC
         value: "62"
-      # Staged degradation. WATCH (>= WARN) only reports. HIGH (>= PAUSE_SYNC)
-      # SIGSTOPs the sync daemon and reaps orphaned slash workers. CRITICAL
-      # (>= this) stops the sync daemon for good and holds its supervisor off,
-      # because a paused daemon still holds its RSS. EMERGENCY
-      # (>= DASHBOARD_PCT) recycles the dashboard -- SIGTERM first so sessions
-      # finalize, then SIGKILL -- and never the gateway, whose oom_score_adj
-      # bootstrap lowers so the kernel does not take it first either. Any
-      # stage set to 0 is off.
-      - key: HERMES_MEMGUARD_CRITICAL
-        value: "87"
       - key: HERMES_MEMGUARD_DASHBOARD_PCT
         value: "92"
-      # Auto-reclaim only engages on a *measured* cap at or below this, so a
-      # big dev box or an uncapped host never has processes killed out from
-      # under it. Kept well above the 512 MB Free cap on purpose: pinned
-      # exactly to the instance size, a cap reading even one megabyte high
-      # would silently drop the guard to telemetry-only forever.
-      - key: HERMES_MEMGUARD_MAX_ACTIVE_MB
-        value: "2048"
-      # Kernel OOM preference, applied at boot and re-applied after any
-      # restart (a new PID carries the kernel's default score). The gateway
-      # is pushed as far from the kill list as the kernel allows and the
-      # dashboard toward it, so pressure costs a dashboard recycle rather
-      # than the conversation in progress.
-      - key: HERMES_OOM_SCORE_GATEWAY
-        value: "-500"
-      - key: HERMES_OOM_SCORE_DASHBOARD
-        value: "250"
-      # Bounded wait for the gateway process to appear at boot so the ranking
-      # above can be applied to it. 0 disables the wait.
-      - key: HERMES_OOM_PROTECT_WAIT_SECONDS
-        value: "60"
-      # A dashboard must have been up at least this long before EMERGENCY
-      # will recycle it, so one still starting is never the thing killed.
-      - key: HERMES_MEMGUARD_DASHBOARD_GRACE
-        value: "5"
       # Git state-sync memory. git eagerly mallocs http.postBuffer on every
       # push and pack-objects defaults to unbounded delta windows with one
       # thread per core; the shipped defaults can spike one push far past
@@ -383,22 +273,6 @@ services:
       # account role behind the key determines what the agent can do.
       - key: RENDER_MCP_API_KEY
         sync: false
-
-      # Seconds the Render MCP client waits for its initial connection.
-      # Upstream's default is 60, and tui_gateway/entry.py calls
-      # discover_mcp_tools() SYNCHRONOUSLY before emitting `gateway.ready` --
-      # the event the browser Chat tab waits on. Measured against an
-      # unreachable server: discover_mcp_tools() blocked 60.05 s at the
-      # default and 5.03 s with a 5 s bound, returning [] either way. So a
-      # slow or unreachable mcp.render.com at boot leaves the dashboard's chat
-      # unusable for the whole timeout. 10 s is generous for a healthy TLS +
-      # MCP initialize (a TLS round trip to GitHub measured 0.55-0.61 s wall
-      # on this 0.1 CPU budget) and caps the worst case at a sixth of
-      # upstream's. This bounds how long boot waits; it does NOT disable the
-      # server -- the tools still register once it answers, and discovery
-      # retries on its next call.
-      - key: HERMES_RENDER_MCP_CONNECT_TIMEOUT
-        value: "10"
 
       # Private age key that decrypts env/secrets.enc.env at boot. Paste the
       # AGE-SECRET-KEY-... line produced by `./run-local.sh secrets init`.

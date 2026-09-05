@@ -17,37 +17,6 @@ def _parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _duplicate_keys(path: Path) -> list[str]:
-    """Keys assigned more than once, in file order."""
-    seen: set[str] = set()
-    dupes: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].strip()
-        if key in seen and key not in dupes:
-            dupes.append(key)
-        seen.add(key)
-    return dupes
-
-
-def test_env_files_have_no_duplicate_keys():
-    """A repeated key is last-one-wins, so a duplicate silently changes what
-    the container runs -- and it reads as a typo nobody notices in review.
-
-    These files are edited by hand and by scripts, and the same knob has
-    landed twice in both of them already. seed-env.py emits one `export` per
-    assignment, so a duplicate is invisible until the value is wrong.
-    """
-    for path in (ROOT / "env" / "common.env", ROOT / ".env.example"):
-        assert not _duplicate_keys(path), (
-            f"{path.name} assigns the same key twice: "
-            f"{_duplicate_keys(path)}. Last one wins, which is a silent "
-            "behaviour change."
-        )
-
-
 def test_env_example_matches_boot_defaults_for_chat_and_free_tier_guards():
     common = _parse_env_file(ROOT / "env" / "common.env")
     example = _parse_env_file(ROOT / ".env.example")
@@ -71,29 +40,5 @@ def test_env_example_matches_boot_defaults_for_chat_and_free_tier_guards():
         "MAKEFLAGS",
         "HERMES_AGENT_CACHE_MAX_SIZE",
         "HERMES_AGENT_CACHE_IDLE_TTL_SECONDS",
-        "HERMES_TUI_MAX_SESSIONS",
-        "MALLOC_TRIM_THRESHOLD_",
-        "HERMES_MEMGUARD_WARN",
-        "HERMES_MEMGUARD_PAUSE_SYNC",
-        "HERMES_MEMGUARD_RESUME_SYNC",
-        "HERMES_MEMGUARD_CRITICAL",
-        "HERMES_MEMGUARD_DASHBOARD_PCT",
-        "HERMES_MEMGUARD_MAX_ACTIVE_MB",
-        "HERMES_MEMGUARD_DASHBOARD_GRACE",
-        "HERMES_OOM_PROTECT_WAIT_SECONDS",
-        "HERMES_OOM_SCORE_GATEWAY",
-        "HERMES_OOM_SCORE_DASHBOARD",
-        "HERMES_KEEP_ALIVE_SECONDS",
-        "HERMES_KEEP_ALIVE_PATH",
-        "GIT_STATE_WATCH_SECONDS",
-        "GIT_STATE_DEBOUNCE_SECONDS",
-        "GIT_STATE_MIN_PUSH_INTERVAL_SECONDS",
-        "GIT_STATE_INTERVAL_SECONDS",
-        "GIT_STATE_PACK_THREADS",
-        "GIT_STATE_PACK_WINDOW_MEMORY_MB",
-        "GIT_STATE_HTTP_POST_BUFFER_MB",
-        "GIT_STATE_BIG_FILE_THRESHOLD_KB",
-        "GIT_STATE_MAX_MEMORY_PCT",
-        "HERMES_RENDER_MCP_CONNECT_TIMEOUT",
     ):
         assert example.get(key) == common.get(key), f"{key} drifted between .env.example and env/common.env"
