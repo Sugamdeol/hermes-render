@@ -709,7 +709,7 @@ cgroup with `memory.max=512MB` and `cpu.max=0.1`, never approaching the cap.
 It is 🟢 rather than unqualified because the Docker image itself was never
 built (Docker Hub is unreachable here, and no `docker` binary or Dockerfile
 linter is installed in this sandbox). The build was verified as far as it can
-be without one — see §5, risk 5.
+be without one — see §5.5.
 
 What is no longer a gap: **the entire degradation ladder has now been observed
 firing end to end** (§10.1), NORMAL → WATCH → HIGH → CRITICAL → EMERGENCY →
@@ -719,4 +719,4 @@ while the gateway's PID and its `oom_adj=-500` were unchanged throughout.
 
 The remaining honest caveats are that the pressure in §10.1 was synthetic, and
 that the MCP truncation has never carried a real multi-megabyte payload from a
-live `mcp.render.com` (§5, risk 7). Neither is a reason to expect a regression.
+live `mcp.render.com` (§5.7). Neither is a reason to expect a regression.
