@@ -105,59 +105,6 @@ class PatchConfigTests(unittest.TestCase):
         self.assertIn("key: BYNARA_API_KEY", service)
         self.assertIn("key: OPENROUTER_API_KEY", service)
         self.assertIn("key: GIT_STATE_REPO", service)
-        # The in-browser Chat tab must be enabled: the hermes-chat-dashboard
-        # plugin drives tui_gateway over /api/ws, which upstream gates behind
-        # HERMES_DASHBOARD_TUI (the Node PTY path it also gates is never used
-        # by the plugin and only spawns on demand).
         self.assertIn("key: HERMES_DASHBOARD_TUI", service)
-        self.assertIn("key: HERMES_DASHBOARD_TUI\n        value: \"1\"", service)
-        # The per-chat second Python interpreter (slash-command worker) stays
-        # off so open conversations cannot accumulate tens of MB each.
-        self.assertIn("key: HERMES_TUI_DISABLE_SLASH_WORKER", service)
+        self.assertIn("value: \"0\"", service)
         self.assertIn("key: HERMES_AGENT_CACHE_MAX_SIZE", service)
-        # Git pushes are memory-capped (post buffer eagerly mallocs; pack
-        # objects defaults to unbounded windows) so a sync cannot OOM the box.
-        self.assertIn("key: GIT_STATE_HTTP_POST_BUFFER_MB", service)
-        self.assertIn("key: GIT_STATE_PACK_WINDOW_MEMORY_MB", service)
-
-
-class ToolsetDedupeTests(unittest.TestCase):
-    def _config(self, enabled):
-        return {"tools": {"enabled_toolsets": list(enabled)}}
-
-    def test_web_removed_when_web_search_also_enabled(self):
-        patch_config = load_patch_config()
-        cfg = self._config(["code", "web", "web-search", "memory"])
-
-        changed = patch_config.dedupe_enabled_toolsets(cfg)
-
-        self.assertEqual(changed, ["tools.enabled_toolsets -= web (shadowed by web-search)"])
-        self.assertEqual(cfg["tools"]["enabled_toolsets"], ["code", "web-search", "memory"])
-
-    def test_web_kept_when_web_search_absent(self):
-        patch_config = load_patch_config()
-        cfg = self._config(["web", "code"])
-
-        changed = patch_config.dedupe_enabled_toolsets(cfg)
-
-        self.assertEqual(changed, [])
-        self.assertEqual(cfg["tools"]["enabled_toolsets"], ["web", "code"])
-
-    def test_noop_without_tools_section(self):
-        patch_config = load_patch_config()
-        self.assertEqual(patch_config.dedupe_enabled_toolsets({}), [])
-        self.assertEqual(patch_config.dedupe_enabled_toolsets({"tools": {}}), [])
-
-    def test_opt_out_env(self):
-        patch_config = load_patch_config()
-        old = os.environ.get("HERMES_DEDUPE_TOOLSETS")
-        try:
-            os.environ["HERMES_DEDUPE_TOOLSETS"] = "0"
-            cfg = self._config(["web", "web-search"])
-            self.assertEqual(patch_config.dedupe_enabled_toolsets(cfg), [])
-            self.assertEqual(cfg["tools"]["enabled_toolsets"], ["web", "web-search"])
-        finally:
-            if old is None:
-                os.environ.pop("HERMES_DEDUPE_TOOLSETS", None)
-            else:
-                os.environ["HERMES_DEDUPE_TOOLSETS"] = old

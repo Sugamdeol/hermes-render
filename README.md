@@ -166,11 +166,11 @@ You need:
 - **An LLM provider API key.** [OpenRouter](https://openrouter.ai/keys) is the easiest because it routes to most providers behind a single key. Direct keys for Anthropic, OpenAI, Google, or Hugging Face also work.
 - **A Render account** with access to the Free web-service instance type. This template uses `plan: free` and has no persistent disk. Free services spin down after inactivity, can be restarted by Render at any time, and lose their local filesystem state when they stop. That is why provider keys belong in Render's Environment tab, not only in the Hermes dashboard.
 
-The upstream Hermes image is resource-intensive. This Free configuration is intended for personal testing and light, text-only use. The Blueprint caps concurrency and cache growth, keeps native worker pools to one thread, and bounds every known spike a push or a chat session can make on the 512 MB instance. Avoid browser automation and parallel subagents, or upgrade the service plan for heavier use. The image build can also take several minutes on a first deploy.
+The upstream Hermes image is resource-intensive. This Free configuration is intended for personal testing and light, text-only use. The Blueprint disables the memory-heavy browser TUI by default, limits concurrency/cache growth, and keeps native worker pools to one thread. Avoid browser automation and parallel subagents; set `HERMES_DASHBOARD_TUI=1` only when you need the dashboard Chat tab and have enough headroom, or upgrade the service plan. The image build can also take several minutes on a first deploy.
 
 On first boot, the patcher adds conservative Free-tier defaults: 30 agent
-turns, one API retry, one delegation worker, an 8-entry cached-agent cap with
-10-minute idle eviction, one session-search worker, earlier context
+turns, one API retry, one delegation worker, a 16-entry cached-agent cap with
+15-minute idle eviction, one session-search worker, earlier context
 compression, shorter browser lifetimes, and smaller tool-output/code-
 execution caps. Edit `config.yaml` from the dashboard or the restored state if
 you deliberately need higher budgets; the profile marker prevents later boots
@@ -252,20 +252,9 @@ The Blueprint generates a `HERMES_GATEWAY_TOKEN` for you. Today, upstream Hermes
 
 ## Chatting with the agent
 
-The dashboard's **Chat** tab is enabled by default. It is served by the bundled `hermes-chat-dashboard` plugin — a ChatGPT-style web workspace that talks to Hermes' `tui_gateway` over a pure-Python WebSocket (`/api/ws`). Upstream gates that WebSocket behind the same `HERMES_DASHBOARD_TUI` flag as its older terminal-PTY fallback, so the Blueprint sets `HERMES_DASHBOARD_TUI=1`; the memory-heavy path people usually mean by "the TUI" — a per-chat Node/esbuild PTY process behind `/api/pty` plus an xterm.js terminal — is never started by the plugin and only spawns if a client actually opens `/api/pty`. Two more guardrails keep chat cheap on 512 MB: the Dockerfile patches `tui_gateway` so `HERMES_TUI_DISABLE_SLASH_WORKER=1` leaves its per-conversation second HermesCLI Python interpreter (the interactive TUI's slash-menu worker, tens of MB of RSS that is never evicted on tab close) unspawned, and the RPC thread pool is pinned to two workers. If you do not want chat at all, set `HERMES_DASHBOARD_TUI=0` in the Environment tab; for the lightest always-on deployment, connect Telegram or another chat platform instead. You do not need Render Shell or SSH (neither is available for Free web services). A Free service only stays awake while it receives traffic, so an outbound-only long-polling or gateway connection may not keep a bot running continuously; use the dashboard to wake it or upgrade for an always-on service.
+The dashboard's **Chat** tab is optional on Free because the full TUI creates a server-side PTY, Node process, and xterm.js session. The Blueprint sets `HERMES_DASHBOARD_TUI=0` to reduce idle RAM and CPU usage. Set it to `1` when you need the browser TUI and accept the additional resource cost. For the lightest deployment, connect Telegram or another chat platform through Render's Environment tab. You do not need Render Shell or SSH (neither is available for Free web services). A Free service only stays awake while it receives traffic, so an outbound-only long-polling or gateway connection may not keep a bot running continuously; use the dashboard to wake it or upgrade for an always-on service.
 
 The in-container `hermes` binary remains available in the image, but running it requires a local terminal or a paid Render service with shell access. The Free service cannot be used for interactive CLI sessions.
-
-### Chat plugin changelog
-
-**1.2.0** — stability + agent-control release.
-
-- *Crash containment:* the whole tab now renders inside an error boundary, so a single malformed payload can never blank the dashboard again — you get a recovery card and the rest of the UI keeps working. All tool/subagent strings are defensively coerced, the WebSocket connect has a hard timeout (a half-open socket can no longer pin the tab in "connecting" forever), a heartbeat (`config.get mtime`, the cheapest session-less read on the pinned gateway) marks dead transports "stale" and force-reconnects, and a failed send now **restores your draft** instead of eating it.
-- *Fixes on the pinned runtime (v2026.5.7):* server-side history search now calls `search_messages` (feature-detected; the previous release called a method that does not exist at this tag, silently returning no hits); transcript paging uses `limit`/`offset` with negative-offset "newest page" support; `respondPrompt` sends the correct parameter per prompt flavour (`clarify.respond → answer`, `sudo.respond → password`, `secret.respond → value`, `approval.respond → choice`) — approvals previously resolved as deny.
-- *Agent control:* steer a running turn from the composer, retry / edit-&-retry (rewind contract) / regenerate / continue, context compaction with a live context meter in the header, `undo turn`, a slash-command bridge over `command.dispatch` (never `slash.exec` — this deployment disables the slash worker), goal-mode pill, and a command palette (⌘K).
-- *Observability:* live subagent trees (per-agent interrupt), delegation status/pause, spawn-tree save/replay, streamed reasoning blocks, tool cards with diffs/todo lists.
-- *Organization:* sidebar folders (drag & drop, rename), tags with filter chips, bulk select actions, share-link manager, branch lineage panel, usage rollups, per-conversation drafts (localStorage), transcript lazy-loading for 1000+ message chats, attachment thumbnails.
-- Bumped from 1.1.0; REST-backed history still works read-only while the gateway restarts, and every new backend route keeps the dashboard session-token check.
 
 ## Run it locally
 
@@ -429,16 +418,6 @@ ones the process environment lacks, so `config.yaml`'s `${RENDER_MCP_API_KEY}`
 substitution resolves from a committed secret too. Only variable *names* are
 logged, never values.
 
-The non-secret knobs in `env/common.env` (`HERMES_DASHBOARD_TUI`, ports, thread
-caps, cache sizes) take a different path on purpose: they are exported for the
-gateway and dashboard but **never written into `$HERMES_HOME/.env`**, and any
-copy of them already in that file is removed at boot. Upstream Hermes loads
-`.env` with `override=True` every time a process starts, so a knob persisted
-there would outrank Render's Environment tab — a `HERMES_DASHBOARD_TUI=0`
-seeded by an older image and carried along in the state backup is exactly how
-the Chat tab stayed switched off after the variable had been set to `1`. For
-knobs the precedence is therefore just: process environment, then the repo.
-
 ### What this does and does not protect
 
 Committing encrypted secrets means the ciphertext is in git history forever. It
@@ -462,102 +441,6 @@ This Blueprint uses Render's **Free** web-service instance. It has no service ch
 | **Subtotal (this template)**    |        | **$0** |
 
 LLM costs are separate and depend entirely on your provider and usage. OpenRouter and Anthropic both report usage in their respective dashboards; Hermes also surfaces per-model usage on its **Analytics** page. Upgrade the Render service if Free's memory limit causes OOMs or if you need persistent local state.
-
-## Keeping the service awake (keep-alive)
-
-A Render Free web service spins down after roughly 15 minutes without
-**inbound** HTTP traffic, and a cold start takes tens of seconds. That is a
-poor fit for a chat agent: Telegram, Discord and Slack messages are
-*outbound* connections from the container, so they do not count as traffic —
-with no help, the service falls asleep in the middle of a conversation and
-the agent stops answering until something happens to wake it again.
-
-The image ships with a keep-alive for exactly this. When Render injects
-`RENDER_EXTERNAL_URL` (it does for every web service), the boot wrapper
-starts a tiny loop that requests the dashboard's own `/api/status` over the
-public URL every `HERMES_KEEP_ALIVE_SECONDS` (600 by default — well inside
-the 15-minute idle window). The request goes through Render's proxy, so it
-counts as traffic and the service stays awake. It runs only where that
-variable exists, so local `run-local.sh` containers are unaffected
-automatically.
-
-| Setting | Default | Effect |
-|---|---|---|
-| `HERMES_KEEP_ALIVE` | `1` | Set to `0` to let the service sleep when idle |
-| `HERMES_KEEP_ALIVE_SECONDS` | `600` | Seconds between keep-alive requests |
-
-The trade-off is instance hours: awake around the clock, one Free service
-uses roughly 720 of the ~750 monthly Free instance hours, which fits, but a
-second always-awake Free service would not. If you would rather let the
-agent sleep between messages — accepting a cold start on the next one — set
-`HERMES_KEEP_ALIVE=0` in Render's **Environment** tab. Sessions and files
-still survive the sleep either way when the git state sync is enabled.
-
-## Troubleshooting: reading the Render logs
-
-The boot wrapper (`scripts/bootstrap.sh`) prefixes its own lines with
-`[render-tools]`; everything else is Hermes itself. The lines you are most
-likely to see and what they mean:
-
-**`Telegram polling conflict … terminated by other getUpdates request`** —
-a *second* process somewhere is polling the same bot token: not two
-containers of this service, but another Hermes instance entirely — most
-commonly a `run-local.sh` container on your own machine that is still
-running, or a second deployment created from an old copy of this repo. Both
-instances fight over Telegram forever (every ~16 s), and both may answer the
-same message. Fix: stop the other instance, or make it join the failover
-lease (`HERMES_FAILOVER=1` on both sides, sharing the same state repo — the
-non-lease holder then strips its platform tokens and stays a dashboard-only
-standby). This service already logs its role at boot
-(`[render-tools] role=active` / `role=standby`).
-
-**`[render-tools] gateway exited (status 137 …)` + `OOM` hint** — the kernel
-OOM-killed the gateway (SIGKILL = 137). The line right below prints
-`MemAvailable` and the top-RSS processes at that moment. On the Free tier
-the usual cause is concurrent chats on one 512 MB box; the cached-agent
-budget (`HERMES_AGENT_CACHE_MAX_SIZE`, lowered to 4 in this repo) and the
-web-chat session cleanup on WebSocket disconnect exist for exactly this.
-Raise both on a paid instance.
-
-**Repeated `[hermes-git-state] restored N file(s)` blocks without a
-`==> Deploying...` line** — the *container* was restarting (a full
-restore → skills-sync → dashboard → gateway boot each time, ~1–2 minutes of
-downtime per cycle; that is what "crashing again and again" looked like in
-the chat tab). The wrapper now restarts a crashed gateway **in place**
-(gateway-only when the dashboard side-process is still alive) and restarts
-a dead dashboard within ~10 s, so a crash costs seconds, not minutes:
-
-| Setting | Default | Effect |
-|---|---|---|
-| `HERMES_ENTRYPOINT_RESTARTS` | `5` | In-place gateway restarts before letting Render do a full container restart (`0` restores the old behavior) |
-| `HERMES_DASHBOARD_RESTARTS` | `10` | Dashboard restart attempts before it is left down (the gateway/Telegram keep working) |
-| `HERMES_HEALTH_INTERVAL_SECONDS` | `10` | How often the dashboard/memory health loop checks |
-| `HERMES_MEMWATCH` | `1` | `0` disables the memory-pressure telemetry |
-| `HERMES_MEMWATCH_MB` | `100` | Floor below which memory lines are logged (throttled to 1 per 2 min) |
-
-**`Tool registration REJECTED: 'web_search' (toolset 'web') would shadow
-existing tool from toolset 'web-search'`** — the config enabled both the
-`web` and `web-search` toolsets. The boot config patcher now removes the
-duplicate automatically (the registry kept `web-search`'s tool either way,
-so nothing changes at runtime); opt out with `HERMES_DEDUPE_TOOLSETS=0`.
-
-**`Cron job 'Autopilot Daemon': skill not found`** — a cron entry in your
-own config references skills (`autopilot`, `terminal`, `file`,
-`delegation`, `web`, `cronjob`) that are not installed in `$HERMES_HOME`.
-Harmless noise, but it retries on every cron tick; remove the job or
-install the skills it names.
-
-**`committing .env in the clear (GIT_STATE_ENV_MODE=plaintext)`** — every
-API key in `.env` is stored unencrypted in the (private) state repo's
-history. Anyone who can read that repo — now or via a future fork/export —
-has those keys. Set `GIT_STATE_ENV_MODE=encrypt` with
-`GIT_STATE_AGE_RECIPIENT` (age is already installed in the image) or
-`omit`, and rotate keys that were committed in the clear.
-
-**`API call failed … Service temporarily overloaded`** — the configured
-model provider (seen with NVIDIA's `nemotron-3-ultra`) was overloaded; the
-agent retries with backoff (`agent.api_max_retries`). Not a crash — but if
-it dominates the log, switch models in the dashboard.
 
 ## Keeping files between restarts
 
@@ -600,32 +483,6 @@ That handoff is guarded: only a branch the daemon has confirmed is empty gets
 seeded, and never one it simply could not reach. If GitHub is unreachable at
 boot, the local tree is not pushed over state this instance never restored
 from — the daemon waits for a boot that restores cleanly.
-
-**Shutdown order, and the flush window.** The mirror works the same way in
-reverse when the service stops. A stop signals the whole process group: the
-gateway exits almost immediately, and without help the container would be torn
-down with it — taking the sync daemon down mid-push and silently dropping
-whatever had changed in the previous few seconds. That is the bug behind
-"the GitHub files are not synced after restart": every restart lost the tail
-of the last session. The boot wrapper now supervises the upstream entrypoint
-instead of replacing itself with it, and after the gateway exits it holds the
-container open for `HERMES_SHUTDOWN_FLUSH_SECONDS` (20 by default — keep it
-below Render's 30s stop grace period) while the daemon lands its final push
-and releases its failover lease. The final push is deliberately not forced:
-when everything is already on the branch it is a no-op, so a quiet restart
-costs a second or two, not a commit.
-
-A failed restore at boot also no longer poisons the whole runtime. Restoring
-is retried while boot time allows (`HERMES_RESTORE_ATTEMPTS`, 2 by default),
-because a single transient GitHub blip at boot used to leave the instance
-running with state sync disarmed until the next restart. The daemon process
-itself is supervised twice over: unexpected errors are caught and logged
-inside the daemon (one bad tick costs a backoff, not the backup), and if the
-daemon *process* ever dies, the boot wrapper restarts it
-(`HERMES_SYNC_DAEMON_RESTARTS` restarts before giving up).
-
-where the branch points before believing the failure — which is what the
-`Everything up-to-date` in that same error message is telling you.
 
 ### Configure the git backup
 
@@ -725,15 +582,6 @@ raise them if you would rather trade freshness for fewer commits. The
 `GIT_STATE_INTERVAL_SECONDS` sync is deliberately still there: a fingerprint
 is metadata-based, so an edit that rewrites a file to the same size within one
 mtime tick can slip past it.
-
-The upload is a real delta, not just a delta commit. The daemon remembers what
-it copied last time (size, mtime and mode per file) and re-copies only what
-changed, so a 30 MB session database that gained one message costs one small
-copy instead of re-reading the whole tree on every push. On a 512 MB Free
-instance that matters beyond bandwidth: re-reading every file per push spikes
-the daemon's memory by the size of the largest file, and when the OOM killer
-comes to reclaim it, it can just as well take the gateway — which is one way
-an agent ends up "stopping mid-session".
 
 #### What gets backed up, and what deliberately does not
 
@@ -845,16 +693,12 @@ Check the **Events** tab for the deploy that failed, then the **Logs** tab aroun
 | `Refusing to start: binding to 0.0.0.0 requires API_SERVER_KEY` | You set `API_SERVER_ENABLED=true` and `API_SERVER_HOST=0.0.0.0` without an `API_SERVER_KEY`. Set the key or flip back to `127.0.0.1`. |
 | Health check fails on `/api/status`                  | `HERMES_DASHBOARD` is unset or the dashboard crashed. Check `[dashboard]` lines for a Python traceback. |
 | `Port scan timeout reached, no open ports detected`  | The container never bound `$PORT` inside Render's scan window, because the boot wrapper was still working when it expired. `[render-tools] state restore finished in Ns (source=...)` in the logs says how long the blocking part took; `HERMES_RESTORE_TIMEOUT_SECONDS` (240) caps it. The GitHub state seed is no longer part of it — a slow first push there used to eat the whole window, so it now runs in the sync daemon after the dashboard is up. |
-| Container OOM-killed                                 | Free has 512 MB and Hermes is a heavy Python image. This template bounds the known spikes: git state pushes run with a 64 MB `http.postBuffer` and capped `pack.windowMemory`/single-threaded pack (`GIT_STATE_HTTP_POST_BUFFER_MB`, `GIT_STATE_PACK_WINDOW_MEMORY_MB`, `GIT_STATE_PACK_THREADS`), the state-sync daemon is OOM-scored so the kernel reclaims it before the gateway, the gateway caches at most 8 session agents (`HERMES_AGENT_CACHE_MAX_SIZE`), and dashboard chat never spawns the slash-command worker subprocess. A proactive memory guard (`memory_guard_loop` in `bootstrap.sh`, on by default via `HERMES_MEMGUARD=1`) also reads the container's real cgroup cap every few seconds and reclaims before the kernel kills the box: telemetry at `HERMES_MEMGUARD_WARN`%, SIGSTOP of the git state-sync daemon at `HERMES_MEMGUARD_PAUSE_SYNC`%, and — as a last resort — dropping the dashboard (which holds the web-chat agents) at `HERMES_MEMGUARD_DASHBOARD_PCT`% so the watchdog restarts it. If light text-only use still OOMs — typically browser/Playwright tasks or parallel subagents — raise those limits back only if you know you need them, or upgrade the service plan. |
-| The agent stops answering mid-session, and the dashboard is slow or 502s until you open it | On Free, the service spun down: chat platforms are outbound-only, so a quiet dashboard lets the ~15-minute idle timer expire even while you are chatting. The bundled keep-alive prevents it (see **Keeping the service awake**); check the boot log for `keep-alive: requesting /api/status`. If it is present but the service still sleeps, make sure `HERMES_KEEP_ALIVE` has not been set to `0`. |
-| The last chat messages or file edits are missing after a restart | The final state push was cut off. Since the fix, the container stays up for `HERMES_SHUTDOWN_FLUSH_SECONDS` (20s) after the gateway exits so the sync daemon can land its last push — if you forked an older version of `bootstrap.sh`, the wrapper must supervise the entrypoint instead of `exec`-ing it. Anything older than that window was already on the branch; check `pushed state:` lines in the logs for the last successful save. |
-| `[render-tools] warning: sync daemon exited (status N); restarting` | The sync daemon process crashed; the wrapper restarted it (up to `HERMES_SYNC_DAEMON_RESTARTS` times). If it repeats, look one line up in the logs for the actual error. |
+| Container OOM-killed                                 | Free has limited memory. Avoid browser/Playwright tasks and parallel subagents; if light text-only use still OOMs, upgrade the service plan. |
 | API keys or sessions disappear                      | Render's **Environment** tab is the durable fallback. If dashboard-managed keys, sessions, logs, and files must survive a cold start/redeploy, configure the git state sync (`GIT_STATE_REPO` + `GIT_STATE_TOKEN`). |
 | `Warning: Input is not a terminal (fd=0)` then `Goodbye!` when running `hermes` | Free services have no shell/SSH. Chat from the dashboard's **Chat** tab or a configured platform; run the CLI locally instead. |
 | `Goodbye! ⚕` in the deploy logs followed by 502s on the URL | The Dockerfile's `ENTRYPOINT` got bypassed somehow (forked the template and overrode it, or set a `dockerCommand` in `render.yaml` without the full upstream chain). The default `ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/render-tools/bootstrap.sh"]` + `CMD ["gateway", "run"]` must stay intact. |
 | `Refusing to run the Hermes gateway as root` | Same root cause as above. Restore the Dockerfile's `ENTRYPOINT`/`CMD` so the upstream `entrypoint.sh` can do its `gosu` drop. |
-| **Chat** tab missing from the sidebar, opening **Chat** from the **Plugins** page lands on **Sessions**, or chat won't connect ("gateway WebSocket failed" / 4403) | The bundled `hermes-chat-dashboard` plugin serves the Chat tab (it overrides `/chat`) and talks to `/api/ws`. Upstream only mounts a `/chat` route — built-in or plugin override — and only answers that WebSocket when the dashboard process started with `HERMES_DASHBOARD_TUI=1`; otherwise the Plugins page still lists Chat with an "Open tab" link, but `/chat` has no route and the dashboard's catch-all redirects it to **Sessions**. The plugin now shows an orange banner on the Sessions/Plugins pages when it detects this state. Two causes: (1) the variable is `0` or unset in Render's Environment tab — set it to `1` and restart; (2) **a stale `HERMES_DASHBOARD_TUI=0` in `/opt/data/.env`** — upstream loads that file with `override=True` at every start, so it silently beats the Environment tab. Images built from this repo before the fix seeded that file with the old `common.env` defaults, and the git state backup restored it on every boot. Current images remove deploy knobs from `.env` at boot (look for `removed N deploy knob(s) from /opt/data/.env` in the logs), so **redeploy on the latest image** and the setting from the Environment tab wins again. The plugin itself must also be present in `$HERMES_HOME/plugins/hermes-chat-dashboard/` — bootstrap installs it from the image on every boot. If you disabled `HERMES_DASHBOARD`, the tab cannot exist. |
-| Dashboard **Chat** terminal (xterm PTY) shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | Only relevant to the old in-terminal chat (`/api/pty`), which the bundled plugin does not use. Two upstream bugs combined to break it on hosted deploys: (1) [#20500](https://github.com/NousResearch/hermes-agent/issues/20500): `/opt/hermes/ui-tui/` ships root-owned but the dashboard runs as the `hermes` user, so the runtime esbuild rebuild fails with `EACCES`. (2) Separate filename mismatch: `_hermes_ink_bundle_stale()` in `hermes_cli/main.py` looks for `packages/hermes-ink/dist/ink-bundle.js`, but `@hermes/ink`'s build script (`esbuild src/entry-exports.ts --outdir=dist`) only produces `entry-exports.js`. The bundle the staleness check expects is never created, so every `/api/pty` connect runs a 28-second `npm run build` that exceeds Render's WebSocket-upgrade timeout. The Dockerfile chowns the directories AND `touch`es the two expected paths at build time so both checks short-circuit. If you've forked the template and removed those lines, restore them. |
+| Dashboard **Chat** tab shows "Chat unavailable: 1" or hangs / 500s on `/api/pty` | Two upstream bugs combined to break the Chat tab on hosted deploys: (1) [#20500](https://github.com/NousResearch/hermes-agent/issues/20500): `/opt/hermes/ui-tui/` ships root-owned but the dashboard runs as the `hermes` user, so the runtime esbuild rebuild fails with `EACCES`. (2) Separate filename mismatch: `_hermes_ink_bundle_stale()` in `hermes_cli/main.py` looks for `packages/hermes-ink/dist/ink-bundle.js`, but `@hermes/ink`'s build script (`esbuild src/entry-exports.ts --outdir=dist`) only produces `entry-exports.js`. The bundle the staleness check expects is never created, so every `/api/pty` connect runs a 28-second `npm run build` that exceeds Render's WebSocket-upgrade timeout. The Dockerfile chowns the directories AND `touch`es the two expected paths at build time so both checks short-circuit. If you've forked the template and removed those lines, restore them. |
 | `mcp_render_*` tools missing from Hermes' tool list | The gateway started without `RENDER_MCP_API_KEY`. Add it under the service's **Environment** tab and click **Restart gateway** from the dashboard's Status tab. |
 | Agent says it tried to run `render <something>` and got `command not found` | Working as designed — the Render CLI is not installed in this image (see **Security: agent capabilities**). Most CLI capabilities have an MCP equivalent the agent should use instead; the rest (live log streaming, `render psql`, SSH) the user runs from their own machine. |
 | `[render-tools] config patch failed; continuing` in the boot logs | Non-fatal. The agent still runs; you just won't see the Render MCP server until you fix it. Usually means `/opt/data/config.yaml` isn't valid YAML — fix it from the dashboard or wipe it (see "Forcing a clean rebuild"). |
