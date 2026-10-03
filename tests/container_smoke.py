@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import os
 import re
 import subprocess
 import time
@@ -9,7 +10,9 @@ import urllib.error
 import urllib.request
 
 AUTH = "Basic " + base64.b64encode(b"hermes:ci-only-password").decode()
-BASE = "http://127.0.0.1:10000"
+PORT = os.environ.get("SMOKE_PORT", "10000")
+CONTAINER = os.environ.get("SMOKE_CONTAINER", "hermes-lite")
+BASE = "http://127.0.0.1:" + PORT
 
 def call(path, data=None, method=None, token=None, authenticated=True):
     headers = {"Content-Type": "application/json"}
@@ -46,7 +49,7 @@ assert json.loads(call("/api/env", {"key": "CI_SAVED_ENV", "value": "ci-value"},
 
 async def check_native_chat():
     import websockets
-    async with websockets.connect("ws://127.0.0.1:10000/api/pty?token=" + token, additional_headers={"Authorization": AUTH}, open_timeout=30) as ws:
+    async with websockets.connect("ws://127.0.0.1:" + PORT + "/api/pty?token=" + token, additional_headers={"Authorization": AUTH}, open_timeout=30) as ws:
         seen = b""
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -58,15 +61,15 @@ async def check_native_chat():
         assert b"Chat unavailable" not in seen and b"Chat failed" not in seen
         # Opening a second native chat must not launch another Node/Python pair.
         try:
-            async with websockets.connect("ws://127.0.0.1:10000/api/pty?token=" + token, additional_headers={"Authorization": AUTH}):
+            async with websockets.connect("ws://127.0.0.1:" + PORT + "/api/pty?token=" + token, additional_headers={"Authorization": AUTH}):
                 raise AssertionError("second chat was accepted")
         except websockets.exceptions.InvalidStatus as error:
             assert error.response.status_code == 403
         await asyncio.sleep(15)
-        peak = subprocess.check_output(["docker", "exec", "hermes-lite", "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
+        peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
 
 asyncio.run(check_native_chat())
-state = json.loads(subprocess.check_output(["docker", "inspect", "hermes-lite", "--format", "{{json .State}}"] ))
+state = json.loads(subprocess.check_output(["docker", "inspect", CONTAINER, "--format", "{{json .State}}"] ))
 assert state["Running"] and not state["OOMKilled"]
-print("Native dashboard auth, custom provider CRUD, env save, browser chat and 512 MB boot passed.")
+print("Native dashboard auth, custom provider CRUD, env save, browser chat and container memory-limit boot passed.")
