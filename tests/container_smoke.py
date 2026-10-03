@@ -38,10 +38,10 @@ except urllib.error.HTTPError as error:
 html = call("/")
 token = re.search(r'__HERMES_SESSION_TOKEN__="([^"]+)"', html).group(1)
 endpoint = "/api/plugins/render-api-providers/custom-providers"
-result = json.loads(call(endpoint, {"name": "CI custom", "base_url": "https://example.invalid/v1", "api_key": "ci-provider-secret", "api_mode": "openai", "model": "ci-model"}, token=token))
+result = json.loads(call(endpoint, {"name": "ci-custom", "base_url": "https://example.invalid/v1", "api_key": "ci-provider-secret", "api_mode": "chat_completions", "model": "ci-model"}, token=token))
 assert result["ok"]
 providers = call(endpoint, token=token)
-assert "CI custom" in providers and "ci-provider-secret" not in providers
+assert "ci-custom" in providers and "ci-provider-secret" not in providers
 assert json.loads(call("/api/env", {"key": "CI_SAVED_ENV", "value": "ci-value"}, method="PUT", token=token))["ok"]
 
 async def check_native_chat():
