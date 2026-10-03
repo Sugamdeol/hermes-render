@@ -102,9 +102,10 @@ class PatchConfigTests(unittest.TestCase):
         self.assertRegex(service, r"(?m)^    plan: free$")
         self.assertNotRegex(service, r"(?m)^    disk:")
         self.assertIn("key: HERMES_HOME", service)
-        self.assertIn("key: BYNARA_API_KEY", service)
-        self.assertIn("key: OPENROUTER_API_KEY", service)
+        self.assertIn("key: STORAGE_ENCRYPTION_KEY", service)
+        self.assertIn("key: HERMES_GATEWAY_TOKEN", service)
         self.assertIn("key: GIT_STATE_REPO", service)
         self.assertIn("key: HERMES_DASHBOARD_TUI", service)
         self.assertIn("value: \"0\"", service)
         self.assertIn("key: HERMES_AGENT_CACHE_MAX_SIZE", service)
+

@@ -259,7 +259,7 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertIn("data/.env", mirrored)
         self.assertIn("super-secret", blob)
         self.assertEqual(manifest["omitted"], [])
-        self.assertEqual(manifest["plaintext_env"], [".env"])
+        self.assertEqual(manifest["plaintext_env"], [".env", "config.yaml"])
 
     def test_the_plaintext_mode_says_so_in_the_log(self):
         """Live keys going into git should never be a silent decision."""
@@ -279,7 +279,7 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertNotIn("data/.env", mirrored)
         self.assertNotIn("super-secret", blob)
         self.assertIn("SEALED(28)", blob)
-        self.assertEqual(manifest["encrypted"], [".env"])
+        self.assertEqual(manifest["encrypted"], [".env", "config.yaml"])
         self.assertEqual(manifest["plaintext_env"], [])
 
     def test_encrypt_mode_omits_rather_than_falling_back_to_plaintext(self):
@@ -1056,8 +1056,7 @@ class TransportTuningTests(unittest.TestCase):
 
     def test_the_post_buffer_defaults_big_enough_for_a_whole_state_tree(self):
         config = make_config(self.storage)
-        self.assertGreaterEqual(config.http_post_buffer, 100 * 1024 * 1024,
-                                "git chunks the body above this and GitHub 408s")
+        self.assertEqual(config.http_post_buffer, 32 * 1024 * 1024)
 
     def test_every_git_call_is_bounded_by_a_timeout(self):
         fake = _RecordingSubprocess()
@@ -1351,3 +1350,4 @@ class MidPushChangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

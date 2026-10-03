@@ -24,6 +24,16 @@ DATA_DIR="${HERMES_HOME:-/opt/data}"
 PATCHER="/opt/render-tools/patch-config.py"
 GIT_SYNC="/opt/render-tools/git-storage.py"
 
+# Bind Render's public port immediately. Health remains unavailable until the
+# private state has restored and the native dashboard is ready.
+python /opt/render-tools/start-proxy.py
+if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
+  TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
+  TELEGRAM_WEBHOOK_PORT=8443
+  TELEGRAM_WEBHOOK_SECRET="$(python -c 'import hashlib,os; print(hashlib.sha256(os.environ["HERMES_GATEWAY_TOKEN"].encode()).hexdigest())')"
+  export TELEGRAM_WEBHOOK_URL TELEGRAM_WEBHOOK_PORT TELEGRAM_WEBHOOK_SECRET
+fi
+
 # Which backend keeps the durable copy of ${DATA_DIR}?
 #
 #   git - a private GitHub repo, configured with GIT_STATE_REPO and a token.
@@ -116,7 +126,8 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
           echo "[render-tools] warning: state restore ran past ${RESTORE_TIMEOUT}s and was stopped," >&2
           echo "[render-tools] warning: so the port binds in time. Raise HERMES_RESTORE_TIMEOUT_SECONDS if this repeats." >&2
         fi
-        echo "[render-tools] warning: github state restore failed; continuing without restored state" >&2
+        echo "[render-tools] private state restore failed; refusing to start with an empty state" >&2
+        exit 1
       fi
       ;;
     empty)
@@ -125,7 +136,8 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
     *)
       # Either the repo is unreachable, or the helper itself could not run.
       # Neither is proof that the branch is empty, so it is not seeded.
-      echo "[render-tools] warning: could not read the github state repo; treating it as unavailable" >&2
+      echo "[render-tools] cannot read private state; refusing to start or overwrite the backup" >&2
+      exit 1
       ;;
   esac
 fi
@@ -246,7 +258,7 @@ fi
 # Apply the resource profile once per data tree. The marker is restored along
 # with the rest of /opt/data from the state repo, so later dashboard edits are
 # not repeatedly overwritten.
-RESOURCE_MARKER="${DATA_DIR}/.render-tools-free-profile-v1"
+RESOURCE_MARKER="${DATA_DIR}/.render-tools-lite-profile-v2"
 APPLY_FREE_DEFAULTS=0
 if [ ! -f "${RESOURCE_MARKER}" ]; then
   APPLY_FREE_DEFAULTS=1
@@ -352,4 +364,7 @@ fi
 
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
+if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  gosu hermes /opt/hermes/.venv/bin/hermes gateway run &
+fi
 exec /opt/hermes/docker/entrypoint.sh "$@"

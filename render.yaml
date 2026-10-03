@@ -1,193 +1,53 @@
-# yaml-language-server: $schema=https://render.com/schema/render.yaml.json
-#
-# Hermes Agent on Render, pre-baked with Render tools.
-# https://github.com/NousResearch/hermes-agent
-#
-# Single web service built from the local Dockerfile, which extends the
-# upstream Hermes image with:
-#   - The official render-oss/skills bundle, pinned at a commit
-#   - The Render MCP server pre-registered in config.yaml at boot
-#     with the full MCP tool catalog available to the provided API key
-#   - A dashboard plugin ("Custom API providers" card on the Models page)
-#     for adding new API providers from the web UI instead of editing
-#     config.yaml by hand
-#
-# Inside the container the gateway runs in the foreground and the
-# dashboard runs as a background side-process (HERMES_DASHBOARD=1).
-# Render's public URL serves the dashboard on port 10000. This Blueprint
-# deliberately uses the Free instance type, so /opt/data is ephemeral;
-# provider keys must be supplied as Render environment variables.
-#
-# To upgrade Hermes: bump HERMES_IMAGE in the Dockerfile and redeploy.
-# To upgrade Render skills: bump RENDER_SKILLS_REF and redeploy.
-
+# Native Hermes dashboard + Telegram, designed for Render Free (512 MB).
 services:
   - type: web
     name: hermes
     runtime: docker
     region: oregon
-    # Free web services have an ephemeral filesystem and spin down after
-    # inactivity, but are enough for a personal/demo Hermes deployment.
-    # Do not add a disk here: Render does not allow persistent disks on Free.
     plan: free
-    # Render builds the image from this repo's Dockerfile on every deploy.
-    # The Dockerfile FROMs the pinned upstream Hermes image, adds Render
-    # tooling + the skill bundle, and sets ENTRYPOINT to our bootstrap wrapper — so
-    # no `dockerCommand` override is needed here.
     dockerfilePath: ./Dockerfile
     autoDeployTrigger: off
-    healthCheckPath: /api/status
-
+    healthCheckPath: /healthz
     envVars:
-      # Free instances lose /opt/data when they spin down or redeploy. Keep
-      # secrets in Render environment variables as the durable fallback. When
-      # git state sync is enabled, dashboard-managed .env settings are restored
-      # too, but the private state repo must then be treated as sensitive.
+      - key: GIT_STATE_REPO
+        value: Sugamdeol/hermes-storage
+      - key: GIT_STATE_BRANCH
+        value: state
+      - key: GIT_STATE_TOKEN
+        sync: false
+      - key: STORAGE_ENCRYPTION_KEY
+        generateValue: true
+      - key: HERMES_GATEWAY_TOKEN
+        generateValue: true
+      - key: GIT_STATE_ENV_MODE
+        value: encrypt
+      - key: GIT_STATE_HTTP_POST_BUFFER_MB
+        value: "32"
+      - key: GIT_STATE_WATCH_SECONDS
+        value: "10"
+      - key: GIT_STATE_DEBOUNCE_SECONDS
+        value: "10"
+      - key: GIT_STATE_MIN_PUSH_INTERVAL_SECONDS
+        value: "30"
+      - key: GIT_STATE_MAX_COMMITS
+        value: "200"
+      - key: HERMES_FAILOVER
+        value: "0"
       - key: HERMES_HOME
         value: /opt/data
       - key: PORT
         value: "10000"
-
-      # Bynara's OpenAI-compatible free router. When this key is present,
-      # the boot patcher adds custom:bynara and selects qwen-3.8-max-free
-      # unless an explicit model/provider is already configured.
-      - key: BYNARA_API_KEY
-        sync: false
-      - key: TELEGRAM_BOT_TOKEN
-        sync: false
-      - key: TELEGRAM_ALLOWED_USERS
-        sync: false
-
-      # OpenRouter is an alternative provider. Leave this blank if you use
-      # Bynara or another provider and add that provider's key in the Render
-      # Environment tab instead. sync: false keeps the value out of the
-      # Blueprint repository and prompts for it during deploy.
-      - key: OPENROUTER_API_KEY
-        sync: false
-
-      # State backup: a private GitHub repository. Each save pushes only the
-      # bytes that changed (typically a few KB) instead of a whole archive,
-      # which is what keeps this inside a small monthly transfer allowance.
-      # Leave GIT_STATE_REPO blank to run with disposable local state.
-      #
-      # On a first launch the state branch is empty, so this instance's tree
-      # is seeded to it after the gateway is up; from then on this repo is the
-      # source of truth and every boot restores from it.
-      #
-      # GIT_STATE_TOKEN wants a fine-grained personal access token scoped to
-      # that one repository with Contents: read and write. The backend refuses
-      # to push unless the GitHub API confirms the repo is private, because
-      # /opt/data holds .env, chat history and memories.
-      - key: GIT_STATE_REPO
-        sync: false
-      - key: GIT_STATE_TOKEN
-        sync: false
-      - key: GIT_STATE_BRANCH
-        value: state
-      # Saves are change-driven: the tree is fingerprinted every
-      # GIT_STATE_WATCH_SECONDS and pushed once it has been quiet for
-      # GIT_STATE_DEBOUNCE_SECONDS, so a change reaches GitHub within seconds.
-      # GIT_STATE_MIN_PUSH_INTERVAL_SECONDS is the hard floor between two
-      # pushes; GIT_STATE_INTERVAL_SECONDS is only the safety net for a change
-      # the fingerprint might miss. GIT_STATE_WATCH=0 disables the watcher.
-      - key: GIT_STATE_WATCH
-        value: "1"
-      - key: GIT_STATE_WATCH_SECONDS
-        value: "5"
-      - key: GIT_STATE_DEBOUNCE_SECONDS
-        value: "10"
-      - key: GIT_STATE_MIN_PUSH_INTERVAL_SECONDS
-        value: "20"
-      - key: GIT_STATE_INTERVAL_SECONDS
-        value: "300"
-      # History is squashed to a single commit after this many state commits,
-      # so the repository cannot grow without bound.
-      - key: GIT_STATE_MAX_COMMITS
-        value: "200"
-      # age public key. If set, /opt/data/.env is encrypted to it before being
-      # committed. If unset, .env is simply left out of the backup -- it is
-      # never committed in the clear.
-      - key: GIT_STATE_AGE_RECIPIENT
-        sync: false
-
-      # Failover. With HERMES_FAILOVER=1 and a shared state backend (the git
-      # repo when configured), the highest-priority instance holding a fresh
-      # lease handles chat; the others keep their dashboard but have their
-      # chat tokens stripped at boot and never upload state. Leave this
-      # service at the lower priority so a laptop started with
-      # `run-local.sh --takeover` wins, and this one resumes automatically
-      # once the laptop stops and flushes its state.
-      - key: HERMES_FAILOVER
-        value: "1"
-      - key: HERMES_INSTANCE_ID
-        value: render
-      - key: HERMES_INSTANCE_PRIORITY
-        value: "50"
-
-      # Dashboard side-process. The entrypoint backgrounds `hermes dashboard`
-      # before exec'ing `gateway run` whenever HERMES_DASHBOARD is truthy.
-      # HERMES_DASHBOARD_HOST=0.0.0.0 makes the entrypoint pass --insecure
-      # so the dashboard accepts non-loopback binds.
-      - key: HERMES_DASHBOARD
-        value: "1"
       - key: HERMES_DASHBOARD_HOST
-        value: "0.0.0.0"
+        value: 127.0.0.1
       - key: HERMES_DASHBOARD_PORT
-        value: "10000"
-      # The full browser TUI starts a Node/esbuild PTY per chat and is
-      # expensive on Free. Keep it off by default; use Telegram or another
-      # configured channel for chat. Set to "1" only when the dashboard Chat
-      # tab is needed and the instance has enough headroom.
+        value: "9119"
       - key: HERMES_DASHBOARD_TUI
-        value: "0"
-
-      # Keep native runtimes from multiplying worker threads or retaining
-      # large allocator arenas on the small Free instance.
+        value: "1"
+      - key: HERMES_AGENT_CACHE_MAX_SIZE
+        value: "2"
+      - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
+        value: "120"
       - key: NODE_OPTIONS
-        value: --max-old-space-size=128
+        value: --max-old-space-size=64
       - key: MALLOC_ARENA_MAX
         value: "2"
-      - key: OMP_NUM_THREADS
-        value: "1"
-      - key: OPENBLAS_NUM_THREADS
-        value: "1"
-      - key: MKL_NUM_THREADS
-        value: "1"
-      - key: TOKENIZERS_PARALLELISM
-        value: "false"
-      # Bound the pinned gateway's cached per-session agent objects. These
-      # values are read by the small Dockerfile source patch at process import.
-      - key: HERMES_AGENT_CACHE_MAX_SIZE
-        value: "16"
-      - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
-        value: "900"
-
-      # Generated once at first deploy. Reuse this value as API_SERVER_KEY
-      # in the Render Environment tab if you later opt into the
-      # OpenAI-compatible API server (API_SERVER_ENABLED=true).
-      - key: HERMES_GATEWAY_TOKEN
-        generateValue: true
-
-      # Bearer token for the pre-registered Render MCP server. Generate
-      # at https://dashboard.render.com/u/*/settings#api-keys and paste
-      # into the dashboard's Environment tab. The boot-time patcher
-      # reads ${RENDER_MCP_API_KEY} into config.yaml lazily, so you can
-      # rotate by editing the env var and restarting — no rebuild needed.
-      #
-      # Named `RENDER_MCP_API_KEY` rather than the stock `RENDER_API_KEY`
-      # to avoid accidental auto-auth if someone later installs the
-      # `render` CLI. This is the same kind of Render API key; the Render
-      # account role behind the key determines what the agent can do.
-      - key: RENDER_MCP_API_KEY
-        sync: false
-
-      # Private age key that decrypts env/secrets.enc.env at boot. Paste the
-      # AGE-SECRET-KEY-... line produced by `./run-local.sh secrets init`.
-      # This single value replaces pasting every API key into this tab: the
-      # rest travel with the repo, encrypted. Leave it blank to ignore the
-      # committed secrets and configure everything from this tab instead.
-      #
-      # A Render Secret File mounted at /etc/secrets/age.key works too, and
-      # bootstrap.sh picks it up automatically.
-      - key: SOPS_AGE_KEY
-        sync: false

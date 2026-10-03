@@ -117,7 +117,7 @@ REMOTE_UNKNOWN = "unknown"
 # disconnect" -- which is exactly what a first state push (the whole restored
 # tree, tens of MB) looks like. A buffer big enough for one request makes git
 # send it with a Content-Length instead, in a single shot.
-DEFAULT_HTTP_POST_BUFFER_BYTES = 250 * 1024 * 1024
+DEFAULT_HTTP_POST_BUFFER_BYTES = 32 * 1024 * 1024
 # A transfer slower than this for this long is stalled, not slow. git gives up
 # and we retry, instead of the process sitting on a dead connection.
 DEFAULT_HTTP_LOW_SPEED_LIMIT = 1000
@@ -132,7 +132,9 @@ DEFAULT_PUSH_RETRY_SECONDS = 5
 # Whether they are committed in the clear is GIT_STATE_ENV_MODE's decision,
 # not a hard-coded one: the operator asked for a complete, restartable copy of
 # the instance, and .env is part of that.
-SENSITIVE_FILES = (".env",)
+SENSITIVE_FILES = (".env", "config.yaml", "auth.json")
+_SEALED_PREFIX = b"HERMES-FERNET-v1\n"
+_SEALED_CACHE = {}
 
 # How a sensitive file reaches the branch.
 #   plaintext - committed as-is (default). The branch can restore the
@@ -416,6 +418,8 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "user.email=hermes-state@localhost",
         "-c", "core.autocrlf=false",
         "-c", "gc.auto=0",
+        "-c", "pack.threads=1",
+        "-c", "pack.windowMemory=16m",
         # Transport tuning for the large pushes this backend makes. See
         # DEFAULT_HTTP_POST_BUFFER_BYTES: without it git chunks the request
         # body and GitHub's front end answers "RPC failed; HTTP 408".
@@ -944,6 +948,18 @@ def plan_mirror(data_dir: Path, excludes) -> "list[str]":
 
 def age_encrypt(plaintext: bytes, config: GitConfig) -> "bytes | None":
     """Encrypt with `age` if a recipient is configured, else None."""
+    key = os.environ.get("STORAGE_ENCRYPTION_KEY")
+    if key:
+        import base64
+        import hashlib
+        from cryptography.fernet import Fernet
+        cipher_key = base64.urlsafe_b64encode(hashlib.sha256(key.encode()).digest())
+        cache_key = (cipher_key, hashlib.sha256(plaintext).digest())
+        if cache_key not in _SEALED_CACHE:
+            if len(_SEALED_CACHE) >= 8:
+                _SEALED_CACHE.clear()
+            _SEALED_CACHE[cache_key] = _SEALED_PREFIX + Fernet(cipher_key).encrypt(plaintext)
+        return _SEALED_CACHE[cache_key]
     if not config.age_recipient:
         return None
     binary = shutil.which("age") or shutil.which("rage")
@@ -964,6 +980,18 @@ def age_encrypt(plaintext: bytes, config: GitConfig) -> "bytes | None":
 
 
 def age_decrypt(ciphertext: bytes, config: GitConfig) -> "bytes | None":
+    if ciphertext.startswith(_SEALED_PREFIX):
+        import base64
+        import hashlib
+        from cryptography.fernet import Fernet, InvalidToken
+        key = os.environ.get("STORAGE_ENCRYPTION_KEY")
+        if not key:
+            raise RuntimeError("STORAGE_ENCRYPTION_KEY is required to restore encrypted settings")
+        try:
+            cipher_key = base64.urlsafe_b64encode(hashlib.sha256(key.encode()).digest())
+            return Fernet(cipher_key).decrypt(ciphertext[len(_SEALED_PREFIX):])
+        except InvalidToken as exc:
+            raise RuntimeError("STORAGE_ENCRYPTION_KEY does not match this backup") from exc
     binary = shutil.which("age") or shutil.which("rage")
     if not binary:
         return None

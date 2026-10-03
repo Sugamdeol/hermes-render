@@ -1,0 +1,23 @@
+name: Hermes Render 512 MB
+on: [push, workflow_dispatch]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml cryptography fastapi httpx websockets
+      - run: python -m unittest discover -s tests -q
+      - run: docker build -t hermes-lite .
+      - name: Boot native dashboard under 512 MB without swap
+        run: |
+          docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
+          python tests/container_smoke.py
+      - name: Container diagnostics
+        if: always()
+        run: |
+          docker logs hermes-lite 2>&1 | tail -100 || true
+          docker inspect hermes-lite --format '{{json .State}}' || true
