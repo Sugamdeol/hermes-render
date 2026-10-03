@@ -43,3 +43,22 @@ class EncryptedRestoreTests(unittest.TestCase):
             self.assertEqual((restored / "config.yaml").read_text(), "a-private-value")
             self.assertEqual((restored / "memories/MEMORY.md").read_text(), "remember this")
             self.assertTrue((work / "archives/nanobot.enc").exists())
+
+    def test_workspace_copy_does_not_buffer_files(self):
+        config = storage.GitConfig(repo="owner/repo", token="test", env_mode="omit")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data, work, restored = root / "local", root / "work", root / "restored"
+            for directory in (data, work, restored):
+                directory.mkdir()
+            artifact = data / "artifact.bin"
+            with artifact.open("wb") as handle:
+                handle.write(b"workspace payload")
+                handle.truncate(16 * 1024 * 1024)
+            # Ordinary files must never use whole-file reads in either direction.
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("unbounded file read")):
+                storage.build_worktree(data, work, config)
+                storage.materialize(work, restored, config)
+            self.assertEqual((restored / "artifact.bin").stat().st_size, artifact.stat().st_size)
+            with (restored / "artifact.bin").open("rb") as handle:
+                self.assertEqual(handle.read(17), b"workspace payload")

@@ -97,3 +97,11 @@ docker run --rm -p 10000:10000 --memory=512m --memory-swap=512m \
 
 Provider and Telegram secrets go in the authenticated dashboard or Render
 Environment, never in this public source repository.
+
+### Memory pressure and production limits
+
+The 512 MB CI measurement covers dashboard and native TUI startup; it does not establish a ceiling for Telegram inference, tools, and GitHub sync running together. Production OOM reports showed this distinction matters.
+
+Ordinary backup and restore files now stream to disk instead of loading entire workspace artifacts into RAM. Browser disconnects terminate the PTY process group, including its Node and Python descendants. Cached gateway agents are swept every 30 seconds. Runtime logs report total cgroup usage and process RSS without command arguments or secrets.
+
+To reserve capacity for Telegram and storage, browser chat refuses to start above 320 MiB of container usage and closes above 400 MiB. This can interrupt an active browser chat; saved session history remains available for resuming. It is a pressure safeguard, not a guarantee that every Hermes tool or workload fits 512 MB. Large local models, browser processes and concurrent agent workloads may still exceed the service budget.

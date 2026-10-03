@@ -1070,12 +1070,11 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         source = data_dir / relative
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            payload = source.read_bytes()
-        except OSError:
-            continue
-
         if relative in SENSITIVE_FILES:
+            try:
+                payload = source.read_bytes()
+            except OSError:
+                continue
             payload, disposition = _prepare_sensitive(payload, config)
             if disposition == ENV_MODE_OMIT:
                 # Either the operator asked for omit, or encrypt was asked for
@@ -1104,7 +1103,12 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
                 pass
             continue
 
-        destination.write_bytes(payload)
+        # Stream ordinary files: workspace artifacts can exceed the entire
+        # Render memory budget. Encryption is needed only for small settings.
+        try:
+            shutil.copyfile(source, destination)
+        except OSError:
+            continue
         try:
             mode = source.stat().st_mode & 0o777
             os.chmod(destination, mode)
@@ -1163,8 +1167,9 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
         if not source.is_file():
             continue
         relative = source.relative_to(source_root).as_posix()
-        payload = source.read_bytes()
+        payload = None
         if relative.endswith(ENCRYPTED_SUFFIX):
+            payload = source.read_bytes()
             relative = relative[: -len(ENCRYPTED_SUFFIX)]
             opened = age_decrypt(payload, config)
             if opened is None:
@@ -1175,7 +1180,10 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
             payload = opened
         destination = data_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(payload)
+        if payload is None:
+            shutil.copyfile(source, destination)
+        else:
+            destination.write_bytes(payload)
         # git records the executable bit in the object mode, so a script that
         # was 0755 in /opt/data has to come back runnable -- a restored
         # entrypoint or hook that lost its +x simply does not run. Modes git

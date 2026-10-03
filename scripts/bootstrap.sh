@@ -27,6 +27,7 @@ GIT_SYNC="/opt/render-tools/git-storage.py"
 # Bind Render's public port immediately. Health remains unavailable until the
 # private state has restored and the native dashboard is ready.
 python /opt/render-tools/start-proxy.py
+python /opt/render-tools/memory-log.py &
 if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
   TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
   TELEGRAM_WEBHOOK_PORT=8443

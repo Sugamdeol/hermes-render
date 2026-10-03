@@ -19,16 +19,75 @@ new = '''_lite_pty_lock = asyncio.Lock()
 
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
-    # A browser chat starts Node plus a Python agent. Keep one active on 512 MB.
+    # Reserve room for Node plus Python before admitting another agent.
+    try:
+        used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+    except (OSError, ValueError):
+        used = 0
+    if used > 320 * 1024 * 1024:
+        await ws.close(code=4429)
+        return
     if _lite_pty_lock.locked():
         await ws.close(code=4429)
         return
     async with _lite_pty_lock:
-        await _lite_pty_ws(ws)
+        async def memory_guard():
+            while True:
+                await asyncio.sleep(1)
+                try:
+                    used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+                except (OSError, ValueError):
+                    continue
+                if used > 400 * 1024 * 1024:
+                    try:
+                        await ws.send_text("\\r\\nRender memory limit approaching; chat closed. Reopen after the active Telegram task finishes.\\r\\n")
+                        await ws.close(code=1013)
+                    except Exception:
+                        pass
+                    return
+        guard = asyncio.create_task(memory_guard())
+        try:
+            await _lite_pty_ws(ws)
+        finally:
+            guard.cancel()
+            try:
+                await guard
+            except asyncio.CancelledError:
+                pass
 
 
 async def _lite_pty_ws(ws: WebSocket) -> None:
 '''
 text = path.read_text()
 assert old in text, "native chat patch no longer matches pinned source"
+path.write_text(text.replace(old, new, 1))
+
+# A shorter TTL is ineffective when the native watcher wakes only every 5 min.
+path = root / "gateway/run.py"
+text = path.read_text()
+old = "async def _session_expiry_watcher(self, interval: int = 300):"
+assert old in text, "cache sweep patch no longer matches pinned source"
+path.write_text(text.replace(old, "async def _session_expiry_watcher(self, interval: int = 30):", 1))
+
+# The PTY leader spawns Node and a Python backend. Killing only that leader
+# can leave its descendants consuming RAM after every browser reconnect.
+path = root / "hermes_cli/pty_bridge.py"
+text = path.read_text()
+old = """            if not self._proc.isalive():
+                break
+            try:
+                self._proc.kill(sig)
+            except Exception:
+                pass
+"""
+new = """            try:
+                # PtyProcess.spawn creates a new session/process group.
+                # Signal it even when the leader has already exited.
+                os.killpg(self.pid, sig)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+"""
+assert old in text, "PTY cleanup patch no longer matches pinned source"
 path.write_text(text.replace(old, new, 1))

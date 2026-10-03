@@ -16,21 +16,12 @@ jobs:
         run: |
           docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
           python tests/container_smoke.py
-      - name: Measure 100 MB compatibility (experimental)
-        continue-on-error: true
+      - name: Verify repeated PTY process-tree cleanup
         run: |
-          docker run -d --name hermes-100 --memory=100m --memory-swap=100m -p 10001:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
-          SMOKE_CONTAINER=hermes-100 SMOKE_PORT=10001 timeout 100 python tests/container_smoke.py
-      - name: Measure 100 MB dashboard-only mode (experimental)
-        continue-on-error: true
-        run: |
-          docker run -d --name hermes-100-dashboard --memory=100m --memory-swap=100m -p 10002:10000 -e HERMES_DASHBOARD_TUI=0 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
-          python tests/dashboard_100.py
+          docker cp tests/pty_cleanup_probe.py hermes-lite:/tmp/pty_cleanup_probe.py
+          docker exec -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/pty_cleanup_probe.py
       - name: Container diagnostics
         if: always()
         run: |
           docker logs hermes-lite 2>&1 | tail -100 || true
           docker inspect hermes-lite --format '{{json .State}}' || true
-          docker logs hermes-100 2>&1 | tail -30 || true
-          docker inspect hermes-100 --format '{{json .State}}' || true
-          docker inspect hermes-100-dashboard --format '{{json .State}}' || true
