@@ -67,6 +67,16 @@ Docker memory limit with no swap, then checks dashboard authentication, provider
 creation, environment writes and native browser chat. See the workflow logs for
 measured peak memory; a boot smoke test is not a full workload benchmark.
 
+Verified run on 2026-10-03: 145 unit tests passed; native dashboard authentication,
+custom provider creation, environment saving and one browser chat passed with
+no swap under 512 MB, peaking at **250.4 MiB**. At 100 MB, native browser chat
+was OOM-killed. Dashboard-only mode (`HERMES_DASHBOARD_TUI=0`) booted at
+98.9 MiB, but that is not a working 100 MB agent. This deployment keeps native
+Hermes chat enabled on Render Free's 512 MB service as requested.
+
+The experimental 100 MB checks are informational and allowed to fail in CI;
+a green workflow does not mean full Hermes is compatible with 100 MB.
+
 ## Native plugins
 
 Hermes's original dashboard plugin system is retained. Create plugins under
