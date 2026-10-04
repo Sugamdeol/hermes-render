@@ -129,7 +129,13 @@ subprocess.check_call(["docker", "exec", CONTAINER, "sh", "-c",
 print("Concurrent Git backups reached the fixture repository with encrypted settings", flush=True)
 subprocess.check_call(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c",
     "import os; from pathlib import Path; events=dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines()); assert int(events.get('oom_kill',0))==0, events; [os.kill(int(Path('/tmp/hermes-combined-probe/'+role+'-pid').read_text()),0) for role in ('gateway','storage')]; print('Zero kernel OOM kills; both background fixtures remain alive; memory.events='+str(events))"])
-logs = subprocess.check_output(["docker", "logs", CONTAINER], stderr=subprocess.STDOUT).decode()
+logs = ""
+heartbeat_deadline = time.monotonic() + 8
+while time.monotonic() < heartbeat_deadline:
+    logs = subprocess.check_output(["docker", "logs", CONTAINER], stderr=subprocess.STDOUT).decode()
+    if "budget_alive=True" in logs:
+        break
+    time.sleep(0.25)
 assert "budget_alive=True" in logs, "worker budget has no healthy heartbeat"
 assert "monitor failed" not in logs, "budget monitor failed during normal container operation"
 print("Budget monitor heartbeat stayed healthy", flush=True)
