@@ -41,11 +41,14 @@ except urllib.error.HTTPError as error:
 html = call("/")
 token = re.search(r'__HERMES_SESSION_TOKEN__="([^"]+)"', html).group(1)
 endpoint = "/api/plugins/render-api-providers/custom-providers"
-result = json.loads(call(endpoint, {"name": "ci-custom", "base_url": "https://example.invalid/v1", "api_key": "ci-provider-secret", "api_mode": "chat_completions", "model": "ci-model"}, token=token))
+result = json.loads(call(endpoint, {"name": "ci-custom", "base_url": "http://127.0.0.1:18080/v1", "api_key": "ci-provider-secret", "api_mode": "chat_completions", "model": "ci-model"}, token=token))
 assert result["ok"]
 providers = call(endpoint, token=token)
 assert "ci-custom" in providers and "ci-provider-secret" not in providers
 assert json.loads(call("/api/env", {"key": "CI_SAVED_ENV", "value": "ci-value"}, method="PUT", token=token))["ok"]
+
+# Select the local fake provider in native Hermes' actual configuration.
+subprocess.check_call(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", "from pathlib import Path; import yaml; p=Path('/opt/data/config.yaml'); c=yaml.safe_load(p.read_text()); c['model']={'default':'ci-model','provider':'custom:ci-custom'}; p.write_text(yaml.safe_dump(c,sort_keys=False))"])
 
 async def check_native_chat():
     import websockets
@@ -66,6 +69,18 @@ async def check_native_chat():
         except websockets.exceptions.InvalidStatus as error:
             assert error.response.status_code == 403
         await asyncio.sleep(15)
+        await ws.send(b"hello\r")
+        answer = b""
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            part = await asyncio.wait_for(ws.recv(), timeout=30)
+            answer += part.encode() if isinstance(part, str) else part
+            plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", answer)
+            if b"Hermes chat works." in plain:
+                print("Native browser chat completed a real model round trip to the local test provider", flush=True)
+                break
+        else:
+            raise AssertionError("native chat did not complete model response")
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
         # Raise total usage to ~440 MiB without approaching the 512 MiB cap.
@@ -73,16 +88,9 @@ async def check_native_chat():
         allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,440*1048576-used)); time.sleep(8)"
         pressure = subprocess.Popen(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", allocator])
         try:
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                try:
-                    await asyncio.wait_for(ws.recv(), timeout=10)
-                except websockets.exceptions.ConnectionClosed as error:
-                    assert error.rcvd.code == 1013, error
-                    print("Memory pressure closed browser chat gracefully", flush=True)
-                    break
-            else:
-                raise AssertionError("browser chat did not yield under memory pressure")
+            await asyncio.sleep(3)
+            assert ws.state.name == 'OPEN', 'memory observer interrupted browser chat'
+            print("Browser chat remains connected under memory pressure", flush=True)
         finally:
             pressure.wait(timeout=15)
 

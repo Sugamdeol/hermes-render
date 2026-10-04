@@ -97,6 +97,13 @@ def _render_entry() -> dict:
 def ensure_render_mcp(config: dict) -> bool:
     """Insert mcp_servers.render if missing. Returns True if changed."""
     mcp_servers = config.get("mcp_servers")
+    if not os.environ.get('RENDER_MCP_API_KEY'):
+        # Do not import/start the MCP stack for an unconfigured adapter entry.
+        # Preserve custom entries and all user-configured MCP servers.
+        if isinstance(mcp_servers, dict) and mcp_servers.get('render') == _render_entry():
+            del mcp_servers['render']
+            return True
+        return False
     if mcp_servers is None:
         config["mcp_servers"] = {"render": _render_entry()}
         return True
@@ -385,3 +392,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

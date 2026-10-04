@@ -3,6 +3,8 @@ from pathlib import Path
 import importlib.util
 import threading
 import time
+import os
+import logging
 
 spec = importlib.util.spec_from_file_location('agent_budget', Path(__file__).with_name('agent-budget.py'))
 budget = importlib.util.module_from_spec(spec)
@@ -18,6 +20,27 @@ def supervise_budget():
             time.sleep(1)
 
 threading.Thread(target=supervise_budget, daemon=True).start()
+
+# Share the interpreter with Git sync instead of retaining a second Python
+# process. Its existing delta watcher, encryption and restore guards remain.
+def supervise_storage():
+    spec = importlib.util.spec_from_file_location('git_storage', Path(__file__).with_name('git-storage.py'))
+    storage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(storage)
+    logging.basicConfig(level=logging.INFO, format='[hermes-git-state] %(message)s')
+    config = storage.GitConfig.from_env()
+    if config is None:
+        return
+    while True:
+        try:
+            storage.run_daemon(Path(os.environ.get('HERMES_HOME', '/opt/data')), config)
+            return
+        except Exception as error:
+            print(f'[hermes-git-state] sync thread failed ({type(error).__name__}); retrying in 10s', flush=True)
+            time.sleep(10)
+
+if os.environ.get('HERMES_GIT_SYNC_IN_PROCESS') == '1':
+    threading.Thread(target=supervise_storage, daemon=True).start()
 
 while True:
     try:

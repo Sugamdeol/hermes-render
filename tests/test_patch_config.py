@@ -5,6 +5,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -20,6 +21,19 @@ def load_patch_config():
 
 
 class PatchConfigTests(unittest.TestCase):
+    def test_unconfigured_mcp_is_not_started(self):
+        module = load_patch_config()
+        with patch.dict(os.environ, {'RENDER_MCP_API_KEY': ''}):
+            fresh = {}
+            self.assertFalse(module.ensure_render_mcp(fresh))
+            self.assertNotIn('mcp_servers', fresh)
+            migrated = {'mcp_servers': {'render': module._render_entry(), 'custom': {'command': 'my-server'}}}
+            self.assertTrue(module.ensure_render_mcp(migrated))
+            self.assertEqual(migrated['mcp_servers'], {'custom': {'command': 'my-server'}})
+        with patch.dict(os.environ, {'RENDER_MCP_API_KEY': 'test-only-key'}):
+            self.assertTrue(module.ensure_render_mcp(fresh))
+            self.assertIn('render', fresh['mcp_servers'])
+
     def test_default_render_mcp_entry_does_not_filter_tools(self):
         patch_config = load_patch_config()
 

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import signal
 import unittest
 
 SCRIPT = Path(__file__).parents[1] / 'scripts/agent-budget.py'
@@ -28,7 +29,8 @@ class AgentBudgetTests(unittest.TestCase):
                 self.assertIsNone(monitor.poll())
                 # Real non-cache pressure must still shed the worker.
                 (Path(tmp) / 'memory.stat').write_text('file ' + str(60 * 1048576) + '\n')
-                self.assertEqual(worker.wait(timeout=5), -9)
+                time.sleep(1)
+                self.assertIsNone(worker.poll(), 'observe-only mode cancelled a worker')
             finally:
                 worker.kill()
                 worker.wait()
@@ -40,7 +42,7 @@ class AgentBudgetTests(unittest.TestCase):
         selected = budget.descendants(table, {10: 'chat'}, {12: ('102', 'chat'), 20: ('old-pid', 'gateway')})
         self.assertEqual(selected, {10: 'chat', 11: 'chat', 12: 'chat'})
 
-    def test_budget_cancels_worker_tree_without_killing_service(self):
+    def test_observer_keeps_busy_worker_tree_alive(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {**os.environ, 'HERMES_WORKER_REGISTRY': tmp + '/workers', 'HERMES_AGENT_RAM_MB': '128', 'HERMES_AGENT_CGROUP': '/proc/hermes-no-delegation', 'HERMES_TOTAL_MEMORY_FILE': tmp + '/total'}
             Path(tmp + '/total').write_text('0')
@@ -55,14 +57,17 @@ class AgentBudgetTests(unittest.TestCase):
                 parent = 'import subprocess,sys,time; p=subprocess.Popen([sys.executable,"-c",sys.argv[1]]); print(p.pid,flush=True); chunks=[];\nfor i in range(40): chunks.append(bytearray(2*1048576)); time.sleep(.03)\ntime.sleep(60)'
                 worker = subprocess.Popen([sys.executable, str(SCRIPT), 'run', 'chat', sys.executable, '-c', parent, child], env=env, stdout=subprocess.PIPE, text=True, start_new_session=True)
                 backend = int(worker.stdout.readline().strip())
-                self.assertEqual(worker.wait(timeout=15), -9)
-                deadline = time.monotonic() + 3
-                while backend in budget.processes() and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                self.assertNotIn(backend, budget.processes())
+                time.sleep(3)
+                self.assertIsNone(worker.poll())
+                self.assertIn(backend, budget.processes())
                 self.assertIsNone(monitor.poll())
                 self.assertIsNone(unrelated.poll())
             finally:
+                if worker is not None:
+                    try:
+                        os.killpg(worker.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                 for proc in (worker, unrelated, monitor):
                     if proc is not None:
                         proc.kill()

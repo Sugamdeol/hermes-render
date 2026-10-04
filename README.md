@@ -57,9 +57,8 @@ GPU/ML runtimes, or unrelated channel SDKs. Those optional tools may need a larg
 instance and additional packages. Existing user skills remain available; a skill
 that depends on an omitted optional package cannot run until that package is added.
 
-One native browser chat is allowed at a time. Node's heap is capped at 64 MB,
-agent cache at two sessions with a 120-second idle timeout, and native library
-threads at one. These settings reduce baseline memory; arbitrary terminal jobs,
+One native browser chat is allowed at a time. The agent cache holds one session
+with a 30-second idle timeout, and native library threads default to one. These settings reduce baseline memory; arbitrary terminal jobs,
 large uploads, plugins or tool workloads can still exceed 512 MB.
 
 The GitHub Actions workflow builds the actual image and boots it under a 512 MB
@@ -98,32 +97,12 @@ docker run --rm -p 10000:10000 --memory=512m --memory-swap=512m \
 Provider and Telegram secrets go in the authenticated dashboard or Render
 Environment, never in this public source repository.
 
-### Memory pressure and production limits
+### Lightweight runtime
 
-The 512 MB CI measurement covers dashboard and native TUI startup; it does not establish a ceiling for Telegram inference, tools, and GitHub sync running together. Production OOM reports showed this distinction matters.
+Python allocation caps, worker cgroup caps and automatic memory-based cancellations have been removed. Old `HERMES_PYTHON_DATA_MB`, `HERMES_PYTHON_AS_MB` and `HERMES_AGENT_RAM_MB` values are ignored. The adapter's previous `NODE_OPTIONS=--max-old-space-size=64` is cleared for agent workers. Render still enforces its own 512 MB instance limit.
 
-Ordinary backup and restore files now stream to disk instead of loading entire workspace artifacts into RAM. Browser disconnects terminate the PTY process group, including its Node and Python descendants. Cached gateway agents are swept every 30 seconds. Runtime logs report total cgroup usage and process RSS without command arguments or secrets.
+The runtime now shares Git delta sync and memory diagnostics in one Python process, uses a shell supervisor for Telegram, starts only one cron job at a time, uses smaller Python thread-stack reservations and one glibc allocation arena, and releases idle gateway agents after 30 seconds. It retains one cached agent and one native browser chat. State encryption, saved memories/skills, provider settings and native chat remain supported.
 
-To reserve capacity for Telegram and storage, browser chat refuses to start above 320 MiB of container usage and closes above 400 MiB. This can interrupt an active browser chat; saved session history remains available for resuming. It is a pressure safeguard, not a guarantee that every Hermes tool or workload fits 512 MB. Large local models, browser processes and concurrent agent workloads may still exceed the service budget.
+An unconfigured image-managed Render MCP entry is removed so it does not trigger unnecessary SDK imports or discovery. User-configured MCP servers and authenticated Render entries remain available.
 
-### Shared agent RAM budget
-
-`HERMES_AGENT_RAM_MB=300` gives browser chat, the Telegram gateway, and their child tools a shared 300 MiB budget. Dashboard, proxy and storage are outside that worker budget; the remaining 212 MiB is headroom, not a guaranteed reservation. The supported setting is clamped to 128–350 MiB.
-
-On platforms with delegated writable cgroup v2 memory controls, the adapter creates a worker cgroup with `memory.max`, disables worker swap, and enables group OOM termination. All launched workers enter it before executing Hermes. This is a hard aggregate kernel cap; exceeding it can terminate the agent group. Telegram's supervisor restarts after 20 seconds; interrupted tasks need retrying.
-
-Render may expose cgroups read-only. In that case the startup log explicitly says `mode=watchdog (sampled, not a hard cap)`. The watchdog checks summed worker RSS every 0.2 seconds, including observed descendants; it cancels browser chat first, then Telegram if needed. It also sheds workers when the container passes 430 MiB. RSS conservatively counts shared pages more than once. Fast allocation spikes can still outrun sampling, and tools that escape tracking may not be fully accounted for. This fallback reduces risk but cannot guarantee prevention of OOM. A strict limit requires a host that permits cgroup delegation.
-
-Look for `[agent-budget]` and `[memory]` lines after redeploy to see the enforcement mode, cancellations, and process memory. Native dashboard gateway-restart actions also enter the worker budget.
-
-The memory logger now supervises the budget monitor in the same process and restarts it after unexpected errors. The monitor runs as the Hermes UID after cgroup setup so signals do not depend on root retaining `CAP_KILL`. Each memory log includes `budget_alive`, worker RSS, cgroup anonymous memory, file cache and inactive file cache. Total cgroup usage includes cache and cannot be compared directly with the agent-only budget. Cached files may be reclaimed by Linux, so a high total alone is not proof of an agent heap leak.
-
-### Python allocation cap
-
-Python Telegram and browser agent backends now call `resource.setrlimit(RLIMIT_DATA, ...)` with a default hard and soft limit of **192 MiB per process** (`HERMES_PYTHON_DATA_MB`, clamped to 96–256 MiB). Linux refuses data-memory allocations beyond that limit; Python allocations may raise `MemoryError` and native libraries may terminate the worker. Its scope is data memory, not total RSS or the sum of all children. Child tools inherit the limit. Node's launcher and the dashboard do not receive this Python cap. The shared 300 MiB worker watchdog still handles multiple workers.
-
-`HERMES_PYTHON_AS_MB` optionally enables `RLIMIT_AS`; it defaults to `0` (disabled). Virtual address-space reservations and thread stacks make a small blanket address-space limit unsafe for native Hermes/Node startup. These allocation limits reduce sudden-growth risk without promising that all container memory, file cache, or every native allocation path is bounded to 192 MiB.
-
-### Cache-aware pressure checks
-
-Worker cancellation and chat admission now use a non-cache memory estimate instead of raw `memory.current`. Both active and inactive clean filesystem cache are excluded; shared/tmpfs, dirty/writeback and locked memory remain counted conservatively. Logs show `noncache` beside the full cgroup total. This prevents a cache-heavy Git sync from repeatedly killing a small gateway during startup. It is an estimate for watchdog decisions, not an extra hard kernel cap; 192 MiB Python data limits and the 300 MiB worker budget remain enabled.
+Memory logs report `mode=observe`. They measure usage without killing agents. CI includes a real native browser message and model response against a local deterministic test provider, thread creation under heap load, gateway initialization, Git storage tests, process-tree cleanup and a 512 MB container without swap. These checks do not prove every research task or tool fits the free instance.

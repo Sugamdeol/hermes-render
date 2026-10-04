@@ -5,8 +5,8 @@ import sys
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/hermes")
 path = root / "gateway/run.py"
 old = "_AGENT_CACHE_MAX_SIZE = 128\n_AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h\n"
-new = '''_AGENT_CACHE_MAX_SIZE = max(1, int(os.environ.get("HERMES_AGENT_CACHE_MAX_SIZE", "2")))
-_AGENT_CACHE_IDLE_TTL_SECS = max(1.0, float(os.environ.get("HERMES_AGENT_CACHE_IDLE_TTL_SECONDS", "120")))
+new = '''_AGENT_CACHE_MAX_SIZE = max(1, int(os.environ.get("HERMES_AGENT_CACHE_MAX_SIZE", "1")))
+_AGENT_CACHE_IDLE_TTL_SECS = max(1.0, float(os.environ.get("HERMES_AGENT_CACHE_IDLE_TTL_SECONDS", "30")))
 '''
 text = path.read_text()
 assert old in text, "gateway cache patch no longer matches pinned source"
@@ -67,42 +67,11 @@ new = '''_lite_pty_lock = asyncio.Lock()
 
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
-    # Reserve room for Node plus Python before admitting another agent.
-    try:
-        from hermes_cli.render_memory import container_memory
-        _, used = container_memory()
-    except (OSError, ValueError):
-        used = 0
-    if used > 320 * 1024 * 1024:
-        await ws.close(code=4429)
-        return
     if _lite_pty_lock.locked():
         await ws.close(code=4429)
         return
     async with _lite_pty_lock:
-        async def memory_guard():
-            while True:
-                await asyncio.sleep(1)
-                try:
-                    _, used = container_memory()
-                except (OSError, ValueError):
-                    continue
-                if used > 400 * 1024 * 1024:
-                    try:
-                        await ws.send_text("\\r\\nRender memory limit approaching; chat closed. Reopen after the active Telegram task finishes.\\r\\n")
-                        await ws.close(code=1013)
-                    except Exception:
-                        pass
-                    return
-        guard = asyncio.create_task(memory_guard())
-        try:
-            await _lite_pty_ws(ws)
-        finally:
-            guard.cancel()
-            try:
-                await guard
-            except asyncio.CancelledError:
-                pass
+        await _lite_pty_ws(ws)
 
 
 async def _lite_pty_ws(ws: WebSocket) -> None:

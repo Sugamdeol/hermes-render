@@ -27,7 +27,6 @@ GIT_SYNC="/opt/render-tools/git-storage.py"
 # Bind Render's public port immediately. Health remains unavailable until the
 # private state has restored and the native dashboard is ready.
 python /opt/render-tools/start-proxy.py
-python /opt/render-tools/memory-log.py &
 if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
   TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
   TELEGRAM_WEBHOOK_PORT=8443
@@ -359,13 +358,14 @@ fi
 # as hermes so it cannot read files outside the data directory. It is optional
 # and exits cleanly when its credentials are not configured.
 if [ "${GIT_BACKEND}" -eq 1 ]; then
-  gosu hermes nice -n 10 "${GIT_SYNC}" daemon "${DATA_DIR}" &
-  echo "[render-tools] started git state sync (delta uploads on change)"
+  export HERMES_GIT_SYNC_IN_PROCESS=1
+  echo "[render-tools] started git state sync inside diagnostics (delta uploads on change)"
 fi
 
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
+gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/memory-log.py &
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py gateway &
+  gosu hermes /opt/render-tools/gateway-supervisor.sh &
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"

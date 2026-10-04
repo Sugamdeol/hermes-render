@@ -43,15 +43,13 @@ services:
         value: "9119"
       - key: HERMES_DASHBOARD_TUI
         value: "1"
-      - key: HERMES_PYTHON_DATA_MB
-        value: "192"
-      - key: HERMES_AGENT_RAM_MB
-        value: "300"
+      - key: HERMES_CRON_MAX_PARALLEL
+        value: "1"
+      - key: HERMES_TUI_RPC_POOL_WORKERS
+        value: "2"
       - key: HERMES_AGENT_CACHE_MAX_SIZE
-        value: "2"
+        value: "1"
       - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
-        value: "120"
-      - key: NODE_OPTIONS
-        value: --max-old-space-size=64
+        value: "30"
       - key: MALLOC_ARENA_MAX
-        value: "2"
+        value: "1"
