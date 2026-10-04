@@ -99,6 +99,10 @@ async def check_json_rpc_isolation():
 
 asyncio.run(check_native_chat())
 asyncio.run(check_json_rpc_isolation())
+logs = subprocess.check_output(["docker", "logs", CONTAINER], stderr=subprocess.STDOUT).decode()
+assert "budget_alive=True" in logs, "worker budget has no healthy heartbeat"
+assert "monitor failed" not in logs, "budget monitor failed during normal container operation"
+print("Budget monitor heartbeat stayed healthy", flush=True)
 state = json.loads(subprocess.check_output(["docker", "inspect", CONTAINER, "--format", "{{json .State}}"] ))
 assert state["Running"] and not state["OOMKilled"]
 print("Native dashboard auth, custom provider CRUD, env save, browser chat and container memory-limit boot passed.")

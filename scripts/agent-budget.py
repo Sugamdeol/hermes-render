@@ -16,6 +16,7 @@ REGISTRY = Path(os.environ.get('HERMES_WORKER_REGISTRY', '/tmp/hermes-agent-work
 CGROUP = Path(os.environ.get('HERMES_AGENT_CGROUP', '/sys/fs/cgroup/hermes-workers'))
 MIB = 1048576
 BUDGET = min(350, max(128, int(os.environ.get('HERMES_AGENT_RAM_MB', '300')))) * MIB
+STATUS = {'heartbeat': 0, 'workers': 0, 'rss': 0, 'mode': 'starting'}
 
 
 def processes():
@@ -94,11 +95,14 @@ def stop_workers(table, selected, role):
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            print(f'[agent-budget] cannot signal worker {pid}; permission denied', flush=True)
     print(f'[agent-budget] cancelled {role} worker tree ({len(victims)} processes); retry the task after restart', flush=True)
 
 
 def monitor():
     REGISTRY.mkdir(mode=0o700, parents=True, exist_ok=True)
+    account = None
     if os.geteuid() == 0:
         try:
             account = pwd.getpwnam('hermes')
@@ -106,9 +110,19 @@ def monitor():
             account = None
         if account is not None:
             os.chown(REGISTRY, account.pw_uid, account.pw_gid)
-    (REGISTRY / 'kernel').unlink(missing_ok=True)
-    hard = setup_kernel_group()
+    try:
+        hard = (REGISTRY / 'kernel').exists() and int((CGROUP / 'memory.max').read_text()) == BUDGET and os.access(CGROUP / 'cgroup.procs', os.W_OK)
+    except (OSError, ValueError):
+        hard = False
+    if not hard:
+        (REGISTRY / 'kernel').unlink(missing_ok=True)
+        hard = setup_kernel_group()
     print(f'[agent-budget] aggregate={BUDGET//MIB}MiB; mode={"kernel-cgroup" if hard else "watchdog (sampled, not a hard cap)"}; dashboard/storage excluded', flush=True)
+    STATUS['mode'] = 'kernel-cgroup' if hard else 'watchdog'
+    # Same UID as Hermes workers allows signalling without CAP_KILL.
+    if account is not None:
+        os.setgid(account.pw_gid)
+        os.setuid(account.pw_uid)
     tracked = {}
     while True:
         table, roots = processes(), {}
@@ -126,6 +140,7 @@ def monitor():
         selected = descendants(table, roots, tracked)
         tracked = {pid: (table[pid][2], role) for pid, role in selected.items()}
         usage = sum(table[pid][3] for pid in selected)
+        STATUS.update(heartbeat=time.monotonic(), workers=len(selected), rss=usage)
         try:
             total = int(Path(os.environ.get('HERMES_TOTAL_MEMORY_FILE', '/sys/fs/cgroup/memory.current')).read_text())
         except (OSError, ValueError):
