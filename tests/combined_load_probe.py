@@ -10,6 +10,7 @@ import time
 
 root = Path('/tmp/hermes-combined-probe')
 root.mkdir(exist_ok=True)
+(root / (sys.argv[1] + '-pid')).write_text(str(os.getpid()))
 stop = threading.Event()
 signal.signal(signal.SIGTERM, lambda *_: stop.set())
 signal.signal(signal.SIGINT, lambda *_: stop.set())
