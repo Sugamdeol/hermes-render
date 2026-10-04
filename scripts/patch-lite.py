@@ -143,3 +143,20 @@ old = "from tui_gateway import server\n"
 new = "from hermes_cli.render_memory import apply_worker_limit\napply_worker_limit()\n\n" + old
 assert old in text, "TUI allocation limit patch no longer matches pinned source"
 path.write_text(text.replace(old, new, 1))
+
+# Avoid importing a second complete HermesCLI for ordinary browser messages.
+path = root / "tui_gateway/server.py"
+text = path.read_text()
+old = "            try:\n                worker = _SlashWorker(key, getattr(agent, \"model\", _resolve_model()))\n                current[\"slash_worker\"] = worker\n            except Exception:\n                pass\n"
+new = "            # Slash subprocess starts on the first slash command.\n"
+assert old in text, 'lazy slash worker patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "    try:\n        _sessions[sid][\"slash_worker\"] = _SlashWorker(\n            key, getattr(agent, \"model\", _resolve_model())\n        )\n    except Exception:\n        # Defer hard-failure to slash.exec; chat still works without slash worker.\n        _sessions[sid][\"slash_worker\"] = None\n"
+new = "    # slash.exec already creates this lazily when actually needed.\n"
+assert old in text, 'lazy slash worker patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "def _restart_slash_worker(session: dict):\n    worker = session.get(\"slash_worker\")\n"
+new = "def _restart_slash_worker(session: dict):\n    worker = session.get(\"slash_worker\")\n    if worker is None:\n        return\n"
+assert old in text, 'lazy slash worker patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+path.write_text(text)

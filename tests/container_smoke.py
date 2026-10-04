@@ -84,6 +84,9 @@ async def check_native_chat():
         else:
             print("Native TUI output: " + re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", seen + answer).decode(errors="replace")[-18000:], flush=True)
             raise AssertionError("native chat did not complete model response")
+        cmdlines = subprocess.check_output(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", "from pathlib import Path; print('\\n'.join(p.read_bytes().replace(b'\\0',b' ').decode(errors='replace') for p in Path('/proc').glob('[0-9]*/cmdline') if p.exists()))"]).decode()
+        assert "-m tui_gateway.slash_worker" not in cmdlines, "ordinary chat eagerly loaded full slash CLI"
+        print("Ordinary chat avoids the additional HermesCLI slash subprocess", flush=True)
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
         # Raise total usage to ~440 MiB without approaching the 512 MiB cap.
