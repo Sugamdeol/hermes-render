@@ -1,5 +1,7 @@
 """Durable gateway task intent; transcript/tool progress stays in native Hermes."""
 import json
+import asyncio
+import logging
 import os
 from pathlib import Path
 import tempfile
@@ -77,13 +79,73 @@ def recover(store):
             if entry is None or entry.suspended or entry.session_id != record['session_id']:
                 del data[key]  # Explicit stop/reset/resume selection wins.
                 continue
-            record['attempts'] = int(record.get('attempts', 0)) + 1
-            reason = 'restart_interrupted' if record['attempts'] <= MAX_RETRIES else 'render_recovery_paused'
+            reason = 'restart_interrupted' if int(record.get('attempts', 0)) < MAX_RETRIES else 'render_recovery_paused'
             entry.resume_pending = True
             entry.resume_reason = reason
             entry.last_resume_marked_at = datetime.now()
         _write(data)
         store._save()
+
+
+def priority(session_key):
+    """Untried lanes go first after a crash, preventing one lane starving others."""
+    with _lock:
+        record = _read().get(session_key, {})
+        return (int(record.get('attempts', 0)), record.get('started_at', 0), session_key)
+
+
+def claim(store, session_key, session_id):
+    """Charge only a dispatched attempt; recheck stop/reset while it was queued."""
+    with _lock, store._lock:
+        store._ensure_loaded_locked()
+        entry = store._entries.get(session_key)
+        data = _read()
+        record = data.get(session_key)
+        if entry is None or entry.suspended or entry.session_id != session_id or not entry.resume_pending:
+            return False
+        if record is None:
+            return False
+        if int(record.get('attempts', 0)) >= MAX_RETRIES:
+            entry.resume_reason = 'render_recovery_paused'
+            store._save()
+            return False
+        record['attempts'] = int(record.get('attempts', 0)) + 1
+        _write(data)
+        return True
+
+
+async def dispatch(runner, adapter, entry, event, session_id):
+    """Drain all interrupted lanes without allocating all their agents at once."""
+    if not hasattr(runner, '_render_recovery_lock'):
+        runner._render_recovery_lock = asyncio.Lock()
+    async with runner._render_recovery_lock:
+        from gateway.session import build_session_key
+        extra = getattr(getattr(adapter, 'config', None), 'extra', {})
+        key = build_session_key(event.source,
+            group_sessions_per_user=extra.get('group_sessions_per_user', True),
+            thread_sessions_per_user=extra.get('thread_sessions_per_user', False))
+        if key in getattr(adapter, '_active_sessions', {}):
+            return  # A real incoming message already took ownership of this lane.
+        if entry.session_id != session_id:
+            return
+        if tracked(entry.session_key):
+            if not claim(runner.session_store, entry.session_key, session_id):
+                return
+        else:
+            # A user completed/stopped this task while it waited in the queue.
+            if not entry.resume_pending or entry.suspended:
+                return
+        logging.getLogger(__name__).info('Continuing interrupted session %s', entry.session_key)
+        await adapter.handle_message(event)
+        # Native handle_message only enqueues the turn. Hold our recovery slot
+        # until its real background owner (including pending-message drains) ends.
+        while True:
+            task = getattr(adapter, '_session_tasks', {}).get(key)
+            if task is None or task is asyncio.current_task():
+                break
+            await asyncio.shield(task)
+            if getattr(adapter, '_session_tasks', {}).get(key) is task:
+                break
 
 
 def resume_text(session_key):

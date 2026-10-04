@@ -193,4 +193,12 @@ old = "                and _interruption_is_fresh\n            )\n            _h
 new = "                and (_interruption_is_fresh or __import__(\"hermes_cli.render_recovery\", fromlist=[\"tracked\"]).tracked(session_key))\n            )\n            _has_fresh_tool_tail"
 assert old in text, 'durable recovery patch no longer matches pinned source'
 text = text.replace(old, new, 1)
+old = "        for entry in candidates:\n            marker = entry.last_resume_marked_at or entry.updated_at\n"
+new = "        from hermes_cli import render_recovery\n        candidates.sort(key=lambda entry: render_recovery.priority(entry.session_key))\n        queued = getattr(self, '_render_recovery_queued', set())\n        self._render_recovery_queued = queued\n        for entry in candidates:\n            if entry.session_key in queued:\n                continue\n            marker = entry.last_resume_marked_at or entry.updated_at\n"
+assert old in text, 'multi-session recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "            task = asyncio.create_task(adapter.handle_message(event))\n            self._background_tasks.add(task)\n            task.add_done_callback(self._background_tasks.discard)\n            scheduled += 1\n"
+new = "            queued.add(entry.session_key)\n            task = asyncio.create_task(render_recovery.dispatch(self, adapter, entry, event, entry.session_id))\n            self._background_tasks.add(task)\n            task.add_done_callback(self._background_tasks.discard)\n            task.add_done_callback(lambda task, key=entry.session_key: queued.discard(key))\n            scheduled += 1\n"
+assert old in text, 'multi-session recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
 path.write_text(text)

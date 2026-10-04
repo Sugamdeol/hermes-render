@@ -47,6 +47,7 @@ class RecoveryTests(unittest.TestCase):
         self.helper['begin'](self.entry, self.event)
         for _ in range(3):
             self.helper['recover'](self.store)
+            self.assertTrue(self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id))
             self.assertEqual(self.entry.resume_reason, 'restart_interrupted')
         self.helper['recover'](self.store)
         self.assertEqual(self.entry.resume_reason, 'render_recovery_paused')
@@ -71,6 +72,31 @@ class RecoveryTests(unittest.TestCase):
     def test_internal_resume_does_not_reset_attempt_count_or_original_task(self):
         self.helper['begin'](self.entry, self.event)
         self.helper['recover'](self.store)
+        self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id)
         self.helper['begin'](self.entry, SimpleNamespace(text='recovery prompt', internal=True))
         self.assertEqual(self.helper['_read']()[self.entry.session_key]['attempts'], 1)
         self.assertEqual(self.helper['_read']()[self.entry.session_key]['task'], self.event.text)
+
+    def test_waiting_sessions_do_not_exhaust_retries_or_lose_tasks(self):
+        entries = [self.entry] + [SimpleNamespace(session_key=f'telegram:{i}',
+            session_id=f'session-{i}', suspended=False) for i in range(3)]
+        self.store._entries = {e.session_key: e for e in entries}
+        for entry in entries:
+            self.helper['begin'](entry, SimpleNamespace(text=entry.session_id, internal=False))
+        for _ in range(5):
+            self.helper['recover'](self.store)
+        for entry in entries:
+            self.assertEqual(self.helper['_read']()[entry.session_key]['attempts'], 0)
+            self.assertEqual(entry.resume_reason, 'restart_interrupted')
+            self.assertIn(entry.session_id, self.helper['resume_text'](entry.session_key))
+        self.helper['claim'](self.store, entries[0].session_key, entries[0].session_id)
+        self.assertGreater(self.helper['priority'](entries[0].session_key),
+            self.helper['priority'](entries[1].session_key))
+
+    def test_user_reset_while_queued_is_not_replayed(self):
+        self.helper['begin'](self.entry, self.event)
+        self.helper['recover'](self.store)
+        original = self.entry.session_id
+        self.entry.session_id = 'selected-new-session'
+        self.assertFalse(self.helper['claim'](self.store, self.entry.session_key, original))
+        self.assertEqual(self.helper['_read']()[self.entry.session_key]['attempts'], 0)
