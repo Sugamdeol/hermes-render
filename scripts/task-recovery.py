@@ -141,6 +141,8 @@ def recover(store):
     with _lock, store._lock:
         store._ensure_loaded_locked()
         data = _read()
+        journal_changed = False
+        store_changed = False
         for key, record in list(data.items()):
             entry = store._entries.get(key)
             if entry is None:
@@ -149,17 +151,27 @@ def recover(store):
                 continue
             if entry.suspended:
                 del data[key]  # Explicit stop/reset wins.
+                journal_changed = True
                 continue
             if entry.session_id != record.get('session_id'):
                 # Keep the intent dormant. A manual "continue" in this lane
                 # can rebind it; an unrelated new task will replace it.
                 continue
             reason = 'restart_interrupted'
-            entry.resume_pending = True
-            entry.resume_reason = reason
-            entry.last_resume_marked_at = datetime.now()
-        _write(data)
-        store._save()
+            if (not getattr(entry, 'resume_pending', False)
+                    or getattr(entry, 'resume_reason', None) != reason
+                    or getattr(entry, 'last_resume_marked_at', None) is None):
+                entry.resume_pending = True
+                entry.resume_reason = reason
+                entry.last_resume_marked_at = datetime.now()
+                store_changed = True
+        # This scan runs every few seconds. Rewriting unchanged files made the
+        # Git backup daemon believe state was perpetually dirty, causing a full
+        # snapshot/push at every minimum interval while chats were idle.
+        if journal_changed:
+            _write(data)
+        if store_changed:
+            store._save()
 
 
 def rebind(store, session_key, session_id, topic_db=None):

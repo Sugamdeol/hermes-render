@@ -366,6 +366,13 @@ fi
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/memory-log.py &
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  gosu hermes /opt/render-tools/gateway-supervisor.sh &
+  # The entrypoint already starts the dashboard as a side process. Make the
+  # restart loop its foreground command so OOM-killing the supervisor ends the
+  # container and lets Render replace it. Running it in the background beside
+  # a user-supplied `hermes gateway run` command created two gateways and
+  # doubled their baseline memory. sleep/infinity is the common Render command;
+  # Telegram still gets one supervised gateway in that setup.
+  echo "[render-tools] starting one foreground, restartable Telegram gateway"
+  exec /opt/hermes/docker/entrypoint.sh /opt/render-tools/gateway-supervisor.sh
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"

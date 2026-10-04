@@ -16,10 +16,11 @@ class Store:
     def __init__(self, entry):
         self._lock = threading.Lock()
         self._entries = {entry.session_key: entry}
+        self.save_calls = 0
     def _ensure_loaded_locked(self):
         pass
     def _save(self):
-        pass
+        self.save_calls += 1
 
 
 class RecoveryTests(unittest.TestCase):
@@ -90,6 +91,15 @@ class RecoveryTests(unittest.TestCase):
         self.store._entries[self.entry.session_key] = self.entry
         self.helper['recover'](self.store)
         self.assertTrue(self.entry.resume_pending)
+    def test_recovery_scan_does_not_rewrite_unchanged_journal_or_store(self):
+        self.helper['begin'](self.entry, self.event)
+        self.helper['recover'](self.store)
+        first_mark = self.entry.last_resume_marked_at
+        save_calls = self.store.save_calls
+        with patch.dict(self.helper, {'_write': lambda data: self.fail('unchanged journal rewritten')}):
+            self.helper['recover'](self.store)
+        self.assertEqual(self.entry.last_resume_marked_at, first_mark)
+        self.assertEqual(self.store.save_calls, save_calls)
     def test_internal_resume_does_not_reset_attempt_count_or_original_task(self):
         self.helper['begin'](self.entry, self.event)
         self.helper['recover'](self.store)
