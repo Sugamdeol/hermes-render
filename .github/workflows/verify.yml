@@ -17,6 +17,9 @@ jobs:
           docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
           docker cp tests/chat_probe_server.py hermes-lite:/tmp/chat_probe_server.py
           docker exec -d hermes-lite /opt/hermes/.venv/bin/python /tmp/chat_probe_server.py
+          docker cp tests/combined_load_probe.py hermes-lite:/tmp/combined_load_probe.py
+          docker exec -d -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py gateway
+          docker exec -d -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py storage
           python tests/container_smoke.py
       - name: Verify native gateway starts without artificial allocation caps
         run: |

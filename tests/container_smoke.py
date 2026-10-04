@@ -14,6 +14,17 @@ PORT = os.environ.get("SMOKE_PORT", "10000")
 CONTAINER = os.environ.get("SMOKE_CONTAINER", "hermes-lite")
 BASE = "http://127.0.0.1:" + PORT
 
+# Both background fixtures must finish loading before chat is measured.
+for attempt in range(90):
+    ready = subprocess.run(["docker", "exec", CONTAINER, "sh", "-c",
+        "test -f /tmp/hermes-combined-probe/gateway-ready && test -f /tmp/hermes-combined-probe/storage-ready"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if ready.returncode == 0:
+        break
+    time.sleep(1)
+else:
+    raise AssertionError("combined gateway/storage fixture did not start")
+
 def call(path, data=None, method=None, token=None, authenticated=True):
     headers = {"Content-Type": "application/json"}
     if authenticated:
@@ -88,7 +99,7 @@ async def check_native_chat():
         assert "-m tui_gateway.slash_worker" not in cmdlines, "ordinary chat eagerly loaded full slash CLI"
         print("Ordinary chat avoids the additional HermesCLI slash subprocess", flush=True)
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
-        print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
+        print("Dashboard + native chat + initialized gateway + local Git sync peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
         # Raise total usage to ~440 MiB without approaching the 512 MiB cap.
         # Observations must not cancel the chat.
         allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,440*1048576-used)); time.sleep(8)"
@@ -113,6 +124,9 @@ async def check_json_rpc_isolation():
 
 asyncio.run(check_native_chat())
 asyncio.run(check_json_rpc_isolation())
+subprocess.check_call(["docker", "exec", CONTAINER, "sh", "-c",
+    "git --git-dir=/tmp/hermes-combined-probe/remote.git show state:data/latest-memory.md >/dev/null && git --git-dir=/tmp/hermes-combined-probe/remote.git cat-file -e state:data/.env.enc"])
+print("Concurrent Git backups reached the fixture repository with encrypted settings", flush=True)
 logs = subprocess.check_output(["docker", "logs", CONTAINER], stderr=subprocess.STDOUT).decode()
 assert "budget_alive=True" in logs, "worker budget has no healthy heartbeat"
 assert "monitor failed" not in logs, "budget monitor failed during normal container operation"

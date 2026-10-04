@@ -1051,6 +1051,10 @@ class TransportTuningTests(unittest.TestCase):
         cmd = fake.calls[0][0]
         self.assertIn(f"http.postBuffer={config.http_post_buffer}", cmd)
         self.assertIn("http.version=HTTP/1.1", cmd)
+        self.assertIn("pack.deltaCacheSize=4m", cmd)
+        self.assertIn("core.deltaBaseCacheLimit=4m", cmd)
+        self.assertIn("core.packedGitWindowSize=4m", cmd)
+        self.assertIn("core.packedGitLimit=32m", cmd)
         self.assertIn(f"http.lowSpeedLimit={config.http_low_speed_limit}", cmd)
         self.assertIn(f"http.lowSpeedTime={config.http_low_speed_time}", cmd)
 
@@ -1350,4 +1354,3 @@ class MidPushChangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -420,6 +420,10 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "gc.auto=0",
         "-c", "pack.threads=1",
         "-c", "pack.windowMemory=16m",
+        "-c", "pack.deltaCacheSize=4m",
+        "-c", "core.deltaBaseCacheLimit=4m",
+        "-c", "core.packedGitWindowSize=4m",
+        "-c", "core.packedGitLimit=32m",
         # Transport tuning for the large pushes this backend makes. See
         # DEFAULT_HTTP_POST_BUFFER_BYTES: without it git chunks the request
         # body and GitHub's front end answers "RPC failed; HTTP 408".
