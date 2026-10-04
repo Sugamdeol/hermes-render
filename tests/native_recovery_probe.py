@@ -83,6 +83,8 @@ async def main():
     runner._run_agent = model
     class HandlerAdapter:
         config = SimpleNamespace(extra={})
+        async def send(self, *args, **kwargs):
+            return SimpleNamespace(success=True, message_id='ci-recovery-response')
         async def handle_message(self, event):
             response = await runner._handle_message(event)
             assert response == 'Recovered task completed', response
