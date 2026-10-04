@@ -542,8 +542,20 @@ def ensure_clone(config: GitConfig) -> Path:
             proc = run_git(["fetch", "--depth", "1", "origin", config.branch],
                            cwd=workdir, check=False, config=config)
             if proc.returncode == 0:
-                run_git(["checkout", "-B", config.branch, "FETCH_HEAD"], cwd=workdir,
-                        config=config)
+                fetched = run_git(["rev-parse", "--verify", "FETCH_HEAD"],
+                                  cwd=workdir, check=False, config=config)
+                current = head_commit(workdir, config)
+                if fetched.returncode == 0 and current == fetched.stdout.strip():
+                    # Do not make Git rewrite a tree that already matches the
+                    # remote. SQLite can create transient -wal/-shm sidecars
+                    # beside an older mirrored database; a no-op checkout can
+                    # still refuse because one of those files looks modified.
+                    # The next sync rebuilds data/ from the source snapshot.
+                    LOG.debug("state branch %s is already current; skipping checkout",
+                              config.branch)
+                else:
+                    run_git(["checkout", "-B", config.branch, "FETCH_HEAD"],
+                            cwd=workdir, config=config)
             return workdir
         LOG.info(
             "state workdir holds a clone of a different repository; starting a "

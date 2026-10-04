@@ -545,6 +545,24 @@ class SeedTests(LocalRemoteTests):
         self.assertEqual(storage.probe_state(self.make_config(workdir=self.root / "w2")),
                          storage.REMOTE_HAS_STATE)
 
+    def test_sync_skips_noop_checkout_with_a_modified_legacy_sqlite_sidecar(self):
+        storage = self.storage
+        data_dir = self._data_dir()
+        sidecar = data_dir / "state.db-shm"
+        sidecar.write_bytes(b"legacy shared-memory sidecar")
+        config = self.make_config()
+        storage.seed(data_dir, config)
+
+        workdir = storage.ensure_clone(config)
+        mirrored_sidecar = workdir / "data" / "state.db-shm"
+        mirrored_sidecar.write_bytes(b"SQLite changed this transient sidecar")
+        sidecar.unlink()
+
+        # A same-commit checkout is unnecessary and fails on the modified
+        # tracked sidecar. Sync rebuilds data/ from source and removes it.
+        self.assertTrue(storage.sync_once(data_dir, config))
+        self.assertNotIn("data/state.db-shm", self.remote_tree())
+
     def test_state_restored_from_github_on_the_second_launch(self):
         storage = self.storage
         storage.seed(self._data_dir(), self.make_config())
