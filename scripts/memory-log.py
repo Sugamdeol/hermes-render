@@ -5,6 +5,11 @@ import threading
 import time
 import os
 import logging
+import signal
+
+stop = threading.Event()
+signal.signal(signal.SIGTERM, lambda *_: stop.set())
+signal.signal(signal.SIGINT, lambda *_: stop.set())
 
 spec = importlib.util.spec_from_file_location('agent_budget', Path(__file__).with_name('agent-budget.py'))
 budget = importlib.util.module_from_spec(spec)
@@ -31,18 +36,20 @@ def supervise_storage():
     config = storage.GitConfig.from_env()
     if config is None:
         return
-    while True:
+    while not stop.is_set():
         try:
-            storage.run_daemon(Path(os.environ.get('HERMES_HOME', '/opt/data')), config)
+            storage.run_daemon(Path(os.environ.get('HERMES_HOME', '/opt/data')), config, stop=stop)
             return
         except Exception as error:
             print(f'[hermes-git-state] sync thread failed ({type(error).__name__}); retrying in 10s', flush=True)
-            time.sleep(10)
+            stop.wait(10)
 
+storage_thread = None
 if os.environ.get('HERMES_GIT_SYNC_IN_PROCESS') == '1':
-    threading.Thread(target=supervise_storage, daemon=True).start()
+    storage_thread = threading.Thread(target=supervise_storage, daemon=True)
+    storage_thread.start()
 
-while True:
+while not stop.is_set():
     try:
         used, noncache = budget.container_memory()
         stats = dict(line.split() for line in Path('/sys/fs/cgroup/memory.stat').read_text().splitlines())
@@ -65,4 +72,8 @@ while True:
         print(f'[memory] cgroup={used/1048576:.1f}MiB noncache={noncache/1048576:.1f}MiB anon={anon:.1f}MiB file={file_cache:.1f}MiB inactive_file={inactive_file:.1f}MiB; budget_alive={healthy} mode={budget.STATUS["mode"]} workers={budget.STATUS["workers"]} workersRSS={budget.STATUS["rss"]/1048576:.1f}MiB; {top}', flush=True)
     except (OSError, ValueError):
         pass
-    time.sleep(30)
+    stop.wait(30)
+
+# Preserve the standalone daemon's final push and lease release on shutdown.
+if storage_thread is not None:
+    storage_thread.join(timeout=20)
