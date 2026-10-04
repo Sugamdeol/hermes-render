@@ -105,4 +105,6 @@ The runtime now shares Git delta sync and memory diagnostics in one Python proce
 
 An unconfigured image-managed Render MCP entry is removed so it does not trigger unnecessary SDK imports or discovery. User-configured MCP servers and authenticated Render entries remain available.
 
+Ordinary browser chat starts the full slash-command CLI subprocess only on the first slash command, rather than eagerly duplicating its imports for every chat.
+
 Memory logs report `mode=observe`. They measure usage without killing agents. CI includes a real native browser message and model response against a local deterministic test provider, thread creation under heap load, gateway initialization, Git storage tests, process-tree cleanup and a 512 MB container without swap. These checks do not prove every research task or tool fits the free instance.

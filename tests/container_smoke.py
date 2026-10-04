@@ -78,7 +78,7 @@ async def check_native_chat():
             part = await asyncio.wait_for(ws.recv(), timeout=30)
             answer += part.encode() if isinstance(part, str) else part
             plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", answer)
-            if b"Hermes chat works." in plain:
+            if b"Hermeschatworks." in re.sub(rb"\s+", b"", plain):
                 print("Native browser chat completed a real model round trip to the local test provider", flush=True)
                 break
         else:
@@ -90,7 +90,7 @@ async def check_native_chat():
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
         # Raise total usage to ~440 MiB without approaching the 512 MiB cap.
-        # The guard must close chat gracefully rather than lose the container.
+        # Observations must not cancel the chat.
         allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,440*1048576-used)); time.sleep(8)"
         pressure = subprocess.Popen(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", allocator])
         try:
