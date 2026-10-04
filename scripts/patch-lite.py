@@ -186,7 +186,7 @@ new = "                text=render_recovery.resume_text(entry.session_key),\n   
 assert old in text, 'durable recovery patch no longer matches pinned source'
 text = text.replace(old, new, 1)
 old = "                self._clear_restart_failure_count(session_key)\n                try:\n"
-new = "                self._clear_restart_failure_count(session_key)\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key)\n                try:\n"
+new = "                self._clear_restart_failure_count(session_key)\n                from hermes_cli import render_recovery\n                try:\n"
 assert old in text, 'durable recovery patch no longer matches pinned source'
 text = text.replace(old, new, 1)
 old = "                and _interruption_is_fresh\n            )\n            _has_fresh_tool_tail"
@@ -205,4 +205,29 @@ old = "        self._schedule_resume_pending_sessions()\n\n        # Drain any r
 new = "        self._schedule_resume_pending_sessions()\n        from hermes_cli import render_recovery\n        recovery_watch = asyncio.create_task(render_recovery.watch(self))\n        self._background_tasks.add(recovery_watch)\n        recovery_watch.add_done_callback(self._background_tasks.discard)\n\n        # Drain any recovered process watchers"
 assert old in text, 'continuous recovery patch no longer matches pinned source'
 text = text.replace(old, new, 1)
+old = '                if bound_session_id and bound_session_id != session_entry.session_id:\n'
+new = '                from hermes_cli import render_recovery\n                if bound_session_id != session_entry.session_id and render_recovery.pending_match(session_entry):\n                    self._record_telegram_topic_binding(source, session_entry)\n                    bound_session_id = session_entry.session_id\n                if bound_session_id and bound_session_id != session_entry.session_id:\n'
+assert old in text, 'topic recovery identity patch no longer matches'
+text = text.replace(old, new, 1)
+# Compression rebinding and transcript commit must precede recovery completion.
+old = "                                    if _hyg_new_sid != session_entry.session_id:\n                                        session_entry.session_id = _hyg_new_sid\n                                        self.session_store._save()"
+new = "                                    if _hyg_new_sid != session_entry.session_id:\n                                        from hermes_cli import render_recovery\n                                        render_recovery.rebind(self.session_store, session_key, _hyg_new_sid, self._session_db)"
+assert old in text, 'hygiene recovery binding patch no longer matches'
+text = text.replace(old, new, 1)
+old = "                if entry:\n                    entry.session_id = agent.session_id\n                    self.session_store._save()"
+new = "                if entry:\n                    from hermes_cli import render_recovery\n                    render_recovery.rebind(self.session_store, session_key, agent.session_id, self._session_db)"
+assert old in text, 'compression recovery binding patch no longer matches'
+text = text.replace(old, new, 1)
+old = "            # Auto voice reply: send TTS audio before the text response"
+new = "            if session_key and _should_clear_resume_pending_after_turn(agent_result):\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key)\n\n" + old
+assert old in text, 'recovery transcript commit patch no longer matches'
+text = text.replace(old, new, 1)
 path.write_text(text)
+
+# An unfinished intent protects the lane even before the periodic scanner runs.
+path = root / 'gateway/session.py'
+text = path.read_text()
+old = '                elif entry.resume_pending:\n'
+new = '                elif entry.resume_pending or __import__("hermes_cli.render_recovery", fromlist=["pending_match"]).pending_match(entry):\n'
+assert old in text, 'unfinished lane expiry patch no longer matches'
+path.write_text(text.replace(old, new, 1))

@@ -10,9 +10,12 @@ from hermes_cli import render_recovery
 async def main():
     runner = GatewayRunner()
     sources = [SessionSource(platform=Platform.TELEGRAM, chat_id='ci-recovery',
-        user_id='ci-user', chat_type='group', thread_id=str(i)) for i in (101, 102, 103)]
+        user_id='ci-user', chat_type='dm', thread_id=str(i)) for i in (101, 102, 103)]
     entries = [runner.session_store.get_or_create_session(source) for source in sources]
     ids = [entry.session_id for entry in entries]
+    runner._session_db.enable_telegram_topic_mode(chat_id='ci-recovery', user_id='ci-user', has_topics_enabled=True, allows_users_to_create_topics=True)
+    for source, entry in zip(sources, entries):
+        runner._record_telegram_topic_binding(source, entry)
     for i, entry in enumerate(entries):
         entry.updated_at = datetime.now() - timedelta(hours=4)
         render_recovery.begin(entry, SimpleNamespace(text=f'Finish notes {i}', internal=False))
@@ -77,6 +80,7 @@ async def main():
     # Exercise the real gateway handler; only model execution is stubbed.
     seen = []
     async def model(**kwargs):
+        assert any(msg.get('content') == 'Saved tool progress: chemistry notes drafted' for msg in kwargs['history']), 'Missing saved history'
         seen.append((kwargs['session_id'], kwargs['message']))
         return {'completed': True, 'final_response': 'Recovered task completed',
             'messages': [], 'api_calls': 1}
@@ -91,6 +95,16 @@ async def main():
     runner.adapters[Platform.TELEGRAM] = HandlerAdapter()
     for i, entry in enumerate(entries):
         render_recovery.begin(entry, SimpleNamespace(text=f'Real handler task {i}', internal=False))
+        compressed = entry.session_id + '-compressed'
+        render_recovery.rebind(runner.session_store, entry.session_key, compressed, runner._session_db)
+        runner.session_store.append_to_transcript(compressed, {'role': 'user', 'content': f'Real handler task {i}'})
+        runner.session_store.append_to_transcript(compressed, {'role': 'assistant', 'content': 'Saved tool progress: chemistry notes drafted'})
+        entry.updated_at = datetime.now() - timedelta(days=3)
+        entry.resume_pending = False
+        runner.session_store._save()
+        assert runner.session_store.get_or_create_session(sources[i]).session_id == compressed
+        binding = runner._session_db.get_telegram_topic_binding(chat_id='ci-recovery', thread_id=sources[i].thread_id)
+        assert binding['session_id'] == compressed
     render_recovery.recover(runner.session_store)
     assert runner._schedule_resume_pending_sessions() == 3
     await asyncio.gather(*list(runner._background_tasks))
@@ -98,7 +112,7 @@ async def main():
     for i, entry in enumerate(entries):
         assert any(sid == entry.session_id and f'Real handler task {i}' in text for sid, text in seen)
         assert not render_recovery.tracked(entry.session_key), 'Successful native handler must clear journal'
-    print('Three original lanes recover through real gateway handler; live retries continue beyond three failures')
+    print('Three private Telegram topic lanes preserve compressed IDs and saved history through real recovery handler')
 
 
 asyncio.run(main())

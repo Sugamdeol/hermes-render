@@ -104,3 +104,19 @@ class RecoveryTests(unittest.TestCase):
         self.entry.session_id = 'selected-new-session'
         self.assertFalse(self.helper['claim'](self.store, self.entry.session_key, original))
         self.assertEqual(self.helper['_read']()[self.entry.session_key]['attempts'], 0)
+
+    def test_manual_continue_preserves_original_task(self):
+        self.helper['begin'](self.entry, self.event)
+        continuation = SimpleNamespace(text='continue', internal=False)
+        self.helper['begin'](self.entry, continuation)
+        record = self.helper['_read']()[self.entry.session_key]
+        self.assertEqual(record['task'], self.event.text)
+        self.assertIn(self.event.text, continuation.text)
+
+    def test_compression_rebind_keeps_recovery_record_and_new_session(self):
+        self.helper['begin'](self.entry, self.event)
+        self.helper['rebind'](self.store, self.entry.session_key, 'compressed-session')
+        self.helper['recover'](self.store)
+        self.assertEqual(self.entry.session_id, 'compressed-session')
+        self.assertEqual(self.helper['_read']()[self.entry.session_key]['session_id'], 'compressed-session')
+        self.assertTrue(self.entry.resume_pending)

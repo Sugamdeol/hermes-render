@@ -52,6 +52,12 @@ def begin(entry, event):
         return
     with _lock:
         data = _read()
+        previous = data.get(entry.session_key)
+        if previous and previous['session_id'] == entry.session_id and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):
+            event.text = resume_text(entry.session_key)
+            previous['next_retry_at'] = 0
+            _write(data)
+            return
         data[entry.session_key] = {'session_id': entry.session_id,
             'task': event.text or '', 'attempts': 0, 'started_at': time.time()}
         _write(data)
@@ -70,6 +76,12 @@ def tracked(session_key):
         return session_key in _read()
 
 
+def pending_match(entry):
+    with _lock:
+        record = _read().get(entry.session_key)
+        return bool(record and record['session_id'] == entry.session_id)
+
+
 def recover(store):
     """Only explicitly unfinished tasks, irrespective of their age."""
     with _lock, store._lock:
@@ -86,6 +98,29 @@ def recover(store):
             entry.last_resume_marked_at = datetime.now()
         _write(data)
         store._save()
+
+
+def rebind(store, session_key, session_id, topic_db=None):
+    """Compression changes the native ID, not the identity of unfinished work."""
+    with _lock, store._lock:
+        store._ensure_loaded_locked()
+        entry = store._entries.get(session_key)
+        if entry is None:
+            return
+        previous_id = entry.session_id
+        data = _read()
+        record = data.get(session_key)
+        if record and record['session_id'] == entry.session_id:
+            record['session_id'] = session_id
+            _write(data)
+        entry.session_id = session_id
+        store._save()
+        source = getattr(entry, 'origin', None)
+        if topic_db is not None and source and source.thread_id:
+            binding = topic_db.get_telegram_topic_binding(chat_id=str(source.chat_id), thread_id=str(source.thread_id))
+            if binding and binding.get('session_id') == previous_id:
+                topic_db.bind_telegram_topic(chat_id=str(source.chat_id), thread_id=str(source.thread_id),
+                    user_id=str(source.user_id or ''), session_key=session_key, session_id=session_id)
 
 
 def priority(session_key):
