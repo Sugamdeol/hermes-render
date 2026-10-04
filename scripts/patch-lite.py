@@ -155,15 +155,7 @@ old = """            # Run the agent
                 channel_prompt=event.channel_prompt,
             )
 """
-new = old.replace("await self._run_agent(", "await self._render_serialized_agent(", 1).replace(
-    "            agent_result = await self._render_serialized_agent(",
-    "            async with self._render_agent_semaphore:\n                agent_result = await self._render_serialized_agent(", 1
-)
-new = new.replace("\n                message=message_text,", "\n                    message=message_text,", 1)
-for field in ("context_prompt", "history", "source", "session_id", "session_key",
-              "run_generation", "event_message_id", "channel_prompt"):
-    new = new.replace(f"\n                {field}=", f"\n                    {field}=", 1)
-new = new.replace("\n            )\n", "\n                )\n", 1)
+new = old.replace("await self._run_agent(", "await self._render_serialized_agent(", 1)
 assert old in text, "gateway turn serialization patch no longer matches pinned source"
 text = text.replace(old, new, 1)
 
@@ -172,7 +164,8 @@ text = text.replace(old, new, 1)
 helper = """
 
 async def _render_serialized_agent(self, *args, **kwargs):
-    return await self._run_agent(*args, **kwargs)
+    async with self._render_agent_semaphore:
+        return await self._run_agent(*args, **kwargs)
 
 
 GatewayRunner._render_serialized_agent = _render_serialized_agent
