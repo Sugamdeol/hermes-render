@@ -43,16 +43,20 @@ class RecoveryTests(unittest.TestCase):
         self.assertTrue(self.entry.resume_pending)
         self.assertEqual(self.entry.resume_reason, 'restart_interrupted')
         self.assertIn(self.event.text, self.helper['resume_text'](self.entry.session_key))
-    def test_retry_exhaustion_pauses_without_resetting_session(self):
+    def test_retries_back_off_without_permanently_pausing(self):
         self.helper['begin'](self.entry, self.event)
-        for _ in range(3):
+        with patch('time.time', return_value=1000):
             self.helper['recover'](self.store)
             self.assertTrue(self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id))
-            self.assertEqual(self.entry.resume_reason, 'restart_interrupted')
-        self.helper['recover'](self.store)
-        self.assertEqual(self.entry.resume_reason, 'render_recovery_paused')
+            self.assertFalse(self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id))
+        for clock in (2000, 3000, 4000, 5000):
+            with patch('time.time', return_value=clock):
+                self.helper['recover'](self.store)
+                self.assertTrue(self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id))
+        self.assertEqual(self.entry.resume_reason, 'restart_interrupted')
         self.assertFalse(self.entry.suspended)
         self.assertEqual(self.entry.session_id, 'original-session')
+
     def test_completed_task_is_not_replayed(self):
         self.helper['begin'](self.entry, self.event)
         self.helper['finish'](self.entry.session_key)

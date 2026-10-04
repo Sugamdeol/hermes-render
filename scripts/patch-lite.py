@@ -201,4 +201,8 @@ old = "            task = asyncio.create_task(adapter.handle_message(event))\n  
 new = "            queued.add(entry.session_key)\n            task = asyncio.create_task(render_recovery.dispatch(self, adapter, entry, event, entry.session_id))\n            self._background_tasks.add(task)\n            task.add_done_callback(self._background_tasks.discard)\n            task.add_done_callback(lambda task, key=entry.session_key: queued.discard(key))\n            scheduled += 1\n"
 assert old in text, 'multi-session recovery patch no longer matches pinned source'
 text = text.replace(old, new, 1)
+old = "        self._schedule_resume_pending_sessions()\n\n        # Drain any recovered process watchers"
+new = "        self._schedule_resume_pending_sessions()\n        from hermes_cli import render_recovery\n        recovery_watch = asyncio.create_task(render_recovery.watch(self))\n        self._background_tasks.add(recovery_watch)\n        recovery_watch.add_done_callback(self._background_tasks.discard)\n\n        # Drain any recovered process watchers"
+assert old in text, 'continuous recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
 path.write_text(text)

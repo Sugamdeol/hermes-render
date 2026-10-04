@@ -10,7 +10,8 @@ import time
 from datetime import datetime
 
 _lock = threading.RLock()
-MAX_RETRIES = 3
+RETRY_BASE_SECONDS = 20
+RETRY_MAX_SECONDS = 300
 
 
 def _path():
@@ -79,7 +80,7 @@ def recover(store):
             if entry is None or entry.suspended or entry.session_id != record['session_id']:
                 del data[key]  # Explicit stop/reset/resume selection wins.
                 continue
-            reason = 'restart_interrupted' if int(record.get('attempts', 0)) < MAX_RETRIES else 'render_recovery_paused'
+            reason = 'restart_interrupted'
             entry.resume_pending = True
             entry.resume_reason = reason
             entry.last_resume_marked_at = datetime.now()
@@ -105,11 +106,11 @@ def claim(store, session_key, session_id):
             return False
         if record is None:
             return False
-        if int(record.get('attempts', 0)) >= MAX_RETRIES:
-            entry.resume_reason = 'render_recovery_paused'
-            store._save()
+        if time.time() < float(record.get('next_retry_at', 0)):
             return False
         record['attempts'] = int(record.get('attempts', 0)) + 1
+        delay = min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * 2 ** min(record['attempts'] - 1, 4))
+        record['next_retry_at'] = time.time() + delay
         _write(data)
         return True
 
@@ -136,6 +137,7 @@ async def dispatch(runner, adapter, entry, event, session_id):
             if not entry.resume_pending or entry.suspended:
                 return
         logging.getLogger(__name__).info('Continuing interrupted session %s', entry.session_key)
+        event.text = resume_text(entry.session_key) or event.text
         await adapter.handle_message(event)
         # Native handle_message only enqueues the turn. Hold our recovery slot
         # until its real background owner (including pending-message drains) ends.
@@ -158,3 +160,16 @@ def resume_text(session_key):
         'files and external state before retrying an action whose outcome is uncertain. '
         'Do not repeat completed actions or invent a new task. If already complete, '
         'report its saved outcome.]\nOriginal task: ' + record['task'])
+
+
+async def watch(runner, interval=10):
+    """Retry failed continuations and late adapters without requiring another restart."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            recover(runner.session_store)
+            runner._schedule_resume_pending_sessions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception('Recovery scan failed; will retry')

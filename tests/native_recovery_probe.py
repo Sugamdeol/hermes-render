@@ -58,20 +58,45 @@ async def main():
         event = next(e for e in events if e.source.thread_id == source.thread_id)
         assert event.internal and f'Finish notes {i}' in event.text
         assert render_recovery._read()[entry.session_key]['attempts'] == 1
-    # One repeatedly crashing lane must not exhaust the others.
-    first = entries[0]
-    for _ in range(2):
-        render_recovery.recover(runner.session_store)
-        assert render_recovery.claim(runner.session_store, first.session_key, first.session_id)
-    render_recovery.recover(runner.session_store)
-    assert first.resume_reason == 'render_recovery_paused'
-    assert runner._schedule_resume_pending_sessions() == 2
+    # Retry a failed continuation in this same live runner after cooldown.
+    with render_recovery._lock:
+        data = render_recovery._read()
+        for entry in entries:
+            data[entry.session_key]['next_retry_at'] = 0
+            data[entry.session_key]['attempts'] = 5
+        render_recovery._write(data)
+    watcher = asyncio.create_task(render_recovery.watch(runner, interval=0.05))
+    await asyncio.sleep(0.25)
+    watcher.cancel()
+    await asyncio.gather(watcher, return_exceptions=True)
     await asyncio.gather(*list(runner._background_tasks))
-    assert runner.session_store.get_or_create_session(sources[0]).session_id == ids[0]
+    assert len(events) == 6, 'Live recovery must continue after more than three failures'
     for entry in entries:
         render_recovery.finish(entry.session_key)
         runner.session_store.clear_resume_pending(entry.session_key)
-    print('All three native Telegram topic sessions recover serially in their original lanes; waiting retries preserved')
+    # Exercise the real gateway handler; only model execution is stubbed.
+    seen = []
+    async def model(**kwargs):
+        seen.append((kwargs['session_id'], kwargs['message']))
+        return {'completed': True, 'final_response': 'Recovered task completed',
+            'messages': [], 'api_calls': 1}
+    runner._run_agent = model
+    class HandlerAdapter:
+        config = SimpleNamespace(extra={})
+        async def handle_message(self, event):
+            response = await runner._handle_message(event)
+            assert response == 'Recovered task completed', response
+    runner.adapters[Platform.TELEGRAM] = HandlerAdapter()
+    for i, entry in enumerate(entries):
+        render_recovery.begin(entry, SimpleNamespace(text=f'Real handler task {i}', internal=False))
+    render_recovery.recover(runner.session_store)
+    assert runner._schedule_resume_pending_sessions() == 3
+    await asyncio.gather(*list(runner._background_tasks))
+    assert len(seen) == 3
+    for i, entry in enumerate(entries):
+        assert any(sid == entry.session_id and f'Real handler task {i}' in text for sid, text in seen)
+        assert not render_recovery.tracked(entry.session_key), 'Successful native handler must clear journal'
+    print('Three original lanes recover through real gateway handler; live retries continue beyond three failures')
 
 
 asyncio.run(main())
