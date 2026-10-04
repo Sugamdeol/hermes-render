@@ -69,7 +69,9 @@ async def check_native_chat():
         except websockets.exceptions.InvalidStatus as error:
             assert error.response.status_code == 403
         await asyncio.sleep(15)
-        await ws.send(b"hello\r")
+        await ws.send(b"hello")
+        await asyncio.sleep(0.5)
+        await ws.send(b"\r")
         answer = b""
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -80,6 +82,7 @@ async def check_native_chat():
                 print("Native browser chat completed a real model round trip to the local test provider", flush=True)
                 break
         else:
+            print("Native TUI output: " + re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", seen + answer).decode(errors="replace")[-18000:], flush=True)
             raise AssertionError("native chat did not complete model response")
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
