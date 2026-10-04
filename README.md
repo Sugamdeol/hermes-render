@@ -117,3 +117,9 @@ Render may expose cgroups read-only. In that case the startup log explicitly say
 Look for `[agent-budget]` and `[memory]` lines after redeploy to see the enforcement mode, cancellations, and process memory. Native dashboard gateway-restart actions also enter the worker budget.
 
 The memory logger now supervises the budget monitor in the same process and restarts it after unexpected errors. The monitor runs as the Hermes UID after cgroup setup so signals do not depend on root retaining `CAP_KILL`. Each memory log includes `budget_alive`, worker RSS, cgroup anonymous memory, file cache and inactive file cache. Total cgroup usage includes cache and cannot be compared directly with the agent-only budget. Cached files may be reclaimed by Linux, so a high total alone is not proof of an agent heap leak.
+
+### Python allocation cap
+
+Python Telegram and browser agent backends now call `resource.setrlimit(RLIMIT_DATA, ...)` with a default hard and soft limit of **192 MiB per process** (`HERMES_PYTHON_DATA_MB`, clamped to 96–256 MiB). Linux refuses data-memory allocations beyond that limit; Python allocations may raise `MemoryError` and native libraries may terminate the worker. Its scope is data memory, not total RSS or the sum of all children. Child tools inherit the limit. Node's launcher and the dashboard do not receive this Python cap. The shared 300 MiB worker watchdog still handles multiple workers.
+
+`HERMES_PYTHON_AS_MB` optionally enables `RLIMIT_AS`; it defaults to `0` (disabled). Virtual address-space reservations and thread stacks make a small blanket address-space limit unsafe for native Hermes/Node startup. These allocation limits reduce sudden-growth risk without promising that all container memory, file cache, or every native allocation path is bounded to 192 MiB.

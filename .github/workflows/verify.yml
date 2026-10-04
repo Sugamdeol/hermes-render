@@ -16,6 +16,9 @@ jobs:
         run: |
           docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
           python tests/container_smoke.py
+      - name: Verify native gateway starts with Python allocation cap
+        run: |
+          docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python -c 'from gateway.run import GatewayRunner; import resource; runner=GatewayRunner(); assert resource.getrlimit(resource.RLIMIT_DATA)==(192*1048576,192*1048576); print("Native gateway constructed under 192 MiB allocation cap")'
       - name: Verify repeated PTY process-tree cleanup
         run: |
           docker cp tests/pty_cleanup_probe.py hermes-lite:/tmp/pty_cleanup_probe.py

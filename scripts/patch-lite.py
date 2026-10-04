@@ -158,3 +158,18 @@ old = "            if chunk is None:  # EOF\n                return"
 new = "            if chunk is None:  # EOF\n                try:\n                    await ws.close(code=1013)\n                except Exception:\n                    pass\n                return"
 assert old in text, "PTY EOF patch no longer matches pinned source"
 path.write_text(text.replace(old, new, 1))
+
+# Apply allocation limits inside Python agent backends, never the Node launcher.
+(root / "hermes_cli/render_memory.py").write_text(Path(__file__).with_name("worker-memory.py").read_text())
+path = root / "gateway/run.py"
+text = path.read_text()
+old = "    def __init__(self, config: Optional[GatewayConfig] = None):\n"
+new = old + "        from hermes_cli.render_memory import apply_worker_limit\n        apply_worker_limit()\n"
+assert old in text, "gateway allocation limit patch no longer matches pinned source"
+path.write_text(text.replace(old, new, 1))
+path = root / "tui_gateway/entry.py"
+text = path.read_text()
+old = "from tui_gateway import server\n"
+new = "from hermes_cli.render_memory import apply_worker_limit\napply_worker_limit()\n\n" + old
+assert old in text, "TUI allocation limit patch no longer matches pinned source"
+path.write_text(text.replace(old, new, 1))
