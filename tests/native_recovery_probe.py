@@ -9,6 +9,23 @@ from hermes_cli import render_recovery
 
 async def main():
     runner = GatewayRunner()
+    active_turns = 0
+    peak_turns = 0
+    async def counted_turn(**kwargs):
+        nonlocal active_turns, peak_turns
+        active_turns += 1
+        peak_turns = max(peak_turns, active_turns)
+        try:
+            await asyncio.sleep(0.03)
+            return kwargs['sequence']
+        finally:
+            active_turns -= 1
+    runner._run_agent = counted_turn
+    results = await asyncio.gather(*(
+        runner._render_serialized_agent(sequence=index) for index in range(3)
+    ))
+    assert results == [0, 1, 2] and peak_turns == 1, 'Gateway ran multiple agent turns at once'
+
     sources = [SessionSource(platform=Platform.TELEGRAM, chat_id='ci-recovery',
         user_id='ci-user', chat_type='dm', thread_id=str(i)) for i in (101, 102, 103)]
     entries = [runner.session_store.get_or_create_session(source) for source in sources]
@@ -114,7 +131,7 @@ async def main():
     for i, entry in enumerate(entries):
         assert any(sid == entry.session_id and f'Real handler task {i}' in text for sid, text in seen)
         assert not render_recovery.tracked(entry.session_key), 'Successful native handler must clear journal'
-    print('Three private Telegram topic lanes preserve compressed IDs and saved history through real recovery handler')
+    print('Three Telegram topic lanes recover with saved history; gateway agent turns stay serialized')
 
 
 asyncio.run(main())

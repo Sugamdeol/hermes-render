@@ -69,7 +69,11 @@ GPU/ML runtimes, or unrelated channel SDKs. Those optional tools may need a larg
 instance and additional packages. Existing user skills remain available; a skill
 that depends on an omitted optional package cannot run until that package is added.
 
-One native browser chat is allowed at a time. The agent cache holds one session
+One native browser chat is allowed at a time. Gateway agent turns also run one
+at a time across chats; incoming sessions wait with their own transcript and
+task state intact, then run when the active turn releases the slot. This keeps
+several simultaneous Telegram sessions from multiplying the agent working set.
+The agent cache holds one session
 with a 30-second idle timeout, and native library threads default to one. These settings reduce baseline memory; arbitrary terminal jobs,
 large uploads, plugins or tool workloads can still exceed 512 MB.
 

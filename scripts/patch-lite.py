@@ -134,9 +134,53 @@ path.write_text(text.replace(old, new, 1))
 path = root / "gateway/run.py"
 text = path.read_text()
 old = "    def __init__(self, config: Optional[GatewayConfig] = None):\n"
-new = old + "        from hermes_cli.render_memory import apply_worker_limit\n        apply_worker_limit()\n"
+new = old + "        self._render_agent_semaphore = asyncio.Semaphore(1)\n        from hermes_cli.render_memory import apply_worker_limit\n        apply_worker_limit()\n"
 assert old in text, "gateway allocation limit patch no longer matches pinned source"
-path.write_text(text.replace(old, new, 1))
+text = text.replace(old, new, 1)
+path.write_text(text)
+
+# Avoid cross-chat agent bursts on the 512 MiB service. Incoming lanes keep
+# their own session state while waiting; the semaphore is held for the full
+# agent turn, including its tool loop and pending-message drains.
+old = """            # Run the agent
+            agent_result = await self._run_agent(
+                message=message_text,
+                context_prompt=context_prompt,
+                history=history,
+                source=source,
+                session_id=session_entry.session_id,
+                session_key=session_key,
+                run_generation=run_generation,
+                event_message_id=event.message_id,
+                channel_prompt=event.channel_prompt,
+            )
+"""
+new = old.replace("await self._run_agent(", "await self._render_serialized_agent(", 1).replace(
+    "            agent_result = await self._render_serialized_agent(",
+    "            async with self._render_agent_semaphore:\n                agent_result = await self._render_serialized_agent(", 1
+)
+new = new.replace("\n                message=message_text,", "\n                    message=message_text,", 1)
+for field in ("context_prompt", "history", "source", "session_id", "session_key",
+              "run_generation", "event_message_id", "channel_prompt"):
+    new = new.replace(f"\n                {field}=", f"\n                    {field}=", 1)
+new = new.replace("\n            )\n", "\n                )\n", 1)
+assert old in text, "gateway turn serialization patch no longer matches pinned source"
+text = text.replace(old, new, 1)
+
+# Keep recursion inside an already-held turn; only the initial turn entry
+# acquires the semaphore, so native pending-message follow-ups cannot deadlock.
+helper = """
+
+async def _render_serialized_agent(self, *args, **kwargs):
+    return await self._run_agent(*args, **kwargs)
+
+
+GatewayRunner._render_serialized_agent = _render_serialized_agent
+"""
+entrypoint = 'if __name__ == "__main__":\n    main()'
+assert entrypoint in text, "gateway CLI entrypoint patch no longer matches pinned source"
+text = text.replace(entrypoint, helper + "\n" + entrypoint, 1)
+path.write_text(text)
 path = root / "tui_gateway/entry.py"
 text = path.read_text()
 old = "from tui_gateway import server\n"
