@@ -69,7 +69,8 @@ new = '''_lite_pty_lock = asyncio.Lock()
 async def pty_ws(ws: WebSocket) -> None:
     # Reserve room for Node plus Python before admitting another agent.
     try:
-        used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+        from hermes_cli.render_memory import container_memory
+        _, used = container_memory()
     except (OSError, ValueError):
         used = 0
     if used > 320 * 1024 * 1024:
@@ -83,7 +84,7 @@ async def pty_ws(ws: WebSocket) -> None:
             while True:
                 await asyncio.sleep(1)
                 try:
-                    used = int(Path("/sys/fs/cgroup/memory.current").read_text())
+                    _, used = container_memory()
                 except (OSError, ValueError):
                     continue
                 if used > 400 * 1024 * 1024:

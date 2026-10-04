@@ -21,7 +21,7 @@ threading.Thread(target=supervise_budget, daemon=True).start()
 
 while True:
     try:
-        used = int(Path('/sys/fs/cgroup/memory.current').read_text())
+        used, noncache = budget.container_memory()
         stats = dict(line.split() for line in Path('/sys/fs/cgroup/memory.stat').read_text().splitlines())
         anon = int(stats.get('anon', 0)) / 1048576
         file_cache = int(stats.get('file', 0)) / 1048576
@@ -39,7 +39,7 @@ while True:
                 continue
         top = ', '.join(f'{name}[{pid}]={rss/1024:.1f}MiB' for rss, pid, name in sorted(processes, reverse=True)[:8])
         healthy = time.monotonic() - budget.STATUS['heartbeat'] < 5
-        print(f'[memory] cgroup={used/1048576:.1f}MiB anon={anon:.1f}MiB file={file_cache:.1f}MiB inactive_file={inactive_file:.1f}MiB; budget_alive={healthy} mode={budget.STATUS["mode"]} workers={budget.STATUS["workers"]} workersRSS={budget.STATUS["rss"]/1048576:.1f}MiB; {top}', flush=True)
+        print(f'[memory] cgroup={used/1048576:.1f}MiB noncache={noncache/1048576:.1f}MiB anon={anon:.1f}MiB file={file_cache:.1f}MiB inactive_file={inactive_file:.1f}MiB; budget_alive={healthy} mode={budget.STATUS["mode"]} workers={budget.STATUS["workers"]} workersRSS={budget.STATUS["rss"]/1048576:.1f}MiB; {top}', flush=True)
     except (OSError, ValueError):
         pass
     time.sleep(30)

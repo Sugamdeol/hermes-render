@@ -68,9 +68,9 @@ async def check_native_chat():
         await asyncio.sleep(15)
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
-        # Raise total usage to ~420 MiB without approaching the 512 MiB cap.
+        # Raise total usage to ~440 MiB without approaching the 512 MiB cap.
         # The guard must close chat gracefully rather than lose the container.
-        allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,420*1048576-used)); time.sleep(8)"
+        allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,440*1048576-used)); time.sleep(8)"
         pressure = subprocess.Popen(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", allocator])
         try:
             deadline = time.monotonic() + 20

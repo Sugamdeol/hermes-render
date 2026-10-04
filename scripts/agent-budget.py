@@ -11,6 +11,9 @@ import pwd
 import subprocess
 import sys
 import time
+import runpy
+
+container_memory = runpy.run_path(Path(__file__).with_name("worker-memory.py"))["container_memory"]
 
 REGISTRY = Path(os.environ.get('HERMES_WORKER_REGISTRY', '/tmp/hermes-agent-workers'))
 CGROUP = Path(os.environ.get('HERMES_AGENT_CGROUP', '/sys/fs/cgroup/hermes-workers'))
@@ -141,16 +144,13 @@ def monitor():
         tracked = {pid: (table[pid][2], role) for pid, role in selected.items()}
         usage = sum(table[pid][3] for pid in selected)
         STATUS.update(heartbeat=time.monotonic(), workers=len(selected), rss=usage)
-        try:
-            total = int(Path(os.environ.get('HERMES_TOTAL_MEMORY_FILE', '/sys/fs/cgroup/memory.current')).read_text())
-        except (OSError, ValueError):
-            total = 0
+        total, noncache = container_memory()
         # RSS counts shared pages conservatively in watchdog mode. A hard
         # cgroup accounts the worker group accurately in the kernel instead.
-        if (not hard and usage > BUDGET) or total > 430 * MIB:
+        if (not hard and usage > BUDGET) or noncache > 430 * MIB:
             role = 'chat' if 'chat' in selected.values() else 'gateway'
             if selected:
-                print(f'[agent-budget] workersRSS={usage/MIB:.1f}MiB container={total/MIB:.1f}MiB', flush=True)
+                print(f'[agent-budget] workersRSS={usage/MIB:.1f}MiB container={total/MIB:.1f}MiB noncache={noncache/MIB:.1f}MiB', flush=True)
                 stop_workers(table, selected, role)
         time.sleep(0.2)
 

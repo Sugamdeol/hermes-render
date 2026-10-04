@@ -14,6 +14,27 @@ spec.loader.exec_module(budget)
 
 
 class AgentBudgetTests(unittest.TestCase):
+    def test_gateway_survives_cache_heavy_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            current = Path(tmp) / 'memory.current'
+            current.write_text(str(510 * 1048576))
+            (Path(tmp) / 'memory.stat').write_text('file ' + str(384 * 1048576) + '\ninactive_file 0\n')
+            env = {**os.environ, 'HERMES_WORKER_REGISTRY': tmp + '/workers', 'HERMES_AGENT_CGROUP': '/proc/hermes-no-delegation', 'HERMES_TOTAL_MEMORY_FILE': str(current)}
+            monitor = subprocess.Popen([sys.executable, str(SCRIPT), 'monitor'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            worker = subprocess.Popen([sys.executable, str(SCRIPT), 'run', 'gateway', sys.executable, '-c', 'import time; time.sleep(30)'], env=env, start_new_session=True)
+            try:
+                time.sleep(2)
+                self.assertIsNone(worker.poll(), 'cache alone killed the gateway')
+                self.assertIsNone(monitor.poll())
+                # Real non-cache pressure must still shed the worker.
+                (Path(tmp) / 'memory.stat').write_text('file ' + str(60 * 1048576) + '\n')
+                self.assertEqual(worker.wait(timeout=5), -9)
+            finally:
+                worker.kill()
+                worker.wait()
+                monitor.kill()
+                monitor.wait()
+
     def test_descendants_and_detached_tracked_children(self):
         table = {10: (1, 10, '100', 10), 11: (10, 10, '101', 20), 12: (1, 12, '102', 30), 20: (1, 20, '200', 40)}
         selected = budget.descendants(table, {10: 'chat'}, {12: ('102', 'chat'), 20: ('old-pid', 'gateway')})
