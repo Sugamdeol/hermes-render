@@ -1,6 +1,8 @@
 import importlib.util
 import os
 from pathlib import Path
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -62,3 +64,78 @@ class EncryptedRestoreTests(unittest.TestCase):
             self.assertEqual((restored / "artifact.bin").stat().st_size, artifact.stat().st_size)
             with (restored / "artifact.bin").open("rb") as handle:
                 self.assertEqual(handle.read(17), b"workspace payload")
+
+    def test_encrypted_sqlite_snapshot_roundtrip_handles_multiple_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"STORAGE_ENCRYPTION_KEY": "test-only-key"}):
+            root = Path(tmp)
+            data, work, restored = root / "local", root / "work", root / "restored"
+            for p in (data, work, restored):
+                p.mkdir()
+            config = storage.GitConfig(repo="owner/repo", token="test", env_mode="encrypt",
+                                       workdir=work)
+            db_path = data / "state.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body BLOB)")
+            conn.execute("INSERT INTO messages(body) VALUES (zeroblob(2300000))")
+            conn.commit()
+            storage.build_worktree(data, work, config)
+
+            cipher_path = work / "data/state.db.enc"
+            self.assertTrue(cipher_path.exists())
+            self.assertFalse((work / "data/state.db").exists())
+            self.assertFalse(Path(str(work / "data/state.db") + "-wal").exists())
+            with cipher_path.open("rb") as handle:
+                self.assertEqual(handle.read(len(storage._STREAM_SEALED_PREFIX)), storage._STREAM_SEALED_PREFIX)
+            first_ciphertext = cipher_path.read_bytes()
+            storage._write_sync_base(config, "checkpoint", "fingerprint",
+                                     config._sqlite_hashes)
+            storage.build_worktree(data, work, config)
+            self.assertEqual((work / "data/state.db.enc").read_bytes(), first_ciphertext,
+                             "unchanged SQLite content should reuse ciphertext and avoid needless commits")
+            storage.materialize(work, restored, config)
+            restored_conn = sqlite3.connect(restored / "state.db")
+            try:
+                length = restored_conn.execute("SELECT length(body) FROM messages").fetchone()[0]
+                self.assertEqual(length, 2300000)
+            finally:
+                restored_conn.close()
+                conn.close()
+            storage._write_sync_base(config, "checkpoint", "fingerprint",
+                                     storage._sqlite_fingerprints(restored))
+            storage.build_worktree(restored, work, config)
+            self.assertEqual((work / "data/state.db.enc").read_bytes(), first_ciphertext,
+                             "restore followed by sync should not churn encrypted database commits")
+
+    def test_streamed_sqlite_ciphertext_tampering_fails_closed(self):
+        config = storage.GitConfig(repo="owner/repo", token="test", env_mode="encrypt")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"STORAGE_ENCRYPTION_KEY": "test-only-key"}):
+            root = Path(tmp)
+            source, sealed, opened = root / "source", root / "sealed", root / "opened"
+            source.write_bytes(b"sensitive database page" * 70000)
+            storage.encrypt_stream_file(source, sealed, config)
+            ciphertext = bytearray(sealed.read_bytes())
+            ciphertext[-20] ^= 1
+            sealed.write_bytes(ciphertext)
+            with self.assertRaises(Exception):
+                storage.decrypt_stream_file(sealed, opened, config)
+            self.assertFalse(opened.exists())
+
+    def test_age_identity_temp_file_is_removed_after_decrypt(self):
+        config = storage.GitConfig(repo="owner/repo", token="test")
+        created = []
+
+        def fake_run(args, **kwargs):
+            identity = Path(args[args.index("-i") + 1])
+            created.append(identity)
+            self.assertTrue(identity.exists())
+            self.assertEqual(identity.read_text().strip(), "AGE-SECRET-KEY-test")
+            return subprocess.CompletedProcess(args, 0, b"opened", b"")
+
+        with patch.dict(os.environ, {"SOPS_AGE_KEY": "AGE-SECRET-KEY-test"}), \
+             patch.object(storage.shutil, "which", return_value="/usr/bin/age"), \
+             patch.object(storage.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(storage.age_decrypt(b"age1ciphertext", config), b"opened")
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists())

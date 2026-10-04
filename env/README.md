@@ -37,3 +37,4 @@ The age private key, `~/.config/sops/age/keys.txt`, or any decrypted copy of
 `secrets.enc.env`. `.gitignore` covers the obvious filenames, but the
 protection that actually matters is not creating plaintext copies inside the
 repo in the first place.
+

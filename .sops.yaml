@@ -16,3 +16,4 @@ creation_rules:
   - path_regex: env/secrets\.enc\.env$
     # Replaced by `./run-local.sh secrets init`.
     age: REPLACE_WITH_AGE_RECIPIENT
+

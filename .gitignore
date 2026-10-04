@@ -47,3 +47,4 @@ npm-debug.log*
 
 # Local upstream clone used during template development.
 .hermes-upstream/
+.upstream-*.txt

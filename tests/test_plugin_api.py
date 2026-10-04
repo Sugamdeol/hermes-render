@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import importlib.util
+import json
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -59,8 +62,8 @@ class _FakeURLResponse:
     def __exit__(self, *args):
         return False
 
-    def read(self):
-        return self.body
+    def read(self, size=-1):
+        return self.body if size is None or size < 0 else self.body[:size]
 
 
 def _install_stubs(
@@ -239,40 +242,30 @@ class ModelDiscoveryTests(unittest.TestCase):
         self.assertEqual(requests[0].get_header("Authorization"), "Bearer env-secret")
         self.assertEqual(requests[1].full_url, "https://llm.example.com/v1/models")
 
-    def test_listing_fetches_models_for_each_custom_provider(self):
-        responses = iter(
-            [
-                _FakeURLResponse({"data": [{"id": "provider-a-model"}]}),
-                _FakeURLResponse({"data": [{"id": "provider-b-model"}]}),
-            ]
-        )
+    def test_provider_listing_does_not_make_network_requests(self):
+        with patch.object(self.mod.urllib.request, "urlopen",
+                          side_effect=AssertionError("listing must not probe providers")):
+            entries = self.mod.list_custom_provider_entries(
+                {"providers": {"p": {"name": "Provider", "base_url": "https://a.example/v1"}}},
+                fetch_models=False,
+            )
+        self.assertEqual(entries[0]["name"], "Provider")
 
-        with patch.dict("os.environ", {"PROVIDER_A_KEY": "a-secret"}, clear=False):
-            with patch.object(
-                self.mod.urllib.request, "urlopen", side_effect=lambda request, timeout: next(responses)
-            ):
-                entries = self.mod.list_custom_provider_entries(
-                    {
-                        "providers": {
-                            "provider-a": {
-                                "name": "Provider A",
-                                "base_url": "https://a.example/v1",
-                                "key_env": "PROVIDER_A_KEY",
-                            },
-                            "provider-b": {
-                                "name": "Provider B",
-                                "base_url": "http://127.0.0.1:8000/v1",
-                            },
-                        }
-                    },
-                    fetch_models=True,
-                )
+    def test_model_discovery_reads_at_most_one_megabyte_plus_one(self):
+        sizes = []
 
-        self.assertEqual([entry["models"] for entry in entries], [
-            ["provider-a-model"],
-            ["provider-b-model"],
-        ])
-        self.assertTrue(all(entry["models_fetched"] for entry in entries))
+        class LargeResponse(_FakeURLResponse):
+            def read(self, size=-1):
+                sizes.append(size)
+                return b"x" * size
+
+        with patch.object(self.mod.urllib.request, "urlopen",
+                          return_value=LargeResponse({})):
+            result = self.mod.fetch_custom_provider_models(
+                {"base_url": "https://models.example/v1"}
+            )
+        self.assertIsNone(result)
+        self.assertEqual(sizes, [self.mod.MAX_PROVIDER_RESPONSE_BYTES + 1])
 
 
 class ListEntriesTests(unittest.TestCase):
@@ -398,6 +391,21 @@ class UpsertTests(unittest.TestCase):
         self.assertEqual(entry["key_env"], "TOGETHER_API_KEY")
         self.assertEqual(entry["models"], {"gpt-4o": {"context_length": 128000}})
 
+    def test_clear_api_key_removes_canonical_and_legacy_key_fields(self):
+        config = {
+            "providers": {"local": {"name": "Local", "base_url": "https://x.example/v1",
+                                     "api_key": "old-secret"}},
+            "custom_providers": [{"name": "Local", "base_url": "https://x.example/v1",
+                                  "key": "legacy-secret"}],
+        }
+        fields = {"name": "Local", "base_url": "https://x.example/v1", "api_key": "",
+                  "clear_api_key": True, "key_env": "", "api_mode": "", "model": "",
+                  "key": "local"}
+        self.mod.upsert_custom_provider_entry(config, fields)
+        self.assertNotIn("api_key", config["providers"]["local"])
+        self.assertNotIn("key", config["providers"]["local"])
+        self.assertNotIn("key", config["custom_providers"][0])
+
     def test_key_collision_with_different_name_rejected(self):
         config = {"providers": {"other": {"name": "Other", "base_url": "https://a.example/v1"}}}
         with self.assertRaises(LookupError):
@@ -482,6 +490,51 @@ class RouteTests(unittest.TestCase):
             call_route(handler, self.request)
         self.assertEqual(caught.exception.status_code, 401)
 
+    def test_storage_status_requires_token(self):
+        _install_stubs(self.env, token_ok=False)
+        handler = self._routes()[("GET", "/storage-status")]
+        with self.assertRaises(_FakeHTTPException) as caught:
+            call_route(handler, self.request)
+        self.assertEqual(caught.exception.status_code, 401)
+
+    def test_storage_status_reports_error_without_secrets(self):
+        handler = self._routes()[("GET", "/storage-status")]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"GIT_STATE_REPO": "owner/private", "GIT_STATE_TOKEN": "ghp_never-return-this",
+                                     "GIT_STATE_STATUS_FILE": str(Path(directory) / "status.json")}):
+            Path(directory, "status.json").write_text(json.dumps({
+                "state": "error", "updated_at": "now", "last_success_at": "before",
+                "error": "git push failed: sanitized",
+            }))
+            result = call_route(handler, self.request)
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["last_success_at"], "before")
+        self.assertNotIn("ghp_never-return-this", json.dumps(result))
+
+    def test_recovery_status_hides_task_text_and_chat_ids(self):
+        handler = self._routes()[("GET", "/recovery-status")]
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"HERMES_HOME": directory}):
+            Path(directory, ".render-recovery.json").write_text(json.dumps({
+                "telegram:private-chat-123": {
+                    "session_id": "secret-session-id", "task": "private chemistry research",
+                    "attempts": 2, "next_retry_at": 0,
+                }
+            }))
+            result = call_route(handler, self.request)
+        self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(result["sessions"][0]["platform"], "telegram")
+        self.assertEqual(result["sessions"][0]["attempts"], 2)
+        for secret in ("private-chat-123", "secret-session-id", "private chemistry research"):
+            self.assertNotIn(secret, json.dumps(result))
+
+    def test_recovery_status_requires_token(self):
+        _install_stubs(self.env, token_ok=False)
+        handler = self._routes()[("GET", "/recovery-status")]
+        with self.assertRaises(_FakeHTTPException) as caught:
+            call_route(handler, self.request)
+        self.assertEqual(caught.exception.status_code, 401)
+
     def test_list_returns_providers_and_main(self):
         self.env["config_state"] = {
             "providers": {
@@ -497,6 +550,17 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(result["main_provider"], "custom:bynara")
         self.assertEqual(len(result["providers"]), 1)
         self.assertEqual(result["providers"][0]["key"], "bynara")
+
+    def test_provider_route_listing_does_not_probe_custom_endpoints(self):
+        self.env["config_state"] = {
+            "providers": {"local": {"name": "Local", "base_url": "https://x.example/v1"}}
+        }
+        self.mod = load_plugin_api(self.env)
+        handler = self.mod.router.routes[("GET", "/custom-providers")]
+        with patch.object(self.mod.urllib.request, "urlopen",
+                          side_effect=AssertionError("page load must not block on a provider")):
+            result = call_route(handler, self.request)
+        self.assertEqual(result["providers"][0]["name"], "Local")
 
     def test_add_provider_persists_and_reports_ref(self):
         handler = self._routes()[("POST", "/custom-providers")]
@@ -516,6 +580,19 @@ class RouteTests(unittest.TestCase):
         self.assertIn("together", self.env["saved"][0]["providers"])
         # Raw keys must never be echoed back.
         self.assertNotIn("api_key", result)
+
+    def test_provider_route_can_clear_saved_api_key(self):
+        self.env["config_state"] = {
+            "providers": {"local": {"name": "Local", "base_url": "https://x.example/v1",
+                                     "api_key": "stored-secret"}}
+        }
+        self.mod = load_plugin_api(self.env)
+        handler = self._routes()[("POST", "/custom-providers")]
+        result = call_route(handler, self.request, {
+            "name": "Local", "base_url": "https://x.example/v1", "clear_api_key": True,
+        })
+        self.assertTrue(result["ok"])
+        self.assertNotIn("api_key", self.env["saved"][0]["providers"]["local"])
 
     def test_add_provider_validates_input(self):
         handler = self._routes()[("POST", "/custom-providers")]

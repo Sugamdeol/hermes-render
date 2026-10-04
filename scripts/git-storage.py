@@ -9,7 +9,7 @@ moves a few kilobytes, rather than a whole-archive upload of the entire tree.
 Layout in the state repo (default branch ``state``):
 
     data/            mirror of $HERMES_HOME, minus excluded paths
-    data/.env.enc    the dotenv, age-encrypted (never plaintext)
+    data/.env.enc    encrypted dotenv when GIT_STATE_ENV_MODE=encrypt
     MANIFEST.json    instance id, timestamp, and what transforms were applied
 
 The manifest also carries the parts of the tree git cannot hold by itself: the
@@ -51,29 +51,29 @@ Safety rules this module enforces rather than documents:
 
   * It refuses to push to a public repository. /opt/data contains .env, chat
     history, and memories.
-  * It commits .env as the operator asked (GIT_STATE_ENV_MODE, plaintext by
-    default) but only to a repository proven private, and it says so in the
-    log every time it does. encrypt seals it with age; omit leaves it out.
-    Under encrypt, a missing recipient or age binary omits the file -- the
-    one combination that never falls back to plaintext.
+  * Sensitive settings follow GIT_STATE_ENV_MODE. The Render Blueprint uses
+    authenticated encryption; plaintext mode is supported for private repos
+    and logs a warning. Omit leaves the values out, never falling back to
+    plaintext when encryption cannot run.
+  * SQLite databases are backed up with SQLite's online snapshot API so WAL
+    pages are included atomically. Encrypt mode seals snapshots in bounded
+    chunks; omit mode leaves them out.
   * It refuses to seed GitHub over a branch that already holds state, unless
     GIT_STATE_SEED_FORCE=1 says the operator meant it.
   * Tokens are stripped from every log line and exception message.
 
 History is bounded: after GIT_STATE_MAX_COMMITS commits the branch is squashed
-to a single orphan commit and force-pushed, so the repo cannot grow without
-limit even though every sync commits.
+to a single orphan commit and replaced with a force-with-lease push, so the repo
+cannot grow without limit and concurrent changes are not overwritten.
 
 Failover leases ride on Git refs (refs/hermes-lease/<priority>-<id>-<epoch>),
 so checking the cluster is one `git ls-remote` -- no clone, no checkout, a few
 kilobytes. The highest-priority instance with a fresh lease is ACTIVE;
 everyone else is STANDBY and does not push state or answer chat platforms.
 
-The dotenv is part of the backup. GIT_STATE_ENV_MODE=plaintext (the
-default) commits /opt/data/.env verbatim, so the branch is a complete,
-restartable copy of the instance; encrypt seals it with age first and omit
-leaves it out. Plaintext mode is only ever allowed against a repository this
-backend has confirmed is private.
+The dotenv is part of the backup. Render uses GIT_STATE_ENV_MODE=encrypt;
+plaintext remains available for a repository proven private, while omit leaves
+the file out. Old plaintext commits cannot be erased by changing this setting.
 """
 from __future__ import annotations
 
@@ -85,15 +85,19 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
+import sqlite3
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 LOG = logging.getLogger("hermes-git-storage")
 
@@ -642,7 +646,8 @@ def remote_ref_sha(config: GitConfig) -> str:
     return proc.stdout.split()[0]
 
 
-def push_branch(workdir: Path, config: GitConfig, *, force: bool = False) -> None:
+def push_branch(workdir: Path, config: GitConfig, *, force: bool = False,
+                force_lease_sha: str | None = None) -> None:
     """Push the state branch, retrying, and trusting the remote over git.
 
     Two things make a bare `git push` unreliable for the payload this backend
@@ -659,7 +664,11 @@ def push_branch(workdir: Path, config: GitConfig, *, force: bool = False) -> Non
     detail = ""
     for attempt in range(1, config.push_attempts + 1):
         args = ["push"]
-        if force:
+        if force_lease_sha:
+            args.append(
+                f"--force-with-lease=refs/heads/{config.branch}:{force_lease_sha}"
+            )
+        elif force:
             args.append("--force")
         args += ["origin", config.branch]
         proc = run_git(args, cwd=workdir, check=False, config=config)
@@ -749,6 +758,82 @@ def state_fingerprint(data_dir: Path) -> str:
                 f"F\\0{relative}\\0{info.st_size}\\0{info.st_mtime_ns}\\0{info.st_mode & 0o7777}\\n".encode()
             )
     return digest.hexdigest()
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _sqlite_fingerprints(data_dir: Path) -> dict[str, str]:
+    planned, _empty, _links = plan_tree(data_dir, DEFAULT_EXCLUDES)
+    databases, _sidecars = sqlite_files(data_dir, planned)
+    result = {}
+    for relative in sorted(databases):
+        try:
+            result[relative] = _hash_file(data_dir / relative)
+        except OSError:
+            continue
+    return result
+
+
+def _sync_base_path(config: GitConfig) -> Path:
+    """The restore/push checkpoint shared by bootstrap and the sync daemon."""
+    override = os.environ.get("GIT_STATE_BASE_FILE", "").strip()
+    return Path(override) if override else Path(str(config.workdir) + ".base.json")
+
+
+def _remote_identity(config: GitConfig) -> str:
+    """Stable remote identity without the token embedded in HTTPS URLs."""
+    raw = config.remote_url
+    try:
+        parsed = urlsplit(raw)
+        if parsed.scheme in ("http", "https") and parsed.hostname:
+            host = parsed.hostname.lower()
+            if parsed.port:
+                host += f":{parsed.port}"
+            return f"{parsed.scheme.lower()}://{host}{parsed.path}"
+    except ValueError:
+        pass
+    return raw
+
+
+def _read_sync_base(config: GitConfig) -> dict | None:
+    try:
+        value = json.loads(_sync_base_path(config).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(value, dict) or value.get("repo") != config.api_repo
+            or value.get("remote") != _remote_identity(config)
+            or value.get("branch") != config.branch):
+        return None
+    return value
+
+
+def _write_sync_base(config: GitConfig, remote_sha: str, local_fingerprint: str,
+                     sqlite_hashes: dict[str, str] | None = None) -> None:
+    """Atomically record which remote revision this local tree came from."""
+    path = _sync_base_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".state-base-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"repo": config.api_repo, "remote": _remote_identity(config),
+                       "branch": config.branch,
+                       "remote_sha": remote_sha, "local_fingerprint": local_fingerprint,
+                       "sqlite_hashes": sqlite_hashes or {}}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
 
 
 class ChangeWatcher:
@@ -945,6 +1030,172 @@ def plan_tree(data_dir: Path,
     return sorted(files), empty_dirs, symlinks
 
 
+_SQLITE_HEADER = b"SQLite format 3\x00"
+_STREAM_SEALED_PREFIX = b"HERMES-AESGCM-STREAM-v1\n"
+_STREAM_CHUNK_BYTES = 1024 * 1024
+
+
+def sqlite_files(root: Path, relative_paths) -> tuple[set[str], set[str]]:
+    """Return SQLite database paths and their live WAL/SHM sidecars."""
+    paths = set(relative_paths)
+    databases: set[str] = set()
+    sidecars: set[str] = set()
+    for relative in paths:
+        if not relative.lower().endswith((".db", ".sqlite", ".sqlite3")):
+            continue
+        try:
+            with (root / relative).open("rb") as handle:
+                if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
+                    databases.add(relative)
+        except OSError:
+            continue
+    for relative in databases:
+        for suffix in ("-wal", "-shm"):
+            candidate = relative + suffix
+            if candidate in paths:
+                sidecars.add(candidate)
+    return databases, sidecars
+
+
+def snapshot_sqlite(source: Path, destination: Path) -> None:
+    """Create a transactionally consistent, bounded-memory SQLite snapshot."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=destination.parent, prefix=f".{destination.name}.", suffix=".snapshot"
+    )
+    os.close(fd)
+    temporary = Path(temporary_name)
+    source_db = target_db = None
+    try:
+        source_uri = source.resolve().as_uri() + "?mode=ro"
+        source_db = sqlite3.connect(source_uri, uri=True, timeout=10)
+        target_db = sqlite3.connect(str(temporary), timeout=10)
+        source_db.backup(target_db, pages=128, sleep=0.05)
+        target_db.close()
+        target_db = None
+        source_db.close()
+        source_db = None
+        os.replace(temporary, destination)
+    except Exception as exc:
+        if target_db is not None:
+            target_db.close()
+        if source_db is not None:
+            source_db.close()
+        temporary.unlink(missing_ok=True)
+        raise GitStateError(
+            f"could not create a consistent SQLite snapshot of {source.name}: "
+            f"{type(exc).__name__}"
+        ) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stream_cipher(salt: bytes):
+    key = os.environ.get("STORAGE_ENCRYPTION_KEY", "")
+    if not key:
+        raise RuntimeError("STORAGE_ENCRYPTION_KEY is required for streamed state encryption")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    derived = HKDF(
+        algorithm=hashes.SHA256(), length=32, salt=salt,
+        info=b"hermes-render-state-stream-v1",
+    ).derive(key.encode("utf-8"))
+    return AESGCM(derived)
+
+
+def encrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> None:
+    """Encrypt a large file in 1 MiB authenticated chunks with bounded RAM."""
+    key = os.environ.get("STORAGE_ENCRYPTION_KEY", "")
+    if key:
+        salt, nonce_prefix = secrets.token_bytes(16), secrets.token_bytes(8)
+        cipher = _stream_cipher(salt)
+        header = _STREAM_SEALED_PREFIX + salt + nonce_prefix
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as inp, destination.open("wb") as out:
+            out.write(header)
+            index = 0
+            while True:
+                block = inp.read(_STREAM_CHUNK_BYTES)
+                if not block:
+                    break
+                nonce = nonce_prefix + index.to_bytes(4, "big")
+                aad = header + index.to_bytes(8, "big") + b"D"
+                sealed = cipher.encrypt(nonce, block, aad)
+                out.write(struct.pack(">I", len(block)))
+                out.write(sealed)
+                index += 1
+            # Authenticated end marker detects truncation and reordering.
+            nonce = nonce_prefix + index.to_bytes(4, "big")
+            aad = header + index.to_bytes(8, "big") + b"F"
+            out.write(struct.pack(">I", 0))
+            out.write(cipher.encrypt(nonce, b"", aad))
+        return
+
+    if not config.age_recipient:
+        raise GitStateError(
+            "GIT_STATE_ENV_MODE=encrypt needs STORAGE_ENCRYPTION_KEY or "
+            "GIT_STATE_AGE_RECIPIENT to back up SQLite session history"
+        )
+    binary = shutil.which("age") or shutil.which("rage")
+    if not binary:
+        raise GitStateError("age encryption is configured but age/rage is unavailable")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as inp, destination.open("wb") as out:
+        proc = subprocess.run(
+            [binary, "-a", "-r", config.age_recipient], stdin=inp,
+            stdout=out, capture_output=True,
+        )
+    if proc.returncode != 0:
+        destination.unlink(missing_ok=True)
+        raise GitStateError("age failed to encrypt a SQLite session snapshot")
+
+
+def decrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> None:
+    """Decrypt a chunked snapshot, rejecting altered or truncated files."""
+    with source.open("rb") as inp:
+        prefix = inp.read(len(_STREAM_SEALED_PREFIX))
+        if prefix != _STREAM_SEALED_PREFIX:
+            raise ValueError("not a streamed Hermes ciphertext")
+        salt = inp.read(16)
+        nonce_prefix = inp.read(8)
+        if len(salt) != 16 or len(nonce_prefix) != 8:
+            raise ValueError("truncated Hermes ciphertext header")
+        header = prefix + salt + nonce_prefix
+        cipher = _stream_cipher(salt)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".restore-tmp")
+        index = 0
+        try:
+            with temporary.open("wb") as out:
+                while True:
+                    raw_length = inp.read(4)
+                    if len(raw_length) != 4:
+                        raise ValueError("truncated Hermes ciphertext frame")
+                    (length,) = struct.unpack(">I", raw_length)
+                    if length > _STREAM_CHUNK_BYTES:
+                        raise ValueError("oversized Hermes ciphertext frame")
+                    encrypted = inp.read(length + 16 if length else 16)
+                    if len(encrypted) != (length + 16 if length else 16):
+                        raise ValueError("truncated Hermes ciphertext data")
+                    nonce = nonce_prefix + index.to_bytes(4, "big")
+                    if length:
+                        aad = header + index.to_bytes(8, "big") + b"D"
+                        out.write(cipher.decrypt(nonce, encrypted, aad))
+                        index += 1
+                        continue
+                    aad = header + index.to_bytes(8, "big") + b"F"
+                    cipher.decrypt(nonce, encrypted, aad)
+                    if inp.read(1):
+                        raise ValueError("trailing bytes after Hermes ciphertext")
+                    break
+            os.replace(temporary, destination)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
 def plan_mirror(data_dir: Path, excludes) -> "list[str]":
     """Relative file paths under data_dir that belong in the backup, sorted."""
     return plan_tree(data_dir, excludes)[0]
@@ -1001,20 +1252,57 @@ def age_decrypt(ciphertext: bytes, config: GitConfig) -> "bytes | None":
         return None
     args = [binary, "-d"]
     env = dict(os.environ)
+    identity_path = None
     if config.age_key_file:
         args += ["-i", config.age_key_file]
     elif os.environ.get("SOPS_AGE_KEY"):
         # age reads identities from a file; materialise the key privately.
         handle = tempfile.NamedTemporaryFile("w", delete=False)
+        identity_path = Path(handle.name)
         os.chmod(handle.name, 0o600)
         handle.write(os.environ["SOPS_AGE_KEY"] + "\n")
         handle.close()
         args += ["-i", handle.name]
-    proc = subprocess.run(args, input=ciphertext, capture_output=True, env=env)
+    try:
+        proc = subprocess.run(args, input=ciphertext, capture_output=True, env=env)
+    finally:
+        if identity_path is not None:
+            identity_path.unlink(missing_ok=True)
     if proc.returncode != 0:
         LOG.warning("age decryption failed: %s", redact(proc.stderr.decode("utf-8", "replace")))
         return None
     return proc.stdout
+
+
+def decrypt_age_file(source: Path, destination: Path, config: GitConfig) -> None:
+    """Decrypt an age file to disk without buffering a session DB in RAM."""
+    binary = shutil.which("age") or shutil.which("rage")
+    if not binary:
+        raise GitStateError("age-encrypted SQLite history cannot be restored: age/rage missing")
+    args = [binary, "-d"]
+    identity_path = None
+    temporary = destination.with_name(destination.name + ".restore-tmp")
+    if config.age_key_file:
+        args += ["-i", config.age_key_file]
+    elif os.environ.get("SOPS_AGE_KEY"):
+        handle = tempfile.NamedTemporaryFile("w", delete=False)
+        identity_path = Path(handle.name)
+        os.chmod(handle.name, 0o600)
+        handle.write(os.environ["SOPS_AGE_KEY"] + "\n")
+        handle.close()
+        args += ["-i", str(identity_path)]
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with source.open("rb") as inp, temporary.open("wb") as out:
+            proc = subprocess.run(args, stdin=inp, stdout=out, stderr=subprocess.PIPE)
+        if proc.returncode != 0:
+            detail = redact(proc.stderr.decode("utf-8", "replace"))[:300]
+            raise GitStateError(f"age could not decrypt SQLite history: {detail}")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+        if identity_path is not None:
+            identity_path.unlink(missing_ok=True)
 
 
 def _prepare_sensitive(payload: bytes, config: GitConfig) -> "tuple[bytes, str]":
@@ -1063,14 +1351,30 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     # remote history is; we carry the count in the manifest instead.
     generation = read_generation(workdir) + 1
     target = workdir / DATA_SUBDIR
+    cache_root = workdir / ".git" if (workdir / ".git").is_dir() else workdir
+    previous_target = cache_root / "hermes-state-data-previous"
+    if previous_target.exists():
+        shutil.rmtree(previous_target, ignore_errors=True)
     if target.exists():
-        shutil.rmtree(target)
+        os.replace(target, previous_target)
     target.mkdir(parents=True, exist_ok=True)
 
     copied, encrypted, plaintext_env, skipped = 0, [], [], []
+    mirrored_sqlite_dbs: set[str] = set()
+    sqlite_hashes: dict[str, str] = {}
+    previous_base = _read_sync_base(config) or {}
+    previous_sqlite_hashes = previous_base.get("sqlite_hashes", {})
+    if not isinstance(previous_sqlite_hashes, dict):
+        previous_sqlite_hashes = {}
     modes: dict[str, str] = {}
     planned, empty_dirs, symlinks = plan_tree(data_dir, excludes)
+    sqlite_dbs, sqlite_sidecars = sqlite_files(data_dir, planned)
     for relative in planned:
+        if relative in sqlite_sidecars:
+            # A standalone WAL/SHM file cannot be mixed with a different
+            # commit of state.db. The database snapshot below includes every
+            # committed WAL page through SQLite's online backup API.
+            continue
         source = data_dir / relative
         destination = target / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1107,6 +1411,40 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
                 pass
             continue
 
+        if relative in sqlite_dbs:
+            if config.env_mode == ENV_MODE_OMIT:
+                skipped.append(relative)
+                continue
+            snapshot_path = destination.with_name(destination.name + ".snapshot-tmp")
+            snapshot_sqlite(source, snapshot_path)
+            sqlite_digest = _hash_file(snapshot_path)
+            sqlite_hashes[relative] = sqlite_digest
+            if config.env_mode == ENV_MODE_ENCRYPT:
+                sealed_path = destination.with_name(destination.name + ENCRYPTED_SUFFIX)
+                try:
+                    prior_cipher = previous_target / (relative + ENCRYPTED_SUFFIX)
+                    if (previous_sqlite_hashes.get(relative) == sqlite_digest
+                            and prior_cipher.is_file()):
+                        shutil.copyfile(prior_cipher, sealed_path)
+                    else:
+                        encrypt_stream_file(snapshot_path, sealed_path, config)
+                finally:
+                    snapshot_path.unlink(missing_ok=True)
+                encrypted.append(relative)
+                destination = sealed_path
+            else:
+                os.replace(snapshot_path, destination)
+            try:
+                mode = source.stat().st_mode & 0o777
+                os.chmod(destination, mode)
+            except OSError:
+                mode = 0o644
+            if mode not in (0o644, 0o755):
+                modes[relative] = format(mode, "o")
+            copied += 1
+            mirrored_sqlite_dbs.add(relative)
+            continue
+
         # Stream ordinary files: workspace artifacts can exceed the entire
         # Render memory budget. Encryption is needed only for small settings.
         try:
@@ -1126,6 +1464,9 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         copied += 1
 
     _warn_plaintext_env(plaintext_env, config)
+    config._sqlite_hashes = sqlite_hashes
+    if previous_target.exists():
+        shutil.rmtree(previous_target, ignore_errors=True)
 
     manifest = {
         "instance": config.instance_id,
@@ -1140,6 +1481,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         # dropped from the backup.
         "empty_dirs": empty_dirs,
         "symlinks": {name: symlinks[name] for name in sorted(symlinks)},
+        "sqlite_snapshots": sorted(mirrored_sqlite_dbs),
         # Only the modes git cannot express; 0644/0755 come back from the
         # object mode on their own.
         "modes": {name: modes[name] for name in sorted(modes)},
@@ -1166,11 +1508,50 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
     if not isinstance(recorded_modes, dict):
         recorded_modes = {}
 
+    source_files = [source for source in source_root.rglob("*") if source.is_file()]
+    source_relatives = [source.relative_to(source_root).as_posix() for source in source_files]
+    sqlite_dbs, sqlite_sidecars = sqlite_files(source_root, source_relatives)
+    recorded_sqlite = manifest.get("sqlite_snapshots", [])
+    if isinstance(recorded_sqlite, list):
+        sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
+    for relative in sqlite_dbs:
+        for suffix in ("-wal", "-shm"):
+            if relative + suffix in source_relatives:
+                sqlite_sidecars.add(relative + suffix)
+
     restored = 0
-    for source in sorted(source_root.rglob("*")):
-        if not source.is_file():
-            continue
+    for source in sorted(source_files):
         relative = source.relative_to(source_root).as_posix()
+        if relative in sqlite_sidecars:
+            continue
+        logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if relative.endswith(ENCRYPTED_SUFFIX) else relative
+        is_sqlite = logical_relative in sqlite_dbs
+        destination = data_dir / logical_relative
+        if is_sqlite:
+            # Restore only the database snapshot. A legacy branch may still
+            # contain sidecars from the old raw-file mirror; never replay them
+            # against this restored image.
+            Path(str(destination) + "-wal").unlink(missing_ok=True)
+            Path(str(destination) + "-shm").unlink(missing_ok=True)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with source.open("rb") as handle:
+                prefix = handle.read(len(_STREAM_SEALED_PREFIX))
+            if prefix == _STREAM_SEALED_PREFIX:
+                decrypt_stream_file(source, destination, config)
+            elif relative.endswith(ENCRYPTED_SUFFIX):
+                decrypt_age_file(source, destination, config)
+            else:
+                # Older mirrors stored the main file and live WAL/SHM as
+                # separate blobs. Fold any same-generation WAL frames into a
+                # new DB snapshot instead of discarding the latest commits.
+                snapshot_sqlite(source, destination)
+            mode = manifest_mode(recorded_modes.get(logical_relative))
+            try:
+                os.chmod(destination, mode or (source.stat().st_mode & 0o777))
+            except OSError:
+                pass
+            restored += 1
+            continue
         payload = None
         if relative.endswith(ENCRYPTED_SUFFIX):
             payload = source.read_bytes()
@@ -1184,6 +1565,12 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
             payload = opened
         destination = data_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if relative in sqlite_dbs:
+            # Restore happens before Hermes starts. Remove any sidecars from a
+            # prior legacy backup so SQLite cannot replay them against this
+            # newly restored snapshot.
+            Path(str(destination) + "-wal").unlink(missing_ok=True)
+            Path(str(destination) + "-shm").unlink(missing_ok=True)
         if payload is None:
             shutil.copyfile(source, destination)
         else:
@@ -1308,7 +1695,10 @@ def should_compact(commits: int, max_commits: int) -> bool:
 
 
 def compact_history(workdir: Path, config: GitConfig) -> None:
-    """Squash the branch to a single orphan commit and force-push."""
+    """Squash history, replacing it only if the remote has not advanced."""
+    expected_remote = remote_ref_sha(config)
+    if not expected_remote:
+        raise GitStateError("cannot compact state history without a remote branch checkpoint")
     LOG.info("squashing state history to one commit")
     # The squashed commit becomes generation 1 again, so the counter that
     # triggered this compaction restarts rather than firing on every sync.
@@ -1326,7 +1716,7 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
     run_git(["commit", "-q", "-m", "Hermes state (squashed history)"],
             cwd=workdir, check=False, config=config)
     run_git(["branch", "-M", config.branch], cwd=workdir, config=config)
-    push_branch(workdir, config, force=True)
+    push_branch(workdir, config, force_lease_sha=expected_remote)
 
 
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
@@ -1351,6 +1741,22 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
             "push this copy anyway, set GIT_STATE_SEED_FORCE=1."
         )
 
+    base = _read_sync_base(config)
+    remote_sha = head_commit(workdir, config)
+    if base is None:
+        if remote_has_data(workdir) and not config.seed_force:
+            raise GitStateError(
+                f"{config.api_repo}@{config.branch} already has state but this "
+                "process has no successful restore checkpoint; refusing to "
+                "replace it. Restart through the normal restore path first."
+            )
+    elif remote_sha != base.get("remote_sha", ""):
+        raise GitStateError(
+            f"{config.api_repo}@{config.branch} advanced since this instance "
+            "restored or last backed up state; refusing to overwrite it. Stop "
+            "other writers and restart this service to restore the newer copy."
+        )
+
     manifest = build_worktree(data_dir, workdir, config)
 
     run_git(["add", "-A"], cwd=workdir, config=config)
@@ -1364,6 +1770,8 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
         LOG.debug("state unchanged; nothing to commit")
         run_git(["checkout", "HEAD", "--", MANIFEST_NAME], cwd=workdir,
                 check=False, config=config)
+        _write_sync_base(config, remote_sha, state_fingerprint(data_dir),
+                         getattr(config, "_sqlite_hashes", {}))
         return True
 
     message = (
@@ -1376,19 +1784,17 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
 
     if should_compact(manifest.get("generation", 0), config.max_commits):
         compact_history(workdir, config)
+        _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+                         getattr(config, "_sqlite_hashes", {}))
         return True
 
-    try:
-        push_branch(workdir, config)
-    except GitStateError:
-        # Either someone else advanced the branch, or the transport gave up.
-        # Ours is a full mirror of local state, so taking our version is
-        # correct rather than merging -- and a force push also settles a ref
-        # that a half-landed attempt left pointing somewhere older.
-        LOG.info("push did not land; re-pushing with force after refetch")
-        run_git(["fetch", "--depth", "1", "origin", config.branch], cwd=workdir,
-                check=False, config=config)
-        push_branch(workdir, config, force=True)
+    # The remote may have advanced from another writer. Never replace that
+    # state as a retry: a normal push is safe to retry, but a force push can
+    # destroy newer sessions and memories. `push_branch` already checks
+    # whether a response-lost push reached our exact commit.
+    push_branch(workdir, config)
+    _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+                     getattr(config, "_sqlite_hashes", {}))
     LOG.info("pushed state: %s", message)
     return True
 
@@ -1400,6 +1806,8 @@ def restore(data_dir: Path, config: GitConfig) -> bool:
         LOG.warning("git state restore unavailable: %s", redact(str(exc)))
         return False
     restored = materialize(workdir, data_dir, config)
+    _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+                     _sqlite_fingerprints(data_dir))
     LOG.info("restored %d file(s) from %s@%s", restored, config.api_repo, config.branch)
     return restored > 0
 
@@ -1591,6 +1999,43 @@ def current_role(config: GitConfig) -> str:
     )
 
 
+def _sync_status_path() -> Path:
+    return Path(os.environ.get(
+        "GIT_STATE_STATUS_FILE", "/tmp/hermes-git-state-status.json"
+    ))
+
+
+def _write_sync_status(config: GitConfig, state: str, error: str = "") -> None:
+    """Publish a small, secret-free backup health record for the dashboard."""
+    path = _sync_status_path()
+    previous = {}
+    try:
+        previous = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(previous, dict):
+            previous = {}
+    except (OSError, ValueError):
+        pass
+    now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+    status = {
+        "state": state,
+        "updated_at": now,
+        "last_success_at": now if state == "ok" else previous.get("last_success_at"),
+        "branch": config.branch,
+        "error": redact(error)[:300] if error else "",
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".state-status-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(status, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -1608,6 +2053,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
     if threading.current_thread() is threading.main_thread():
         signal.signal(signal.SIGTERM, request_stop)
         signal.signal(signal.SIGINT, request_stop)
+    _write_sync_status(config, "starting")
     LOG.info(
         "git state sync enabled; repo=%s branch=%s interval=%ss%s",
         config.api_repo, config.branch, config.interval,
@@ -1653,12 +2099,14 @@ def run_daemon(data_dir: Path, config: GitConfig,
         try:
             sync_once(data_dir, config)
         except GitStateError as exc:
+            _write_sync_status(config, "error", redact(str(exc)))
             LOG.warning("git state push failed (%s); will retry: %s",
                         reason, redact(str(exc)))
             if watcher is not None:
                 watcher.defer(config.retry_seconds)
             return
         config._last_push_at = time.time()
+        _write_sync_status(config, "ok")
         if watcher is not None:
             watcher.mark_pushed(snapshot)
 

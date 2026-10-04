@@ -6,8 +6,10 @@ The dashboard process imports this file at startup (see the ``api`` field in
 ``/api/plugins/render-api-providers/``.
 
 Endpoints
-  GET    /custom-providers             list custom providers and live model IDs
+  GET    /custom-providers             list configured providers without network probes
   GET    /custom-providers/{key}/models refresh one provider's model IDs
+  GET    /storage-status               authenticated state-backup health
+  GET    /recovery-status              pending interrupted-task counts
   POST   /custom-providers             add (or update) a custom provider
   DELETE /custom-providers/{key}       remove a custom provider
 
@@ -36,9 +38,12 @@ return plain dicts so they can be unit-tested without the hermes codebase
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+import time
+from pathlib import Path
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -53,6 +58,8 @@ ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 API_MODES = ("", "chat_completions", "anthropic_messages")
 MODEL_FETCH_TIMEOUT = 5.0
 MAX_DISCOVERED_MODELS = 500
+MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
+_MODEL_DISCOVERY_LIMIT = asyncio.Semaphore(1)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +261,10 @@ def fetch_custom_provider_models(
         try:
             request = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
+                raw_payload = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                if len(raw_payload) > MAX_PROVIDER_RESPONSE_BYTES:
+                    return None
+                payload = json.loads(raw_payload.decode("utf-8"))
             return _model_ids_from_response(payload)
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
             continue
@@ -283,7 +293,7 @@ def _normalize_entry(raw: dict, *, key: str = "", source: str) -> dict | None:
         "model": _first_str(raw, "model", "default_model"),
         "models": _configured_model_ids(raw),
         "key_env": _first_str(raw, "key_env", "api_key_env"),
-        "has_api_key": bool(_first_str(raw, "api_key")),
+        "has_api_key": bool(_first_str(raw, "api_key", "key")),
         "source": source,
     }
 
@@ -392,10 +402,11 @@ def _upsert_legacy_entry(config: dict, name: str, key: str, fields: dict) -> Non
         if not _legacy_entry_matches(entry, name, key):
             continue
         entry["base_url"] = fields["base_url"]
-        if fields.get("api_key"):
-            entry["api_key"] = fields["api_key"]
-        if "api_key" in fields and not fields["api_key"]:
+        if fields.get("clear_api_key"):
             entry.pop("api_key", None)
+            entry.pop("key", None)
+        elif fields.get("api_key"):
+            entry["api_key"] = fields["api_key"]
         if fields.get("key_env"):
             entry["key_env"] = fields["key_env"]
         else:
@@ -448,7 +459,10 @@ def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
     entry["base_url"] = fields["base_url"]
     # A blank api_key on update means "keep the current key" (the form
     # cannot represent "clear" without a dedicated affordance).
-    if fields.get("api_key"):
+    if fields.get("clear_api_key"):
+        entry.pop("api_key", None)
+        entry.pop("key", None)
+    elif fields.get("api_key"):
         entry["api_key"] = fields["api_key"]
     if fields.get("key_env"):
         entry["key_env"] = fields["key_env"]
@@ -511,6 +525,66 @@ def _require_session(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+def read_storage_status() -> dict:
+    """Return safe backup health metadata without exposing repository secrets."""
+    if not os.environ.get("GIT_STATE_REPO") or not (
+        os.environ.get("GIT_STATE_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    ):
+        return {"state": "not_configured", "last_success_at": None, "error": ""}
+    path = Path(os.environ.get(
+        "GIT_STATE_STATUS_FILE", "/tmp/hermes-git-state-status.json"
+    ))
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            raw = json.loads(handle.read(4096))
+    except (OSError, ValueError):
+        return {"state": "pending", "last_success_at": None, "error": ""}
+    if not isinstance(raw, dict):
+        return {"state": "pending", "last_success_at": None, "error": ""}
+    state = raw.get("state")
+    if state not in ("starting", "ok", "error"):
+        state = "pending"
+    return {
+        "state": state,
+        "updated_at": raw.get("updated_at") if isinstance(raw.get("updated_at"), str) else None,
+        "last_success_at": raw.get("last_success_at") if isinstance(raw.get("last_success_at"), str) else None,
+        "error": str(raw.get("error", ""))[:300] if state == "error" else "",
+    }
+
+
+def read_recovery_status() -> dict:
+    """Expose recovery counts, never saved task text or platform chat IDs."""
+    path = Path(os.environ.get("HERMES_HOME", "/opt/data")) / ".render-recovery.json"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            payload = handle.read(1024 * 1024 + 1)
+        if len(payload) > 1024 * 1024:
+            return {"state": "unavailable", "pending_count": 0, "sessions": []}
+        records = json.loads(payload)
+    except FileNotFoundError:
+        return {"state": "idle", "pending_count": 0, "sessions": []}
+    except (OSError, ValueError):
+        return {"state": "unavailable", "pending_count": 0, "sessions": []}
+    if not isinstance(records, dict):
+        return {"state": "unavailable", "pending_count": 0, "sessions": []}
+    sessions = []
+    for lane, record in records.items():
+        if not isinstance(record, dict) or not isinstance(record.get("session_id"), str):
+            continue
+        try:
+            attempts = max(0, int(record.get("attempts", 0)))
+            retry_at = float(record.get("next_retry_at", 0) or 0)
+        except (TypeError, ValueError):
+            attempts, retry_at = 0, 0.0
+        sessions.append({
+            "platform": str(lane).split(":", 1)[0][:32],
+            "attempts": attempts,
+            "retry_in_seconds": max(0, int(retry_at - time.time())),
+        })
+    return {"state": "active" if sessions else "idle",
+            "pending_count": len(sessions), "sessions": sessions[:100]}
+
+
 def _config_backend():
     try:
         from hermes_cli import config as hermes_config
@@ -529,6 +603,7 @@ def _parse_upsert_body(body: dict) -> dict:
         "name": name,
         "base_url": normalize_base_url(body.get("base_url", "")),
         "api_key": str(body.get("api_key", "") or "").strip(),
+        "clear_api_key": body.get("clear_api_key") is True,
         "key_env": normalize_key_env(body.get("key_env", "")),
         "api_mode": normalize_api_mode(body.get("api_mode", "")),
         "model": str(body.get("model", "") or "").strip(),
@@ -577,13 +652,23 @@ async def list_custom_providers(request: Request):
     load_config, _ = _config_backend()
     config = load_config()
     return {
-        # Probe every provider here rather than relying on the upstream
-        # picker, whose older releases only discovered entries with an
-        # inline api_key.  This also covers key_env, keyless local servers,
-        # and Anthropic-compatible transports.
-        "providers": list_custom_provider_entries(config, fetch_models=True),
+        # Listing config must stay instant. Model discovery is an explicit
+        # per-provider action so a slow endpoint cannot freeze the dashboard.
+        "providers": list_custom_provider_entries(config, fetch_models=False),
         "main_provider": current_main_provider(config),
     }
+
+
+@router.get("/storage-status")
+async def storage_status(request: Request):
+    _require_session(request)
+    return read_storage_status()
+
+
+@router.get("/recovery-status")
+async def recovery_status(request: Request):
+    _require_session(request)
+    return read_recovery_status()
 
 
 @router.get("/custom-providers/{key}/models")
@@ -596,7 +681,8 @@ async def list_custom_provider_models(request: Request, key: str):
     if raw is None:
         raise HTTPException(status_code=404, detail=f"provider '{key}' not found")
 
-    models = fetch_custom_provider_models(raw)
+    async with _MODEL_DISCOVERY_LIMIT:
+        models = await asyncio.to_thread(fetch_custom_provider_models, raw)
     if models is None:
         # Keep the configured/default model useful when a provider does not
         # implement GET /models, but make the failed live discovery explicit

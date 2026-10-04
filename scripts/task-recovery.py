@@ -22,10 +22,61 @@ def _read():
     path = _path()
     if not path.exists():
         return {}
-    data = json.loads(path.read_text())
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        logging.getLogger(__name__).exception(
+            'task recovery journal is unreadable; keeping the gateway available'
+        )
+        return {}
     if not isinstance(data, dict):
-        raise ValueError('invalid task recovery journal')
+        logging.getLogger(__name__).error('task recovery journal is not an object')
+        return {}
     return data
+
+
+def _json_value(value, depth=0):
+    """Keep only bounded JSON metadata from a platform message event."""
+    if depth > 5:
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        if isinstance(value, str):
+            return value[:4000]
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item, depth + 1) for item in value[:32]]
+    if isinstance(value, dict):
+        return {
+            str(key)[:100]: _json_value(item, depth + 1)
+            for key, item in list(value.items())[:64]
+            if isinstance(key, (str, int))
+        }
+    return None
+
+
+def _event_metadata(event):
+    raw = getattr(event, '__dict__', {})
+    if not isinstance(raw, dict):
+        return {}
+    ignored = {'text', 'source', 'internal', 'message_type'}
+    return {
+        key: value for key, item in raw.items()
+        if key not in ignored and (value := _json_value(item)) is not None
+    }
+
+
+def _source_metadata(source):
+    if source is None:
+        return None
+    serializer = getattr(source, 'to_dict', None)
+    if callable(serializer):
+        try:
+            value = serializer()
+        except Exception:
+            value = None
+        if isinstance(value, dict):
+            return _json_value(value)
+    return _json_value(getattr(source, '__dict__', None))
 
 
 def _write(data):
@@ -53,13 +104,16 @@ def begin(entry, event):
     with _lock:
         data = _read()
         previous = data.get(entry.session_key)
-        if previous and previous['session_id'] == entry.session_id and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):
+        if previous and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):
             event.text = resume_text(entry.session_key)
+            previous['session_id'] = entry.session_id
             previous['next_retry_at'] = 0
             _write(data)
             return
         data[entry.session_key] = {'session_id': entry.session_id,
-            'task': event.text or '', 'attempts': 0, 'started_at': time.time()}
+            'task': event.text or '', 'attempts': 0, 'started_at': time.time(),
+            'source': _source_metadata(getattr(event, 'source', None)),
+            'event': _event_metadata(event)}
         _write(data)
 
 
@@ -89,8 +143,16 @@ def recover(store):
         data = _read()
         for key, record in list(data.items()):
             entry = store._entries.get(key)
-            if entry is None or entry.suspended or entry.session_id != record['session_id']:
-                del data[key]  # Explicit stop/reset/resume selection wins.
+            if entry is None:
+                # A delayed SessionStore load must not erase a durable task.
+                # The periodic scanner will pick it up once its lane is ready.
+                continue
+            if entry.suspended:
+                del data[key]  # Explicit stop/reset wins.
+                continue
+            if entry.session_id != record.get('session_id'):
+                # Keep the intent dormant. A manual "continue" in this lane
+                # can rebind it; an unrelated new task will replace it.
                 continue
             reason = 'restart_interrupted'
             entry.resume_pending = True
@@ -172,6 +234,7 @@ async def dispatch(runner, adapter, entry, event, session_id):
             if not entry.resume_pending or entry.suspended:
                 return
         logging.getLogger(__name__).info('Continuing interrupted session %s', entry.session_key)
+        restore_event_metadata(event, entry.session_key)
         event.text = resume_text(entry.session_key) or event.text
         await adapter.handle_message(event)
         # Native handle_message only enqueues the turn. Hold our recovery slot
@@ -195,6 +258,24 @@ def resume_text(session_key):
         'files and external state before retrying an action whose outcome is uncertain. '
         'Do not repeat completed actions or invent a new task. If already complete, '
         'report its saved outcome.]\nOriginal task: ' + record['task'])
+
+
+def restore_event_metadata(event, session_key):
+    """Restore supported message fields onto a gateway recovery event."""
+    with _lock:
+        record = _read().get(session_key, {})
+    metadata = record.get('event')
+    if not isinstance(metadata, dict):
+        return event
+    for key, value in metadata.items():
+        if key in ('text', 'source', 'internal', 'message_type'):
+            continue
+        if hasattr(event, key):
+            try:
+                setattr(event, key, value)
+            except (AttributeError, TypeError):
+                pass
+    return event
 
 
 async def watch(runner, interval=10):

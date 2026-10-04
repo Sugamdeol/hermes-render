@@ -171,3 +171,4 @@ mcp_render_list_services()
 …and look for the service name they used when they deployed this template
 (default: `hermes`). Don't suggest changes to that service casually. Restarting
 it kills your own session.
+

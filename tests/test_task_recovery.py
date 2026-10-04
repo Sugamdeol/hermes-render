@@ -63,16 +63,33 @@ class RecoveryTests(unittest.TestCase):
         self.helper['recover'](self.store)
         self.assertFalse(self.helper['tracked'](self.entry.session_key))
         self.assertFalse(hasattr(self.entry, 'resume_pending'))
-    def test_explicit_stop_or_new_session_wins(self):
-        for change in ('stop', 'new'):
-            self.helper['begin'](self.entry, self.event)
-            if change == 'stop':
-                self.entry.suspended = True
-            else:
-                self.entry.suspended = False
-                self.entry.session_id = 'user-selected-new-session'
-            self.helper['recover'](self.store)
-            self.assertFalse(self.helper['tracked'](self.entry.session_key))
+    def test_explicit_stop_wins(self):
+        self.helper['begin'](self.entry, self.event)
+        self.entry.suspended = True
+        self.helper['recover'](self.store)
+        self.assertFalse(self.helper['tracked'](self.entry.session_key))
+
+    def test_new_native_session_preserves_task_until_manual_continue(self):
+        self.helper['begin'](self.entry, self.event)
+        self.entry.session_id = 'fresh-native-session'
+        self.helper['recover'](self.store)
+        self.assertTrue(self.helper['tracked'](self.entry.session_key))
+        self.assertFalse(getattr(self.entry, 'resume_pending', False))
+
+        continuation = SimpleNamespace(text='continue', internal=False)
+        self.helper['begin'](self.entry, continuation)
+        self.assertIn(self.event.text, continuation.text)
+        self.assertEqual(self.helper['_read']()[self.entry.session_key]['session_id'],
+                         'fresh-native-session')
+
+    def test_late_session_store_load_does_not_delete_orphaned_intent(self):
+        self.helper['begin'](self.entry, self.event)
+        self.store._entries.clear()
+        self.helper['recover'](self.store)
+        self.assertTrue(self.helper['tracked'](self.entry.session_key))
+        self.store._entries[self.entry.session_key] = self.entry
+        self.helper['recover'](self.store)
+        self.assertTrue(self.entry.resume_pending)
     def test_internal_resume_does_not_reset_attempt_count_or_original_task(self):
         self.helper['begin'](self.entry, self.event)
         self.helper['recover'](self.store)
@@ -112,6 +129,17 @@ class RecoveryTests(unittest.TestCase):
         record = self.helper['_read']()[self.entry.session_key]
         self.assertEqual(record['task'], self.event.text)
         self.assertIn(self.event.text, continuation.text)
+
+    def test_original_event_metadata_can_be_restored(self):
+        original = SimpleNamespace(text='analyze this', internal=False,
+                                   media_urls=['https://files.example/image.png'],
+                                   message_id=123)
+        self.helper['begin'](self.entry, original)
+        recovery_event = SimpleNamespace(text='', internal=True,
+                                         media_urls=[], message_id=None)
+        self.helper['restore_event_metadata'](recovery_event, self.entry.session_key)
+        self.assertEqual(recovery_event.media_urls, ['https://files.example/image.png'])
+        self.assertEqual(recovery_event.message_id, 123)
 
     def test_compression_rebind_keeps_recovery_record_and_new_session(self):
         self.helper['begin'](self.entry, self.event)

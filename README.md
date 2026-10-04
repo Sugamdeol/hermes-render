@@ -22,7 +22,9 @@ and private GitHub persistence. This replaces the Nanobot deployment.
    Select that provider/model in the native model picker.
 6. Use **Environment** to save `TELEGRAM_BOT_TOKEN` and
    `TELEGRAM_ALLOWED_USERS` (your numeric Telegram user ID). Click the native
-   gateway restart action after changing Telegram settings.
+   gateway restart action after changing Telegram settings. Dashboard-saved
+   values are encrypted in Git storage; Render Environment values remain the
+   recommended setup for provider and chat credentials.
 
 Telegram uses a secret-validated webhook on Render's public `/telegram` route,
 so an incoming message can wake a sleeping free service. The first message after
@@ -39,11 +41,21 @@ with at least 30 seconds between pushes. Unsynced edits can still be lost if the
 free container is killed before a successful backup.
 
 Memories, skills, workspace, sessions, plugin files and settings persist in the
-private repository. `.env`, `config.yaml` and `auth.json` are authenticated-encrypted
-with `STORAGE_ENCRYPTION_KEY` before new backups. Other files, including memories
-and chat history, remain private-repository plaintext. Old plaintext secrets in
-existing Git history are not automatically erased. Legacy age encryption remains
-supported when its matching private key is provided.
+private repository. `.env`, `config.yaml`, `auth.json`, the recovery journal and
+SQLite databases are encrypted before new backups when `GIT_STATE_ENV_MODE=encrypt`.
+SQLite session databases use a transactionally consistent online snapshot; WAL
+and SHM sidecars are not copied as independent files. Other files, including
+memories and workspace content, remain private-repository plaintext. Old plaintext
+secrets in existing Git history are not automatically erased. Legacy age
+encryption remains supported when its matching private key or recipient is set.
+
+The Models page shows the last successful GitHub state sync, current sync errors,
+and the count of interrupted gateway tasks queued for automatic recovery. It
+does not expose saved task text or chat IDs.
+Provider listing does not probe remote endpoints; use **Test & refresh models**
+on a provider row to check its model endpoint and refresh IDs. A branch conflict
+is reported and held until restart restores the latest state; it never replaces
+the remote branch. Keep one active writer per state branch.
 
 Git operations use one packing thread, a 16 MB pack window and a 32 MB HTTP buffer.
 History is compacted after 200 commits. Root-level `archives/` is preserved by

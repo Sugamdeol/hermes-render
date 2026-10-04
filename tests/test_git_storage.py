@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
@@ -12,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "git-storage.py"
@@ -31,6 +33,23 @@ def make_config(storage, **overrides):
                     instance_id="tester")
     defaults.update(overrides)
     return storage.GitConfig(**defaults)
+
+
+class StorageStatusTests(unittest.TestCase):
+    def test_status_updates_atomically_and_preserves_last_success(self):
+        storage = load_storage()
+        config = make_config(storage)
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(os.environ, {"GIT_STATE_STATUS_FILE": str(Path(directory) / "status.json")}):
+            path = Path(directory) / "status.json"
+            storage._write_sync_status(config, "ok")
+            previous = json.loads(path.read_text())
+            storage._write_sync_status(config, "error", "network temporarily unavailable")
+            result = json.loads(path.read_text())
+            self.assertEqual(result["state"], "error")
+            self.assertEqual(result["last_success_at"], previous["last_success_at"])
+            self.assertEqual(result["error"], "network temporarily unavailable")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
 class ConfigTests(unittest.TestCase):
@@ -216,6 +235,82 @@ class MirrorPlanTests(unittest.TestCase):
             planned = list(self.storage.plan_mirror(
                 data_dir, self.storage.DEFAULT_EXCLUDES))
             self.assertEqual(planned, sorted(planned))
+
+    def test_sqlite_wal_is_snapshotted_as_one_consistent_database(self):
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, work, restored = root / "local", root / "work", root / "restored"
+            data.mkdir(); work.mkdir(); restored.mkdir()
+            db_path = data / "state.db"
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+            conn.execute("INSERT INTO messages(body) VALUES ('latest committed turn')")
+            conn.commit()
+            self.assertTrue(Path(str(db_path) + "-wal").exists())
+
+            config = make_config(storage, env_mode="plaintext")
+            manifest = storage.build_worktree(data, work, config)
+            mirrored_db = work / "data/state.db"
+            self.assertTrue(mirrored_db.exists())
+            self.assertFalse(Path(str(mirrored_db) + "-wal").exists())
+            self.assertFalse(Path(str(mirrored_db) + "-shm").exists())
+            self.assertEqual(manifest["sqlite_snapshots"], ["state.db"])
+            storage.materialize(work, restored, config)
+
+            restored_conn = sqlite3.connect(restored / "state.db")
+            try:
+                row = restored_conn.execute("SELECT body FROM messages").fetchone()
+                self.assertEqual(row, ("latest committed turn",))
+            finally:
+                restored_conn.close()
+                conn.close()
+
+    def test_legacy_raw_wal_backup_restores_the_latest_committed_turn(self):
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work, data, restored = root / "work", root / "work/data", root / "restored"
+            data.mkdir(parents=True); restored.mkdir()
+            (work / "MANIFEST.json").write_text("{}\n")
+            source_db = root / "live.db"
+            conn = sqlite3.connect(source_db)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA wal_autocheckpoint=0")
+            conn.execute("CREATE TABLE messages (body TEXT)")
+            conn.execute("INSERT INTO messages VALUES ('saved only in legacy WAL')")
+            conn.commit()
+            self.assertTrue(Path(str(source_db) + "-wal").exists())
+            for suffix in ("", "-wal", "-shm"):
+                candidate = Path(str(source_db) + suffix)
+                if candidate.exists():
+                    shutil.copyfile(candidate, data / ("state.db" + suffix))
+
+            storage.materialize(work, restored, make_config(storage))
+            result = sqlite3.connect(restored / "state.db")
+            try:
+                row = result.execute("SELECT body FROM messages").fetchone()
+                self.assertEqual(row, ("saved only in legacy WAL",))
+            finally:
+                result.close()
+                conn.close()
+
+    def test_omit_mode_does_not_accidentally_commit_sqlite_plaintext(self):
+        storage = self.storage
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, work = root / "local", root / "work"
+            data.mkdir(); work.mkdir()
+            db = sqlite3.connect(data / "history.sqlite3")
+            db.execute("CREATE TABLE transcript (body TEXT)")
+            db.execute("INSERT INTO transcript VALUES ('private conversation')")
+            db.commit(); db.close()
+            manifest = storage.build_worktree(data, work, make_config(storage, env_mode="omit"))
+            self.assertFalse((work / "data/history.sqlite3").exists())
+            self.assertEqual(manifest["sqlite_snapshots"], [])
+            self.assertEqual(manifest["omitted"], ["history.sqlite3"])
 
 
 class SecretHandlingTests(unittest.TestCase):
@@ -509,6 +604,14 @@ class SeedTests(LocalRemoteTests):
         storage.restore(restored, self.make_config(workdir=self.root / "w3"))
         self.assertEqual((restored / "memories" / "note.md").read_text(),
                          "state already in github")
+
+    def test_sync_without_restore_checkpoint_cannot_replace_existing_state(self):
+        storage = self.storage
+        storage.seed(self._data_dir("saved remote state"), self.make_config())
+        fresh_workdir = self.root / "unrestored"
+        config = self.make_config(workdir=fresh_workdir)
+        with self.assertRaisesRegex(storage.GitStateError, "no successful restore checkpoint"):
+            storage.sync_once(self._data_dir("stale local state"), config)
 
     def test_the_guard_lets_an_empty_branch_be_filled(self):
         """The guard must not block the very case it exists for."""
@@ -900,6 +1003,64 @@ class PushRobustnessTests(LocalRemoteTests):
         storage.run_git(["add", "-A"], cwd=workdir, config=config)
         storage.run_git(["commit", "-q", "-m", "second"], cwd=workdir, config=config)
         return workdir
+
+    def test_sync_refuses_to_force_over_a_concurrent_writer(self):
+        storage = self.storage
+        data = self.root / "data"
+        data.mkdir()
+        (data / "memories").mkdir()
+        (data / "memories/note.md").write_text("initial state")
+        config = self.make_config(push_attempts=1, push_retry_seconds=0)
+        storage.seed(data, config)
+        (data / "memories/note.md").write_text("local update")
+
+        writer_config = self.make_config(workdir=self.root / "writer")
+        writer = storage.ensure_clone(writer_config)
+        real_push = storage.push_branch
+        calls = []
+
+        def race_push(workdir, push_config, *, force=False):
+            calls.append(force)
+            if len(calls) == 1:
+                (writer / "data/memories/concurrent.md").write_text("other writer")
+                storage.run_git(["add", "-A"], cwd=writer, config=writer_config)
+                storage.run_git(["commit", "-q", "-m", "concurrent"], cwd=writer,
+                                config=writer_config)
+                real_push(writer, writer_config)
+            return real_push(workdir, push_config, force=force)
+
+        storage.push_branch = race_push
+        try:
+            with self.assertRaises(storage.GitStateError):
+                storage.sync_once(data, config)
+        finally:
+            storage.push_branch = real_push
+
+        self.assertEqual(calls, [False], "sync must never retry a conflict with --force")
+        with self.assertRaisesRegex(storage.GitStateError, "advanced since this instance"):
+            storage.sync_once(data, config)
+        checkout = self.root / "verify"
+        subprocess.run(["git", "clone", "-q", "--branch", "state", str(self.remote),
+                        str(checkout)], check=True, capture_output=True)
+        self.assertEqual((checkout / "data/memories/concurrent.md").read_text(), "other writer")
+        self.assertEqual((checkout / "data/memories/note.md").read_text(), "initial state")
+
+    def test_history_compaction_uses_a_checked_remote_lease(self):
+        storage = self.storage
+        data = self.root / "compact-data"
+        data.mkdir()
+        (data / "note.md").write_text("first")
+        config = self.make_config(max_commits=2)
+        storage.seed(data, config)
+        (data / "note.md").write_text("second")
+        storage.sync_once(data, config)
+
+        workdir = storage.ensure_clone(config)
+        self.assertEqual(storage.remote_ref_sha(config), storage.head_commit(workdir, config))
+        count = subprocess.run(["git", f"--git-dir={self.remote}", "rev-list", "--count", "state"],
+                               capture_output=True, text=True, check=True)
+        self.assertEqual(count.stdout.strip(), "1")
+        self.assertEqual((workdir / "data/note.md").read_text(), "second")
 
     def test_a_transient_push_failure_is_retried_until_it_lands(self):
         storage = self.storage

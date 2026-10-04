@@ -40,6 +40,7 @@
   var hermesApi = SDK.api;
 
   var PLUGIN = "render-api-providers";
+  var PLUGIN_BASE = "/api/plugins/" + PLUGIN;
   var API_BASE = "/api/plugins/" + PLUGIN + "/custom-providers";
 
   var API_MODES = [
@@ -90,6 +91,7 @@
       name: initial ? initial.name : "",
       baseUrl: initial ? initial.base_url : "",
       apiKey: "",
+      clearApiKey: false,
       keyEnv: initial ? initial.key_env : "",
       apiMode: initial ? initial.api_mode : "",
       model: initial ? initial.model : "",
@@ -142,6 +144,7 @@
         api_mode: form.apiMode,
         key_env: form.keyEnv.trim(),
         model: form.model.trim(),
+        clear_api_key: form.clearApiKey,
       };
       if (form.apiKey) payload.api_key = form.apiKey.trim();
       // Blank key on edit = keep the stored key (backend preserves it).
@@ -216,8 +219,19 @@
             ? "Leave blank to keep the current key"
             : "Optional — leave blank for keyless endpoints or a key env var",
           autoComplete: "off",
-          onChange: function (e) { set({ apiKey: e.target.value }); },
+          onChange: function (e) { set({ apiKey: e.target.value, clearApiKey: false }); },
         }),
+        editing && initial.has_api_key && !form.clearApiKey
+          ? h(Button, {
+              type: "button",
+              size: "sm",
+              outlined: true,
+              onClick: function () { set({ clearApiKey: true, apiKey: "" }); },
+            }, "Clear saved key")
+          : null,
+        editing && form.clearApiKey
+          ? h("span", { className: "rapi-status rapi-status-err" }, "Saved key will be removed when you save.")
+          : null,
       ),
       h(
         "div",
@@ -476,7 +490,7 @@
               disabled: ui.busy,
               onClick: refreshModels,
             },
-            "Refresh models",
+            "Test & refresh models",
           ),
           h(
             Button,
@@ -564,6 +578,24 @@
     var [formOpen, setFormOpen] = useState(false);
     var [editing, setEditing] = useState(null);
     var [status, setStatus] = useState(null);
+    var [backup, setBackup] = useState(null);
+    var [recovery, setRecovery] = useState(null);
+
+    var refreshBackup = useCallback(async function () {
+      try {
+        setBackup(await fetchJSON(PLUGIN_BASE + "/storage-status"));
+      } catch (err) {
+        setBackup({ state: "unknown", error: apiErrorMessage(err) });
+      }
+    }, []);
+
+    var refreshRecovery = useCallback(async function () {
+      try {
+        setRecovery(await fetchJSON(PLUGIN_BASE + "/recovery-status"));
+      } catch (err) {
+        setRecovery({ state: "unavailable", pending_count: 0, error: apiErrorMessage(err) });
+      }
+    }, []);
 
     var load = useCallback(async function () {
       setLoading(true);
@@ -581,7 +613,9 @@
 
     useEffect(function () {
       load();
-    }, [load]);
+      refreshBackup();
+      refreshRecovery();
+    }, [load, refreshBackup, refreshRecovery]);
 
     var onStatus = useCallback(function (text, kind) {
       setStatus({ text: text, kind: kind || "ok" });
@@ -635,6 +669,49 @@
       h(
         CardContent,
         { className: "rapi-root pt-3" },
+        h(
+          "div",
+          { className: "rapi-storage" },
+          h(
+            "div",
+            { className: "min-w-0" },
+            h("div", { className: "font-medium text-sm" }, "Private GitHub backup"),
+            h(
+              "div",
+              { className: "text-xs text-muted-foreground mt-1" },
+              !backup || backup.state === "starting" || backup.state === "pending"
+                ? "Waiting for the first successful backup…"
+                : backup.state === "not_configured"
+                  ? "Set GIT_STATE_REPO and GIT_STATE_TOKEN in Render to enable backups."
+                  : backup.state === "ok"
+                    ? "Last successful backup: " + (backup.last_success_at || "unknown time")
+                    : backup.state === "error"
+                      ? "Backup failed: " + (backup.error || "check service logs")
+                      : backup.error || "Backup status unavailable.",
+            ),
+          ),
+          h(
+            "div",
+            { className: "min-w-0" },
+            h("div", { className: "font-medium text-sm" }, "Interrupted task recovery"),
+            h(
+              "div",
+              { className: "text-xs text-muted-foreground mt-1" },
+              !recovery
+                ? "Checking recovery queue…"
+                : recovery.state === "unavailable"
+                  ? recovery.error || "Recovery status unavailable."
+                  : recovery.pending_count === 0
+                    ? "No unfinished gateway tasks."
+                    : recovery.pending_count + " unfinished session(s) are queued for automatic resume.",
+            ),
+          ),
+          h(
+            Button,
+            { type: "button", size: "sm", outlined: true, onClick: function () { refreshBackup(); refreshRecovery(); } },
+            "Refresh status",
+          ),
+        ),
         formOpen
           ? h(
               ProviderForm,
