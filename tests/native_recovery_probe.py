@@ -96,6 +96,7 @@ async def main():
     for i, entry in enumerate(entries):
         render_recovery.begin(entry, SimpleNamespace(text=f'Real handler task {i}', internal=False))
         compressed = entry.session_id + '-compressed'
+        runner._session_db.create_session(session_id=compressed, source='telegram', user_id='ci-user')
         render_recovery.rebind(runner.session_store, entry.session_key, compressed, runner._session_db)
         runner.session_store.append_to_transcript(compressed, {'role': 'user', 'content': f'Real handler task {i}'})
         runner.session_store.append_to_transcript(compressed, {'role': 'assistant', 'content': 'Saved tool progress: chemistry notes drafted'})
@@ -105,6 +106,7 @@ async def main():
         assert runner.session_store.get_or_create_session(sources[i]).session_id == compressed
         binding = runner._session_db.get_telegram_topic_binding(chat_id='ci-recovery', thread_id=sources[i].thread_id)
         assert binding['session_id'] == compressed
+    runner._session_db.bind_telegram_topic(chat_id='ci-recovery', thread_id=sources[0].thread_id, user_id='ci-user', session_key=entries[0].session_key, session_id=ids[0])
     render_recovery.recover(runner.session_store)
     assert runner._schedule_resume_pending_sessions() == 3
     await asyncio.gather(*list(runner._background_tasks))
