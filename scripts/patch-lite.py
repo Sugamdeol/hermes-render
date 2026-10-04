@@ -160,3 +160,37 @@ new = "def _restart_slash_worker(session: dict):\n    worker = session.get(\"sla
 assert old in text, 'lazy slash worker patch no longer matches pinned source'
 text = text.replace(old, new, 1)
 path.write_text(text)
+
+# Persist unfinished gateway intent before agent allocation and recover its exact lane.
+(root / 'hermes_cli/render_recovery.py').write_text(Path(__file__).with_name('task-recovery.py').read_text())
+path = root / 'gateway/run.py'
+text = path.read_text()
+old = "        if getattr(session_entry, \"was_auto_reset\", False):\n"
+new = "        from hermes_cli import render_recovery\n        render_recovery.begin(session_entry, event)\n        if getattr(session_entry, \"was_auto_reset\", False):\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "        # Stuck-loop detection (#7536): if a session has been active across\n"
+new = "        from hermes_cli import render_recovery\n        render_recovery.recover(self.session_store)\n\n        # Stuck-loop detection (#7536): if a session has been active across\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "        for session_key in stuck_keys:\n            try:\n"
+new = "        for session_key in stuck_keys:\n            from hermes_cli import render_recovery\n            if render_recovery.tracked(session_key):\n                continue  # Pause retry exhaustion without wiping its session ID.\n            try:\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "            if marker is not None and (now - marker).total_seconds() > window:\n"
+new = "            from hermes_cli import render_recovery\n            if not render_recovery.tracked(entry.session_key) and marker is not None and (now - marker).total_seconds() > window:\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "                text=\"\",\n                message_type=MessageType.TEXT,\n                source=source,\n                internal=True,\n"
+new = "                text=render_recovery.resume_text(entry.session_key),\n                message_type=MessageType.TEXT,\n                source=source,\n                internal=True,\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "                self._clear_restart_failure_count(session_key)\n                try:\n"
+new = "                self._clear_restart_failure_count(session_key)\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key)\n                try:\n"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+old = "                and _interruption_is_fresh\n            )\n            _has_fresh_tool_tail"
+new = "                and (_interruption_is_fresh or __import__(\"hermes_cli.render_recovery\", fromlist=[\"tracked\"]).tracked(session_key))\n            )\n            _has_fresh_tool_tail"
+assert old in text, 'durable recovery patch no longer matches pinned source'
+text = text.replace(old, new, 1)
+path.write_text(text)

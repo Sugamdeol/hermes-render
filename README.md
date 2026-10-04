@@ -112,3 +112,11 @@ Memory logs report `mode=observe`. They measure usage without killing agents. CI
 Verified lightweight run on 2026-10-04: the native browser sent a message and received the local test-provider reply under 512 MiB with no swap, peaking at **313.7 MiB**. Chat stayed connected during the pressure test; the gateway initialized without allocation caps. This run did not include a live Telegram connection or the private Git backend.
 
 Git backup subprocesses use small delta and packed-file caches (4 MiB each, 32 MiB mapped-pack cache). HTTP transport buffering stays unchanged to preserve the existing push compatibility. CI also runs browser chat alongside a resident initialized GatewayRunner and a real local Git backup daemon with 1,724 fixture files plus a 16 MiB session file; this does not exercise a live Telegram connection or GitHub HTTP transport.
+
+## Interrupted gateway task recovery
+
+Telegram/gateway turns now record their original request and session ID before allocating the agent. A gateway restart reloads explicitly unfinished tasks regardless of the native two-minute crash-detection window and schedules an internal continuation in the same conversation lane. Native transcripts and tool results remain the progress checkpoints. Completed turns remove the intent record. Explicit stop, new-session and session-selection actions take precedence.
+
+Three automatic recovery attempts are allowed. Exhaustion pauses recovery while preserving the session ID and transcript instead of triggering Hermes' stuck-loop session reset. A new user instruction can resume that preserved lane. Recovery asks the model to verify uncertain tool outcomes before repeating an action; this is not an exactly-once guarantee for external side effects.
+
+The intent journal is encrypted by Git storage. A killed gateway process can recover its locally committed journal immediately. A full Render-instance replacement can recover only state that reached GitHub before the instance disappeared; unsynced progress cannot be guaranteed. Browser TUI and cron-job runners are separate execution paths from this gateway turn recovery.

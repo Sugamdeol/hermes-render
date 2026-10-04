@@ -132,7 +132,7 @@ DEFAULT_PUSH_RETRY_SECONDS = 5
 # Whether they are committed in the clear is GIT_STATE_ENV_MODE's decision,
 # not a hard-coded one: the operator asked for a complete, restartable copy of
 # the instance, and .env is part of that.
-SENSITIVE_FILES = (".env", "config.yaml", "auth.json")
+SENSITIVE_FILES = (".env", "config.yaml", "auth.json", ".render-recovery.json")
 _SEALED_PREFIX = b"HERMES-FERNET-v1\n"
 _SEALED_CACHE = {}
 

@@ -28,6 +28,10 @@ jobs:
         run: |
           docker cp tests/pty_cleanup_probe.py hermes-lite:/tmp/pty_cleanup_probe.py
           docker exec -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/pty_cleanup_probe.py
+      - name: Verify durable native gateway recovery
+        run: |
+          docker cp tests/native_recovery_probe.py hermes-lite:/tmp/native_recovery_probe.py
+          docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/native_recovery_probe.py
       - name: Container diagnostics
         if: always()
         run: |
