@@ -68,8 +68,37 @@ async def check_native_chat():
         await asyncio.sleep(15)
         peak = subprocess.check_output(["docker", "exec", CONTAINER, "cat", "/sys/fs/cgroup/memory.peak"]).decode().strip()
         print("Native dashboard + one chat peak memory: %.1f MiB" % (int(peak) / 1048576), flush=True)
+        # Raise total usage to ~420 MiB without approaching the 512 MiB cap.
+        # The guard must close chat gracefully rather than lose the container.
+        allocator = "import time; from pathlib import Path; used=int(Path('/sys/fs/cgroup/memory.current').read_text()); payload=bytearray(max(0,420*1048576-used)); time.sleep(8)"
+        pressure = subprocess.Popen(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", allocator])
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=10)
+                except websockets.exceptions.ConnectionClosed as error:
+                    assert error.rcvd.code == 1013, error
+                    print("Memory pressure closed browser chat gracefully", flush=True)
+                    break
+            else:
+                raise AssertionError("browser chat did not yield under memory pressure")
+        finally:
+            pressure.wait(timeout=15)
+
+async def check_json_rpc_isolation():
+    import websockets
+    await asyncio.sleep(1)
+    async with websockets.connect("ws://127.0.0.1:" + PORT + "/api/ws?token=" + token, additional_headers={"Authorization": AUTH}, open_timeout=30) as ws:
+        ready = json.loads(await asyncio.wait_for(ws.recv(), timeout=90))
+        assert ready["params"]["type"] == "gateway.ready"
+        await ws.send("not JSON")
+        reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+        assert reply["error"]["code"] == -32700
+    print("Native JSON-RPC protocol works in an isolated budgeted worker", flush=True)
 
 asyncio.run(check_native_chat())
+asyncio.run(check_json_rpc_isolation())
 state = json.loads(subprocess.check_output(["docker", "inspect", CONTAINER, "--format", "{{json .State}}"] ))
 assert state["Running"] and not state["OOMKilled"]
 print("Native dashboard auth, custom provider CRUD, env save, browser chat and container memory-limit boot passed.")

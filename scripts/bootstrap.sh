@@ -28,6 +28,7 @@ GIT_SYNC="/opt/render-tools/git-storage.py"
 # private state has restored and the native dashboard is ready.
 python /opt/render-tools/start-proxy.py
 python /opt/render-tools/memory-log.py &
+python /opt/render-tools/agent-budget.py monitor &
 if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
   TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
   TELEGRAM_WEBHOOK_PORT=8443
@@ -366,6 +367,6 @@ fi
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
-  gosu hermes /opt/hermes/.venv/bin/hermes gateway run &
+  gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py gateway &
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"

@@ -105,3 +105,13 @@ The 512 MB CI measurement covers dashboard and native TUI startup; it does not e
 Ordinary backup and restore files now stream to disk instead of loading entire workspace artifacts into RAM. Browser disconnects terminate the PTY process group, including its Node and Python descendants. Cached gateway agents are swept every 30 seconds. Runtime logs report total cgroup usage and process RSS without command arguments or secrets.
 
 To reserve capacity for Telegram and storage, browser chat refuses to start above 320 MiB of container usage and closes above 400 MiB. This can interrupt an active browser chat; saved session history remains available for resuming. It is a pressure safeguard, not a guarantee that every Hermes tool or workload fits 512 MB. Large local models, browser processes and concurrent agent workloads may still exceed the service budget.
+
+### Shared agent RAM budget
+
+`HERMES_AGENT_RAM_MB=300` gives browser chat, the Telegram gateway, and their child tools a shared 300 MiB budget. Dashboard, proxy and storage are outside that worker budget; the remaining 212 MiB is headroom, not a guaranteed reservation. The supported setting is clamped to 128–350 MiB.
+
+On platforms with delegated writable cgroup v2 memory controls, the adapter creates a worker cgroup with `memory.max`, disables worker swap, and enables group OOM termination. All launched workers enter it before executing Hermes. This is a hard aggregate kernel cap; exceeding it can terminate the agent group. Telegram's supervisor restarts after 20 seconds; interrupted tasks need retrying.
+
+Render may expose cgroups read-only. In that case the startup log explicitly says `mode=watchdog (sampled, not a hard cap)`. The watchdog checks summed worker RSS every 0.2 seconds, including observed descendants; it cancels browser chat first, then Telegram if needed. It also sheds workers when the container passes 430 MiB. RSS conservatively counts shared pages more than once. Fast allocation spikes can still outrun sampling, and tools that escape tracking may not be fully accounted for. This fallback reduces risk but cannot guarantee prevention of OOM. A strict limit requires a host that permits cgroup delegation.
+
+Look for `[agent-budget]` and `[memory]` lines after redeploy to see the enforcement mode, cancellations, and process memory. Native dashboard gateway-restart actions also enter the worker budget.

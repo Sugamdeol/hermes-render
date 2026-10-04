@@ -43,6 +43,8 @@ services:
         value: "9119"
       - key: HERMES_DASHBOARD_TUI
         value: "1"
+      - key: HERMES_AGENT_RAM_MB
+        value: "300"
       - key: HERMES_AGENT_CACHE_MAX_SIZE
         value: "2"
       - key: HERMES_AGENT_CACHE_IDLE_TTL_SECONDS
