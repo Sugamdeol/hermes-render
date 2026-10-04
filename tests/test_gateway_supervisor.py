@@ -16,6 +16,16 @@ class GatewaySupervisorTests(unittest.TestCase):
             root = Path(directory)
             counter = root / 'starts'
             ready = root / 'ready'
+            heartbeat = root / 'heartbeat'
+            worker_script = root / 'worker.py'
+            worker_script.write_text('''from pathlib import Path
+import sys
+import time
+path = Path(sys.argv[1])
+while True:
+    path.write_text(str(time.monotonic()))
+    time.sleep(0.03)
+''')
             fake_hermes = root / 'fake-hermes'
             fake_hermes.write_text('''#!/bin/sh
 count=0
@@ -23,8 +33,8 @@ count=0
 count=$((count + 1))
 echo "$count" > "$TEST_START_COUNT"
 if [ "$count" -eq 1 ]; then exit 23; fi
-echo "$$" > "$TEST_READY_PID"
-exec "$TEST_PYTHON" -c 'import time; time.sleep(60)'
+echo started > "$TEST_READY_PID"
+exec "$TEST_PYTHON" "$TEST_WORKER_SCRIPT" "$TEST_HEARTBEAT"
 ''')
             fake_hermes.chmod(0o755)
             env = {
@@ -37,6 +47,8 @@ exec "$TEST_PYTHON" -c 'import time; time.sleep(60)'
                 'TEST_START_COUNT': str(counter),
                 'TEST_READY_PID': str(ready),
                 'TEST_PYTHON': os.sys.executable,
+                'TEST_WORKER_SCRIPT': str(worker_script),
+                'TEST_HEARTBEAT': str(heartbeat),
             }
             supervisor = subprocess.Popen(['sh', str(SCRIPT)], env=env,
                                           stdout=subprocess.DEVNULL,
@@ -50,16 +62,15 @@ exec "$TEST_PYTHON" -c 'import time; time.sleep(60)'
                     time.sleep(0.02)
                 self.assertTrue(ready.exists(), 'second gateway did not start')
                 self.assertGreaterEqual(int(counter.read_text()), 2)
-                child_pid = int(ready.read_text())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and not heartbeat.exists():
+                    time.sleep(0.01)
+                self.assertTrue(heartbeat.exists(), 'second gateway worker is not running')
                 supervisor.send_signal(signal.SIGTERM)
                 supervisor.wait(timeout=5)
-                deadline = time.monotonic() + 2
-                while time.monotonic() < deadline:
-                    stat_path = Path(f'/proc/{child_pid}/stat')
-                    if not stat_path.exists() or stat_path.read_text().split(') ', 1)[1].split()[0] == 'Z':
-                        break
-                    time.sleep(0.02)
-                else:
+                before = heartbeat.stat().st_mtime_ns
+                time.sleep(0.15)
+                if heartbeat.stat().st_mtime_ns != before:
                     self.fail('active gateway worker survived supervisor shutdown')
             finally:
                 if supervisor.poll() is None:

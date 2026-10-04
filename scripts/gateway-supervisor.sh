@@ -12,7 +12,9 @@ stopping=0
 stop_supervisor() {
   stopping=1
   if [ -n "$worker_pid" ]; then
-    kill -TERM -- "-$worker_pid" 2>/dev/null || true
+    # dash's kill builtin does not accept `--`; the old spelling silently
+    # failed and could leave a live gateway behind during container shutdown.
+    kill -TERM "-$worker_pid" 2>/dev/null || true
   fi
 }
 
@@ -26,6 +28,6 @@ while [ "$stopping" -eq 0 ]; do
   kill -s KILL "-$worker_pid" 2>/dev/null || true
   worker_pid=""
   [ "$stopping" -eq 0 ] || exit 0
-  echo "[render-tools] gateway exited ($status); restarting in 20s" >&2
+  echo "[render-tools] gateway exited ($status); restarting in ${RESTART_DELAY}s" >&2
   sleep "$RESTART_DELAY"
 done
