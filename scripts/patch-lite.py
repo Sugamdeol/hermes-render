@@ -3,6 +3,12 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "/opt/hermes")
+path = root / 'run_agent.py'
+text = path.read_text()
+old = '        self._api_max_retries = _api_retries\n'
+new = '        self._api_max_retries = min(_api_retries, max(1, int(os.environ.get("HERMES_API_MAX_RETRIES", "2"))))\n'
+assert old in text, 'agent retry cap patch no longer matches pinned source'
+path.write_text(text.replace(old, new, 1))
 path = root / "gateway/run.py"
 old = "_AGENT_CACHE_MAX_SIZE = 128\n_AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h\n"
 new = '''_AGENT_CACHE_MAX_SIZE = max(1, int(os.environ.get("HERMES_AGENT_CACHE_MAX_SIZE", "1")))
