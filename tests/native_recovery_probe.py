@@ -12,6 +12,7 @@ from hermes_cli import render_recovery
 
 
 async def main():
+    os.environ["HERMES_MAX_CONCURRENT_SESSIONS"] = "2"
     runner = GatewayRunner()
     active_turns = 0
     peak_turns = 0
@@ -28,7 +29,7 @@ async def main():
     results = await asyncio.gather(*(
         runner._render_serialized_agent(sequence=index) for index in range(3)
     ))
-    assert results == [0, 1, 2] and peak_turns == 1, 'Gateway ran multiple agent turns at once'
+    assert results == [0, 1, 2] and peak_turns == 2, 'Gateway concurrency setting was not respected'
 
     sources = [SessionSource(platform=Platform.TELEGRAM, chat_id='ci-recovery',
         user_id='ci-user', chat_type='dm', thread_id=str(i)) for i in (101, 102, 103)]
@@ -71,12 +72,12 @@ async def main():
     assert runner._schedule_resume_pending_sessions() == 3
     assert runner._schedule_resume_pending_sessions() == 0, 'Duplicate scheduling'
     await asyncio.sleep(0.05)
-    assert len(events) == 1, 'handle_message returning must not free the recovery slot'
+    assert len(events) == 2, 'handle_message returning must not free the recovery slot'
     records = render_recovery._read()
-    assert sum(records[entry.session_key]['attempts'] for entry in entries) == 1
+    assert sum(records[entry.session_key]['attempts'] for entry in entries) == 2
     gate.set()
     await asyncio.gather(*list(runner._background_tasks))
-    assert peak == 1 and len(events) == 3
+    assert peak == 2 and len(events) == 3
     for i, (source, entry, sid) in enumerate(zip(sources, entries, ids)):
         assert runner.session_store.get_or_create_session(source).session_id == sid
         event = next(e for e in events if e.source.thread_id == source.thread_id)
@@ -173,7 +174,7 @@ os.kill(os.getpid(), signal.SIGKILL)
     assert len(seen) == 3
     assert all('Continue hard-killed work' in message for _, message in seen)
     print('SIGKILL recovery passed for three lanes, including a missing session index entry')
-    print('Three Telegram topic lanes recover with saved history; gateway agent turns stay serialized')
+    print('Three Telegram topic lanes recover with saved history; two gateway agent turns run concurrently')
 
 
 asyncio.run(main())

@@ -140,12 +140,12 @@ path.write_text(text.replace(old, new, 1))
 path = root / "gateway/run.py"
 text = path.read_text()
 old = "    def __init__(self, config: Optional[GatewayConfig] = None):\n"
-new = old + "        self._render_agent_semaphore = asyncio.Semaphore(1)\n        from hermes_cli.render_memory import apply_worker_limit\n        apply_worker_limit()\n"
+new = old + "        from hermes_cli.render_recovery import session_concurrency\n        self._render_agent_semaphore = asyncio.Semaphore(session_concurrency())\n        self._render_checkpoint_lock = asyncio.Lock()\n        from hermes_cli.render_memory import apply_worker_limit\n        apply_worker_limit()\n"
 assert old in text, "gateway allocation limit patch no longer matches pinned source"
 text = text.replace(old, new, 1)
 path.write_text(text)
 
-# Avoid cross-chat agent bursts on the 512 MiB service. Incoming lanes keep
+# Bound cross-chat concurrency with a configurable number of slots. Lanes keep
 # their own session state while waiting; the semaphore is held for the full
 # agent turn, including its tool loop and pending-message drains.
 old = """            # Run the agent
@@ -172,7 +172,8 @@ helper = """
 async def _render_serialized_agent(self, *args, **kwargs):
     async with self._render_agent_semaphore:
         from hermes_cli import render_recovery
-        await render_recovery.checkpoint()
+        async with self._render_checkpoint_lock:
+            await render_recovery.checkpoint()
         return await self._run_agent(*args, **kwargs)
 
 

@@ -15,6 +15,14 @@ RETRY_BASE_SECONDS = 20
 RETRY_MAX_SECONDS = 300
 
 
+def session_concurrency():
+    """Maximum independently running gateway chats, shared with recovery."""
+    try:
+        return max(1, int(os.environ.get('HERMES_MAX_CONCURRENT_SESSIONS', '2')))
+    except ValueError:
+        return 2
+
+
 def _path():
     return Path(os.environ.get('HERMES_HOME', '/opt/data')) / '.render-recovery.json'
 
@@ -248,7 +256,7 @@ def claim(store, session_key, session_id):
 async def dispatch(runner, adapter, entry, event, session_id):
     """Drain all interrupted lanes without allocating all their agents at once."""
     if not hasattr(runner, '_render_recovery_lock'):
-        runner._render_recovery_lock = asyncio.Lock()
+        runner._render_recovery_lock = asyncio.Semaphore(session_concurrency())
     async with runner._render_recovery_lock:
         from gateway.session import build_session_key
         extra = getattr(getattr(adapter, 'config', None), 'extra', {})
