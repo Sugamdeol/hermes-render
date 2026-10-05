@@ -165,6 +165,8 @@ helper = """
 
 async def _render_serialized_agent(self, *args, **kwargs):
     async with self._render_agent_semaphore:
+        from hermes_cli import render_recovery
+        await render_recovery.checkpoint()
         return await self._run_agent(*args, **kwargs)
 
 
@@ -247,6 +249,10 @@ new = '                from hermes_cli import render_recovery\n                i
 assert old in text, 'topic recovery identity patch no longer matches'
 text = text.replace(old, new, 1)
 # Compression rebinding and transcript commit must precede recovery completion.
+old = '                session_entry.session_id = agent_result["session_id"]\n'
+new = '                from hermes_cli import render_recovery\n                render_recovery.rebind(self.session_store, session_key, agent_result["session_id"], self._session_db)\n'
+assert old in text, 'result recovery binding patch no longer matches'
+text = text.replace(old, new, 1)
 old = "                                    if _hyg_new_sid != session_entry.session_id:\n                                        session_entry.session_id = _hyg_new_sid\n                                        self.session_store._save()"
 new = "                                    if _hyg_new_sid != session_entry.session_id:\n                                        from hermes_cli import render_recovery\n                                        render_recovery.rebind(self.session_store, session_key, _hyg_new_sid, self._session_db)"
 assert old in text, 'hygiene recovery binding patch no longer matches'

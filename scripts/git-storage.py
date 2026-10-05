@@ -2053,6 +2053,50 @@ def _write_sync_status(config: GitConfig, state: str, error: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 
+def recovery_checkpoint(data_dir: Path, config: GitConfig) -> bool:
+    """Acknowledge a turn only after its state has reached the remote branch."""
+    request = Path(os.environ.get('HERMES_RECOVERY_CHECKPOINT_FILE', '/tmp/hermes-recovery-checkpoint.json'))
+    ack = request.with_suffix('.ack')
+    try:
+        value = json.loads(request.read_text())
+        nonce = value['nonce']
+        if not isinstance(nonce, str) or not nonce:
+            return False
+        try:
+            acknowledged = json.loads(ack.read_text())
+            if isinstance(acknowledged, dict) and acknowledged.get('nonce') == nonce:
+                return False
+        except (OSError, ValueError):
+            pass
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    ok = False
+    try:
+        if config.env_mode == ENV_MODE_OMIT:
+            raise GitStateError('Recovery checkpoint requires encrypted or private plaintext state, not omit mode')
+        if config.failover and config.role == ROLE_STANDBY:
+            raise GitStateError('A standby service cannot checkpoint active work')
+        ok = bool(sync_once(data_dir, config))
+        if ok:
+            config._last_push_at = time.time()
+            LOG.info('recovery checkpoint uploaded')
+    except Exception as exc:
+        LOG.warning('recovery checkpoint failed: %s', redact(str(exc)))
+    fd, name = tempfile.mkstemp(dir=request.parent, prefix='.checkpoint-ack-')
+    try:
+        # Diagnostics starts as root, while the gateway drops to hermes.
+        # Keep the 0600 acknowledgement readable by the requesting user.
+        owner = request.stat()
+        if os.geteuid() == 0:
+            os.fchown(fd, owner.st_uid, owner.st_gid)
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'nonce': nonce, 'ok': ok}, handle)
+        os.replace(name, ack)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    return True
+
+
 def run_daemon(data_dir: Path, config: GitConfig,
                stop: "threading.Event | None" = None) -> None:
     stop = stop if stop is not None else threading.Event()
@@ -2126,6 +2170,9 @@ def run_daemon(data_dir: Path, config: GitConfig,
     last_scan = 0.0
     while not stop.is_set():
         now = time.time()
+        # Recovery intent cannot wait for a quiet tree or the normal push gap.
+        # The gateway waits for this acknowledgement before allocating an agent.
+        recovery_checkpoint(data_dir, config)
         if config.failover:
             if now - last_heartbeat >= config.heartbeat_interval:
                 try:
@@ -2162,6 +2209,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
             push("safety-net interval")
 
         stop.wait(min(
+            1,
             config.watch_seconds,
             config.poll_interval if config.failover else config.interval,
             config.interval,

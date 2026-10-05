@@ -1,5 +1,9 @@
 """Exercise patched native multi-session routing without a messaging account."""
 import asyncio
+import os
+import signal
+import subprocess
+import sys
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from gateway.run import GatewayRunner
@@ -131,6 +135,44 @@ async def main():
     for i, entry in enumerate(entries):
         assert any(sid == entry.session_id and f'Real handler task {i}' in text for sid, text in seen)
         assert not render_recovery.tracked(entry.session_key), 'Successful native handler must clear journal'
+    # A hard kill never executes gateway shutdown/drain callbacks. A fresh
+    # interpreter must find each unfinished lane from the persisted journal.
+    child = subprocess.run([sys.executable, '-c', '''
+import os, signal
+from types import SimpleNamespace
+from gateway.run import GatewayRunner
+from gateway.session import SessionSource, Platform
+from hermes_cli import render_recovery
+runner = GatewayRunner()
+for thread in ('201', '202', '203'):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id='ci-hard-kill',
+        user_id='ci-user', chat_type='dm', thread_id=thread)
+    entry = runner.session_store.get_or_create_session(source)
+    render_recovery.begin(entry, SimpleNamespace(text='Continue hard-killed work ' + thread, internal=False, source=source))
+    runner.session_store.append_to_transcript(entry.session_id, {'role': 'assistant', 'content': 'Saved tool progress: chemistry notes drafted'})
+runner.session_store._save()
+os.kill(os.getpid(), signal.SIGKILL)
+'''], timeout=30)
+    assert child.returncode == -signal.SIGKILL
+    runner = GatewayRunner()
+    runner.session_store._ensure_loaded_locked()
+    killed = [e for e in runner.session_store._entries.values()
+              if e.origin and e.origin.chat_id == 'ci-hard-kill']
+    assert len(killed) == 3
+    # Partial/older session index: the task journal must rebuild its exact lane.
+    orphan = killed[0]
+    runner.session_store._entries.pop(orphan.session_key)
+    runner.session_store._save()
+    render_recovery.recover(runner.session_store)
+    assert runner.session_store._entries[orphan.session_key].session_id == orphan.session_id
+    seen.clear()
+    runner._run_agent = model
+    runner.adapters[Platform.TELEGRAM] = HandlerAdapter()
+    assert runner._schedule_resume_pending_sessions() == 3
+    await asyncio.gather(*list(runner._background_tasks))
+    assert len(seen) == 3
+    assert all('Continue hard-killed work' in message for _, message in seen)
+    print('SIGKILL recovery passed for three lanes, including a missing session index entry')
     print('Three Telegram topic lanes recover with saved history; gateway agent turns stay serialized')
 
 

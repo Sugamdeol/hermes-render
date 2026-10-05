@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import secrets
 from datetime import datetime
 
 _lock = threading.RLock()
@@ -112,7 +113,8 @@ def begin(entry, event):
             return
         data[entry.session_key] = {'session_id': entry.session_id,
             'task': event.text or '', 'attempts': 0, 'started_at': time.time(),
-            'source': _source_metadata(getattr(event, 'source', None)),
+            'source': _source_metadata(getattr(event, 'source', None) or getattr(entry, 'origin', None)),
+            'entry': entry.to_dict() if callable(getattr(entry, 'to_dict', None)) else None,
             'event': _event_metadata(event)}
         _write(data)
 
@@ -146,9 +148,25 @@ def recover(store):
         for key, record in list(data.items()):
             entry = store._entries.get(key)
             if entry is None:
-                # A delayed SessionStore load must not erase a durable task.
-                # The periodic scanner will pick it up once its lane is ready.
-                continue
+                snapshot = record.get('entry')
+                if not isinstance(snapshot, dict) and isinstance(record.get('source'), dict):
+                    # Migrate journals written before entry snapshots existed.
+                    stamp = datetime.fromtimestamp(record.get('started_at', time.time())).isoformat()
+                    snapshot = {'session_key': key, 'session_id': record['session_id'],
+                        'created_at': stamp, 'updated_at': stamp,
+                        'origin': record['source'], 'platform': record['source'].get('platform')}
+                if not isinstance(snapshot, dict) or not snapshot.get('origin'):
+                    continue
+                try:
+                    from gateway.session import SessionEntry
+                    entry = SessionEntry.from_dict(snapshot)
+                    entry.session_key = key
+                    entry.session_id = record['session_id']
+                    store._entries[key] = entry
+                    store_changed = True
+                except (KeyError, ValueError, TypeError):
+                    logging.getLogger(__name__).exception('Cannot rebuild recovery lane %s', key)
+                    continue
             if entry.suspended:
                 del data[key]  # Explicit stop/reset wins.
                 journal_changed = True
@@ -188,6 +206,9 @@ def rebind(store, session_key, session_id, topic_db=None):
             record['session_id'] = session_id
             _write(data)
         entry.session_id = session_id
+        if record and callable(getattr(entry, 'to_dict', None)):
+            record['entry'] = entry.to_dict()
+            _write(data)
         store._save()
         source = getattr(entry, 'origin', None)
         if topic_db is not None and source and source.thread_id:
@@ -301,3 +322,37 @@ async def watch(runner, interval=10):
             raise
         except Exception:
             logging.getLogger(__name__).exception('Recovery scan failed; will retry')
+
+
+async def checkpoint():
+    """Do not allocate an agent until its recovery state is stored remotely.
+
+    The existing storage thread performs the upload, avoiding a second Git
+    writer or a second Python process. SIGKILL cannot run shutdown hooks.
+    """
+    if not os.environ.get('GIT_STATE_REPO') or not os.environ.get('GIT_STATE_TOKEN'):
+        return
+    request = Path(os.environ.get('HERMES_RECOVERY_CHECKPOINT_FILE', '/tmp/hermes-recovery-checkpoint.json'))
+    ack = request.with_suffix('.ack')
+    nonce = secrets.token_hex(16)
+    request.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=request.parent, prefix='.checkpoint-')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'nonce': nonce}, handle)
+        os.replace(name, request)
+    finally:
+        Path(name).unlink(missing_ok=True)
+    deadline = time.monotonic() + float(os.environ.get('HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS', '180'))
+    while time.monotonic() < deadline:
+        try:
+            result = json.loads(ack.read_text())
+            if isinstance(result, dict) and result.get('nonce') == nonce:
+                if not result.get('ok'):
+                    raise RuntimeError('Private backup could not save this task. It remains queued for recovery; check storage logs.')
+                logging.getLogger(__name__).info('Recovery checkpoint saved to private storage')
+                return
+        except (OSError, ValueError):
+            pass
+        await asyncio.sleep(0.2)
+    raise RuntimeError('Private backup checkpoint timed out. Task remains queued; recovery will retry automatically.')
