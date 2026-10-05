@@ -113,7 +113,7 @@ def begin(entry, event):
     with _lock:
         data = _read()
         previous = data.get(entry.session_key)
-        if previous and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):
+        if previous and previous.get('status', 'pending') == 'pending' and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):
             event.text = resume_text(entry.session_key)
             previous['session_id'] = entry.session_id
             previous['next_retry_at'] = 0
@@ -127,23 +127,47 @@ def begin(entry, event):
         _write(data)
 
 
-def finish(session_key):
+def finish(session_key, store=None, status="completed"):
     with _lock:
         data = _read()
         if session_key in data:
-            del data[session_key]
+            data[session_key]['status'] = status
+            data[session_key]['finished_at'] = time.time()
             _write(data)
+    if store is not None:
+        store.clear_resume_pending(session_key)
+    request_checkpoint()
+
+
+def request_checkpoint():
+    if not os.environ.get('GIT_STATE_REPO') or not os.environ.get('GIT_STATE_TOKEN'):
+        return
+    request = Path(os.environ.get('HERMES_RECOVERY_CHECKPOINT_FILE', '/tmp/hermes-recovery-checkpoint.json'))
+    request.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=request.parent, prefix='.checkpoint-')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump({'nonce': secrets.token_hex(16)}, handle)
+        os.replace(name, request)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def tracked(session_key):
     with _lock:
-        return session_key in _read()
+        return _read().get(session_key, {}).get('status', 'pending') == 'pending' and session_key in _read()
+
+
+def is_terminal(session_key):
+    with _lock:
+        record = _read().get(session_key)
+        return bool(record and record.get('status', 'pending') != 'pending')
 
 
 def pending_match(entry):
     with _lock:
         record = _read().get(entry.session_key)
-        return bool(record and record['session_id'] == entry.session_id)
+        return bool(record and record.get('status', 'pending') == 'pending' and record['session_id'] == entry.session_id)
 
 
 def recover(store):
@@ -155,6 +179,12 @@ def recover(store):
         store_changed = False
         for key, record in list(data.items()):
             entry = store._entries.get(key)
+            if record.get('status', 'pending') != 'pending':
+                if entry is not None and entry.session_id == record.get('session_id') and getattr(entry, 'resume_pending', False):
+                    entry.resume_pending = False
+                    entry.resume_reason = None
+                    store_changed = True
+                continue
             if entry is None:
                 snapshot = record.get('entry')
                 if not isinstance(snapshot, dict) and isinstance(record.get('source'), dict):
@@ -242,7 +272,7 @@ def claim(store, session_key, session_id):
         record = data.get(session_key)
         if entry is None or entry.suspended or entry.session_id != session_id or not entry.resume_pending:
             return False
-        if record is None:
+        if record is None or record.get('status', 'pending') != 'pending':
             return False
         if time.time() < float(record.get('next_retry_at', 0)):
             return False
@@ -292,7 +322,7 @@ async def dispatch(runner, adapter, entry, event, session_id):
 def resume_text(session_key):
     with _lock:
         record = _read().get(session_key)
-    if not record:
+    if not record or record.get('status', 'pending') != 'pending':
         return ''
     return ('[Recovery after an unexpected process exit. Continue the unfinished task '
         'in this same session using the saved transcript and tool results. Check actual '

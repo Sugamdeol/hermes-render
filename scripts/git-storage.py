@@ -164,6 +164,9 @@ DEFAULT_EXCLUDES = (
     "*.pyc",
     ".cache",
     "node_modules",
+    ".venv",
+    "venv",
+    "site-packages",
     "tmp",
     "*.tmp",
     "*.sock",
@@ -404,8 +407,26 @@ class GitConfig:
 # ---------------------------------------------------------------------------
 
 
+def clean_stale_index_lock(workdir):
+    """Remove an orphaned index lock, never one owned by a live Git process."""
+    lock = Path(workdir) / '.git/index.lock'
+    if not lock.exists():
+        return
+    for proc in Path('/proc').glob('[0-9]*'):
+        try:
+            command = (proc / 'cmdline').read_bytes().split(b'\0')[0].decode()
+            if Path(command).name.startswith('git') and (proc / 'cwd').resolve() == Path(workdir).resolve():
+                return
+        except (OSError, UnicodeError):
+            continue
+    lock.unlink(missing_ok=True)
+    LOG.warning('Removed orphaned Git index lock after process exit')
+
+
 def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
             config: "GitConfig | None" = None) -> subprocess.CompletedProcess:
+    if cwd is not None and args and args[0] in ('add', 'checkout', 'commit', 'reset'):
+        clean_stale_index_lock(cwd)
     env = dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
     env.setdefault("GIT_CONFIG_NOSYSTEM", "1")

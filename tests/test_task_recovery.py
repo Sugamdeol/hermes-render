@@ -70,6 +70,25 @@ class RecoveryTests(unittest.TestCase):
         self.helper['recover'](self.store)
         self.assertFalse(self.helper['tracked'](self.entry.session_key))
 
+    def test_stopped_record_clears_stale_restart_marker(self):
+        self.helper['begin'](self.entry, self.event)
+        self.entry.resume_pending = True
+        self.entry.resume_reason = 'restart_interrupted'
+        self.helper['finish'](self.entry.session_key, status='stopped')
+        self.helper['recover'](self.store)
+        self.assertFalse(self.entry.resume_pending)
+        self.assertFalse(self.helper['tracked'](self.entry.session_key))
+        self.assertEqual(self.helper['_read']()[self.entry.session_key]['status'], 'stopped')
+        self.assertFalse(self.helper['claim'](self.store, self.entry.session_key, self.entry.session_id))
+
+    def test_continue_after_completion_is_a_new_task(self):
+        self.helper['begin'](self.entry, self.event)
+        self.helper['finish'](self.entry.session_key)
+        event = SimpleNamespace(text='continue', internal=False)
+        self.helper['begin'](self.entry, event)
+        self.assertEqual(event.text, 'continue')
+        self.assertEqual(self.helper['_read']()[self.entry.session_key]['task'], 'continue')
+
     def test_new_native_session_preserves_task_until_manual_continue(self):
         self.helper['begin'](self.entry, self.event)
         self.entry.session_id = 'fresh-native-session'

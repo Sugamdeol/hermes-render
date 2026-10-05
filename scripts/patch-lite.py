@@ -174,6 +174,8 @@ async def _render_serialized_agent(self, *args, **kwargs):
         from hermes_cli import render_recovery
         async with self._render_checkpoint_lock:
             await render_recovery.checkpoint()
+        if render_recovery.is_terminal(kwargs.get('session_key')):
+            return {"interrupted": True, "completed": False, "final_response": ""}
         return await self._run_agent(*args, **kwargs)
 
 
@@ -269,9 +271,21 @@ new = "                if entry:\n                    from hermes_cli import ren
 assert old in text, 'compression recovery binding patch no longer matches'
 text = text.replace(old, new, 1)
 old = "            # Auto voice reply: send TTS audio before the text response"
-new = "            if session_key and _should_clear_resume_pending_after_turn(agent_result):\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key)\n\n" + old
+new = "            if session_key and _should_clear_resume_pending_after_turn(agent_result):\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key, self.session_store)\n\n" + old
 assert old in text, 'recovery transcript commit patch no longer matches'
 text = text.replace(old, new, 1)
+# Stop/reset must persist intent cancellation even through the early intercept.
+old = '        running_agent = self._running_agents.get(session_key)\n        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:\n'
+new = '        if interrupt_reason in (_INTERRUPT_REASON_STOP, _INTERRUPT_REASON_RESET):\n            from hermes_cli import render_recovery\n            render_recovery.finish(session_key, self.session_store, status="stopped")\n' + old
+assert old in text, 'stop recovery patch no longer matches'
+text = text.replace(old, new, 1)
+old = '        agent = self._running_agents.get(session_key)\n        if agent is _AGENT_PENDING_SENTINEL:\n'
+# This occurrence is in the fallback /stop handler; scope the replacement there.
+start = text.index('    async def _handle_stop_command(')
+head, tail = text[:start], text[start:]
+assert old in tail, 'stop fallback recovery patch no longer matches'
+tail = tail.replace(old, '        from hermes_cli import render_recovery\n        render_recovery.finish(session_key, self.session_store, status="stopped")\n' + old, 1)
+text = head + tail
 path.write_text(text)
 
 # An unfinished intent protects the lane even before the periodic scanner runs.

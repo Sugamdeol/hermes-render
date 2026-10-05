@@ -83,6 +83,18 @@ async def main():
         event = next(e for e in events if e.source.thread_id == source.thread_id)
         assert event.internal and f'Finish notes {i}' in event.text
         assert render_recovery._read()[entry.session_key]['attempts'] == 1
+    # Native fallback /stop cancels recovery even when no agent is active.
+    stop_entry = runner.session_store.get_or_create_session(SessionSource(
+        platform=Platform.TELEGRAM, chat_id='ci-stopped', user_id='ci-user', chat_type='dm'))
+    render_recovery.begin(stop_entry, SimpleNamespace(text='Do not restart this', internal=False))
+    stop_entry.resume_pending = True
+    stop_entry.resume_reason = 'restart_interrupted'
+    runner.session_store._save()
+    await runner._handle_stop_command(SimpleNamespace(source=stop_entry.origin))
+    render_recovery.recover(runner.session_store)
+    assert not render_recovery.tracked(stop_entry.session_key)
+    assert not stop_entry.resume_pending, '/stop left a restart marker'
+
     # Retry a failed continuation in this same live runner after cooldown.
     with render_recovery._lock:
         data = render_recovery._read()
