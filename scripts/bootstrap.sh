@@ -19,6 +19,7 @@
 # disk that hasn't been chowned yet.
 
 set -eu
+export GIT_STATE_FENCE_ON_RESTORE="${GIT_STATE_FENCE_ON_RESTORE:-1}"
 
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 PATCHER="/opt/render-tools/patch-config.py"

@@ -474,6 +474,27 @@ class LocalRemoteTests(unittest.TestCase):
         return set(proc.stdout.split())
 
 
+class RestoreHandoverTests(LocalRemoteTests):
+    def test_new_restore_fences_old_writer_without_changing_files(self):
+        data = self.root / 'data'
+        data.mkdir()
+        (data / 'notes.md').write_text('saved notes')
+        old = self.make_config(push_attempts=1)
+        self.storage.seed(data, old)
+        before = self.remote_tree()
+        new = self.make_config(workdir=self.root / 'new-work', push_attempts=1)
+        restored = self.root / 'restored'
+        with patch.dict(os.environ, {'GIT_STATE_FENCE_ON_RESTORE': '1'}):
+            self.assertTrue(self.storage.restore(restored, new))
+        self.assertEqual(self.remote_tree(), before)
+        self.assertEqual((restored / 'notes.md').read_text(), 'saved notes')
+        (data / 'notes.md').write_text('late old write')
+        with self.assertRaisesRegex(self.storage.GitStateError, 'advanced'):
+            self.storage.sync_once(data, old)
+        (restored / 'notes.md').write_text('new writer')
+        self.assertTrue(self.storage.sync_once(restored, new))
+
+
 class RemoteProbeTests(LocalRemoteTests):
     """`empty` and `unreachable` must never be confused: only empty is seeded."""
 

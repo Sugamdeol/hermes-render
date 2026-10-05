@@ -1837,6 +1837,17 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
 def restore(data_dir: Path, config: GitConfig) -> bool:
     try:
         workdir = ensure_clone(config)
+        if (os.environ.get('GIT_STATE_FENCE_ON_RESTORE', '0') == '1'
+                and not (config.failover and config.role == ROLE_STANDBY)
+                and remote_has_data(workdir)):
+            ensure_safe_to_push(config)
+            # A fast-forward empty commit fences the old deployment before
+            # materializing state. Its old base can no longer push; no files
+            # are overwritten and in-flight normal pushes cannot replace us.
+            run_git(['commit', '--allow-empty', '-q', '-m',
+                     'Hermes backup writer handover'], cwd=workdir, config=config)
+            push_branch(workdir, config)
+            LOG.info('Claimed backup writer before restoring state')
     except GitStateError as exc:
         LOG.warning("git state restore unavailable: %s", redact(str(exc)))
         return False
