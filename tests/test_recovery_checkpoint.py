@@ -17,6 +17,7 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.request = Path(self.tmp.name) / 'checkpoint.json'
         self.env = patch.dict(os.environ, {
+            'HERMES_RECOVERY_REQUIRE_REMOTE': '1',
             'GIT_STATE_REPO': 'owner/private', 'GIT_STATE_TOKEN': 'test-only',
             'HERMES_RECOVERY_CHECKPOINT_FILE': str(self.request),
             'HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS': '2',
@@ -55,6 +56,18 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {'HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS': '0.05'}):
             with self.assertRaisesRegex(RuntimeError, 'timed out'):
                 await self.recovery['checkpoint']()
+
+    async def test_optional_backup_failure_allows_local_recovery(self):
+        with patch.dict(os.environ, {'HERMES_RECOVERY_REQUIRE_REMOTE': '0'}):
+            task = asyncio.create_task(self.recovery['checkpoint']())
+            await asyncio.sleep(0.05)
+            with patch.object(self.storage, 'sync_once', side_effect=self.storage.GitStateError('remote advanced')):
+                self.storage.recovery_checkpoint(Path(self.tmp.name), self.config)
+            self.assertFalse(await task)
+
+    async def test_optional_backup_timeout_allows_chat(self):
+        with patch.dict(os.environ, {'HERMES_RECOVERY_REQUIRE_REMOTE': '0', 'HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS': '0.05'}):
+            self.assertFalse(await self.recovery['checkpoint']())
 
     async def test_no_remote_storage_does_not_wait(self):
         with patch.dict(os.environ, {'GIT_STATE_REPO': ''}):

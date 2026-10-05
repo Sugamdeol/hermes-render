@@ -333,6 +333,20 @@ async def watch(runner, interval=10):
 
 
 async def checkpoint():
+    """Attempt remote durability without making a storage outage a chat outage."""
+    strict = os.environ.get('HERMES_RECOVERY_REQUIRE_REMOTE', '0').lower() in ('1', 'true', 'yes')
+    try:
+        return await _checkpoint_upload(strict)
+    except RuntimeError:
+        if strict:
+            raise
+        logging.getLogger(__name__).warning(
+            'Remote checkpoint unavailable; continuing with local recovery journal. '
+            'Storage will retry; full container loss can lose unuploaded progress.', exc_info=True)
+        return False
+
+
+async def _checkpoint_upload(strict):
     """Do not allocate an agent until its recovery state is stored remotely.
 
     The existing storage thread performs the upload, avoiding a second Git
@@ -351,7 +365,7 @@ async def checkpoint():
         os.replace(name, request)
     finally:
         Path(name).unlink(missing_ok=True)
-    deadline = time.monotonic() + float(os.environ.get('HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS', '180'))
+    deadline = time.monotonic() + float(os.environ.get('HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS', '180' if strict else '10'))
     while time.monotonic() < deadline:
         try:
             result = json.loads(ack.read_text())
