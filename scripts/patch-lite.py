@@ -271,7 +271,7 @@ new = "                if entry:\n                    from hermes_cli import ren
 assert old in text, 'compression recovery binding patch no longer matches'
 text = text.replace(old, new, 1)
 old = "            # Auto voice reply: send TTS audio before the text response"
-new = "            if session_key and _should_clear_resume_pending_after_turn(agent_result):\n                from hermes_cli import render_recovery\n                render_recovery.finish(session_key, self.session_store)\n\n" + old
+new = "            from hermes_cli import render_recovery\n            if session_key and render_recovery.turn_finished(agent_result):\n                render_recovery.finish(session_key, self.session_store)\n\n" + old
 assert old in text, 'recovery transcript commit patch no longer matches'
 text = text.replace(old, new, 1)
 # Stop/reset must persist intent cancellation even through the early intercept.

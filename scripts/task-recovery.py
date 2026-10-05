@@ -127,6 +127,12 @@ def begin(entry, event):
         _write(data)
 
 
+def turn_finished(result):
+    # A returned error/partial response is still a settled turn. Retry only
+    # after an actual interruption, not forever after a visible API failure.
+    return isinstance(result, dict) and not result.get('interrupted')
+
+
 def finish(session_key, store=None, status="completed"):
     with _lock:
         data = _read()

@@ -70,6 +70,11 @@ class RecoveryTests(unittest.TestCase):
         self.helper['recover'](self.store)
         self.assertFalse(self.helper['tracked'](self.entry.session_key))
 
+    def test_returned_errors_do_not_restart_forever(self):
+        for result in ({'failed': True}, {'partial': True}, {'completed': False}, {'final_response': 'Done'}):
+            self.assertTrue(self.helper['turn_finished'](result))
+        self.assertFalse(self.helper['turn_finished']({'interrupted': True}))
+
     def test_stopped_record_clears_stale_restart_marker(self):
         self.helper['begin'](self.entry, self.event)
         self.entry.resume_pending = True
