@@ -125,7 +125,7 @@ async def check_json_rpc_isolation():
 asyncio.run(check_native_chat())
 asyncio.run(check_json_rpc_isolation())
 subprocess.check_call(["docker", "exec", CONTAINER, "sh", "-c",
-    "git --git-dir=/tmp/hermes-combined-probe/remote.git show state:data/latest-memory.md >/dev/null && git --git-dir=/tmp/hermes-combined-probe/remote.git cat-file -e state:data/.env.enc"])
+    "git --git-dir=/tmp/hermes-combined-probe/remote.git show state:data/latest-memory.md >/dev/null && git --git-dir=/tmp/hermes-combined-probe/remote.git cat-file -e state:data/.env.enc && git --git-dir=/tmp/hermes-combined-probe/remote.git cat-file -e state:data/.render-runtime-env.json.enc"])
 print("Concurrent Git backups reached the fixture repository with encrypted settings", flush=True)
 subprocess.check_call(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c",
     "import os; from pathlib import Path; events=dict(line.split() for line in Path('/sys/fs/cgroup/memory.events').read_text().splitlines()); assert int(events.get('oom_kill',0))==0, events; [os.kill(int(Path('/tmp/hermes-combined-probe/'+role+'-pid').read_text()),0) for role in ('gateway','storage')]; print('Zero kernel OOM kills; both background fixtures remain alive; memory.events='+str(events))"])

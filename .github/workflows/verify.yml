@@ -19,7 +19,7 @@ jobs:
           docker exec -d hermes-lite /opt/hermes/.venv/bin/python /tmp/chat_probe_server.py
           docker cp tests/combined_load_probe.py hermes-lite:/tmp/combined_load_probe.py
           docker exec -d -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py gateway
-          docker exec -d -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py storage
+          docker exec -d -e STORAGE_ENCRYPTION_KEY=ci-only-key -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py storage
           python tests/container_smoke.py
       - name: Verify native gateway starts without artificial allocation caps
         run: |
