@@ -14,7 +14,7 @@ jobs:
       - run: docker build -t hermes-lite .
       - name: Boot native dashboard under 512 MB without swap
         run: |
-          docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password -e STORAGE_ENCRYPTION_KEY=ci-only-key hermes-lite
+          docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password hermes-lite
           docker cp tests/chat_probe_server.py hermes-lite:/tmp/chat_probe_server.py
           docker exec -d hermes-lite /opt/hermes/.venv/bin/python /tmp/chat_probe_server.py
           docker cp tests/combined_load_probe.py hermes-lite:/tmp/combined_load_probe.py
