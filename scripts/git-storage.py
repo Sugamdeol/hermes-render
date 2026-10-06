@@ -136,7 +136,7 @@ DEFAULT_PUSH_RETRY_SECONDS = 5
 # Whether they are committed in the clear is GIT_STATE_ENV_MODE's decision,
 # not a hard-coded one: the operator asked for a complete, restartable copy of
 # the instance, and .env is part of that.
-SENSITIVE_FILES = (".env", "config.yaml", "auth.json", ".render-recovery.json")
+SENSITIVE_FILES = (".env", "config.yaml", "auth.json", ".render-recovery.json", ".render-runtime-env.json")
 _SEALED_PREFIX = b"HERMES-FERNET-v1\n"
 _SEALED_CACHE = {}
 
@@ -1775,6 +1775,30 @@ def capture_runtime_secrets(data_dir: Path, config: GitConfig) -> None:
         return
     excluded = {'STORAGE_ENCRYPTION_KEY', 'SOPS_AGE_KEY', 'SOPS_AGE_KEY_FILE',
                 'GIT_STATE_AGE_RECIPIENT'}
+    # Capture settings as well as secrets. Host/image paths and Render-generated
+    # identities must be taken from the new container, never from an old host.
+    host_keys = {"PATH", "HOME", "HOSTNAME", "PWD", "OLDPWD", "SHLVL", "_",
+                 "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "PORT",
+                 "VIRTUAL_ENV", "UV_LINK_MODE", "UV_COMPILE_BYTECODE",
+                 "HERMES_HOME", "HERMES_TUI_DIR", "GIT_STATE_SEED_ON_BOOT",
+                 "TELEGRAM_WEBHOOK_URL", "TELEGRAM_WEBHOOK_PORT", "TELEGRAM_WEBHOOK_SECRET"}
+    runtime = {key: value for key, value in os.environ.items()
+               if key not in excluded and key not in host_keys
+               and not key.startswith(("PYTHON", "LC_", "CODEX_"))
+               and (not key.startswith("RENDER_") or key.startswith("RENDER_MCP_"))}
+    data_dir.mkdir(parents=True, exist_ok=True)
+    runtime_path = data_dir / ".render-runtime-env.json"
+    runtime_content = json.dumps({"version": 1, "variables": runtime}, sort_keys=True) + "\n"
+    if not runtime_path.exists() or runtime_path.read_text() != runtime_content:
+        fd, temporary = tempfile.mkstemp(dir=data_dir, prefix='.runtime-env-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(runtime_content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, runtime_path)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     values = {key: value for key, value in os.environ.items()
               if value and key not in excluded
               and key.endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD', '_CREDENTIALS'))}

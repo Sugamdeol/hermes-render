@@ -4,6 +4,17 @@ import os
 from pathlib import Path
 import subprocess
 import crypt
+import sys
+
+if "--holding" in sys.argv:
+    port = int(os.environ.get("PORT", "10000"))
+    Path("/etc/nginx/nginx.conf").write_text(
+        "user www-data; worker_processes 1; pid /run/nginx.pid; "
+        "events { worker_connections 128; } http { access_log off; "
+        f"server {{ listen {port}; location / {{ return 503; }} }} }}"
+    )
+    subprocess.run(["nginx"], check=True)
+    raise SystemExit(0)
 
 password = os.environ.get("HERMES_GATEWAY_TOKEN", "")
 if not password:
@@ -49,4 +60,4 @@ http {
   }
 }
 '''.replace("PORT_VALUE", str(port)))
-subprocess.run(["nginx"], check=True)
+subprocess.run(["nginx", "-s", "reload"] if Path("/run/nginx.pid").exists() else ["nginx"], check=True)

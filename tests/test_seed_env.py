@@ -251,3 +251,28 @@ class _Capture:
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class SavedRuntimeTests(unittest.TestCase):
+    def test_cold_boot_exports_settings_tokens_and_exact_values(self):
+        import contextlib, io, json
+        seed = load_seed_env()
+        with TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text('TELEGRAM_BOT_TOKEN="saved-token"\nHERMES_GATEWAY_TOKEN="saved-password"\n')
+            (env.parent / ".render-runtime-env.json").write_text(json.dumps({"version": 1, "variables": {"CUSTOM_ENDPOINT": "https://provider/v1", "HERMES_API_MAX_RETRIES": "10", "SPECIAL": 'quotes " slash \\ dollar $ newline\nnext', "STORAGE_ENCRYPTION_KEY": "never-export"}}))
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"HERMES_API_MAX_RETRIES": "2", "STORAGE_ENCRYPTION_KEY": "real-key"}, clear=True), contextlib.redirect_stdout(output):
+                self.assertEqual(seed.main(["--env-file", str(env), "--load-existing"]), 0)
+            text = output.getvalue()
+            self.assertIn("HERMES_API_MAX_RETRIES=10", text)
+            self.assertIn("TELEGRAM_BOT_TOKEN=saved-token", text)
+            self.assertIn("HERMES_GATEWAY_TOKEN=saved-password", text)
+            self.assertNotIn("never-export", text)
+            self.assertIn("CUSTOM_ENDPOINT=https://provider/v1", text)
+
+    def test_json_quoted_secret_round_trip(self):
+        import json
+        seed = load_seed_env()
+        value = 'a"b\\c$D\nnext'
+        self.assertEqual(seed.parse_dotenv("KEY=" + json.dumps(value)), [("KEY", value)])

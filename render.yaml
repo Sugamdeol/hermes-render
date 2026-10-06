@@ -16,9 +16,7 @@ services:
       - key: GIT_STATE_TOKEN
         sync: false
       - key: STORAGE_ENCRYPTION_KEY
-        generateValue: true
-      - key: HERMES_GATEWAY_TOKEN
-        generateValue: true
+        sync: false
       - key: GIT_STATE_ENV_MODE
         value: encrypt
       - key: GIT_STATE_HTTP_POST_BUFFER_MB

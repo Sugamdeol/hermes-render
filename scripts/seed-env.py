@@ -37,6 +37,8 @@ Never log the values. stdout is meant for `eval`, not for a terminal.
 from __future__ import annotations
 
 import argparse
+import json
+import secrets
 import os
 import shlex
 import sys
@@ -68,7 +70,13 @@ def parse_dotenv(text: str) -> "list[tuple[str, str]]":
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
+            if value[0] == '"':
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = value[1:-1]
+            else:
+                value = value[1:-1]
         pairs.append((key, value))
     return pairs
 
@@ -150,7 +158,7 @@ def write_env(path: Path, text: str) -> bool:
 
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--secrets", required=True,
+    parser.add_argument("--secrets",
                         help="decrypted dotenv file, or - to read stdin")
     parser.add_argument("--env-file", required=True,
                         help="target .env, normally $HERMES_HOME/.env")
@@ -158,7 +166,41 @@ def main(argv: "list[str] | None" = None) -> int:
                         help="let repo secrets override values already in the .env file")
     parser.add_argument("--print-exports", action="store_true",
                         help="write shell-quoted exports for vars missing from the process env")
+    parser.add_argument("--load-existing", action="store_true",
+                        help="export restored runtime settings and dotenv before services start")
     args = parser.parse_args(argv)
+
+    if args.load_existing:
+        env_path = Path(args.env_file)
+        runtime_path = env_path.parent / ".render-runtime-env.json"
+        values = {}
+        if runtime_path.exists():
+            payload = json.loads(runtime_path.read_text())
+            if payload.get("version") != 1 or not isinstance(payload.get("variables"), dict):
+                raise ValueError("invalid saved runtime environment")
+            values.update(payload["variables"])
+        # UI edits in dotenv override the captured process snapshot.
+        values.update(parse_dotenv(read_text(env_path)))
+        gateway = os.environ.get("HERMES_GATEWAY_TOKEN") or values.get("HERMES_GATEWAY_TOKEN")
+        if not gateway:
+            gateway = secrets.token_urlsafe(32)
+            text, _ = merge(read_text(env_path), [("HERMES_GATEWAY_TOKEN", gateway)], force=True)
+            if not write_env(env_path, text):
+                return 1
+        values["HERMES_GATEWAY_TOKEN"] = gateway
+        for key, value in values.items():
+            if not isinstance(key, str) or not is_valid_key(key) or not isinstance(value, str):
+                raise ValueError("invalid saved environment entry")
+            if key in {"STORAGE_ENCRYPTION_KEY", "SOPS_AGE_KEY", "SOPS_AGE_KEY_FILE", "PORT", "HERMES_HOME"}:
+                continue
+            overrides = {name.strip() for name in os.environ.get("HERMES_ENV_OVERRIDE_KEYS", "").split(",")}
+            bootstrap_keys = {"GIT_STATE_TOKEN", "GITHUB_TOKEN", "GIT_STATE_REPO", "GIT_STATE_BRANCH"}
+            if key not in overrides and not (key in bootstrap_keys and os.environ.get(key)):
+                sys.stdout.write(f"export {key}={shlex.quote(value)}\n")
+        print("[render-tools] loaded saved runtime settings and credentials", file=sys.stderr)
+        return 0
+    if not args.secrets:
+        parser.error("--secrets or --load-existing is required")
 
     if args.secrets == "-":
         secrets_text = sys.stdin.read()

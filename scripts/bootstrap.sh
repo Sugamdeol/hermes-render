@@ -27,12 +27,14 @@ GIT_SYNC="/opt/render-tools/git-storage.py"
 
 # Bind Render's public port immediately. Health remains unavailable until the
 # private state has restored and the native dashboard is ready.
-python /opt/render-tools/start-proxy.py
-if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
-  TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
-  TELEGRAM_WEBHOOK_PORT=8443
-  TELEGRAM_WEBHOOK_SECRET="$(python -c 'import hashlib,os; print(hashlib.sha256(os.environ["HERMES_GATEWAY_TOKEN"].encode()).hexdigest())')"
-  export TELEGRAM_WEBHOOK_URL TELEGRAM_WEBHOOK_PORT TELEGRAM_WEBHOOK_SECRET
+# Safe 503-only listener keeps Render's port scan alive during restore.
+python /opt/render-tools/start-proxy.py --holding
+export GIT_STATE_REPO="${GIT_STATE_REPO:-Sugamdeol/hermes-storage}"
+export GIT_STATE_BRANCH="${GIT_STATE_BRANCH:-state}"
+export GIT_STATE_ENV_MODE="${GIT_STATE_ENV_MODE:-encrypt}"
+if [ -n "${STORAGE_ENCRYPTION_KEY:-}" ] && [ -z "${GIT_STATE_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
+  echo "[render-tools] private restore requires GIT_STATE_TOKEN as well as STORAGE_ENCRYPTION_KEY" >&2
+  exit 1
 fi
 
 # Which backend keeps the durable copy of ${DATA_DIR}?
@@ -254,6 +256,23 @@ if [ -x "${SEEDER}" ] && [ -f "${SECRETS_ENC}" ]; then
     rm -rf "${SECRETS_TMP}"
     unset SECRETS_TMP
   fi
+fi
+
+# Export the restored dotenv/runtime snapshot BEFORE proxy, patcher, daemon
+# and gateway initialization. Invalid saved settings fail closed.
+if exports="$(gosu hermes "${SEEDER}" --env-file "${DATA_DIR}/.env" --load-existing)"; then
+  eval "${exports}"
+  unset exports
+else
+  echo "[render-tools] saved environment could not load; refusing incomplete startup" >&2
+  exit 1
+fi
+python /opt/render-tools/start-proxy.py
+if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
+  TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
+  TELEGRAM_WEBHOOK_PORT=8443
+  TELEGRAM_WEBHOOK_SECRET="$(python -c 'import hashlib,os; print(hashlib.sha256(os.environ["HERMES_GATEWAY_TOKEN"].encode()).hexdigest())')"
+  export TELEGRAM_WEBHOOK_URL TELEGRAM_WEBHOOK_PORT TELEGRAM_WEBHOOK_SECRET
 fi
 
 # Apply the resource profile once per data tree. The marker is restored along

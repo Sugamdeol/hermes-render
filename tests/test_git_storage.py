@@ -1594,3 +1594,18 @@ class CompactionFenceTests(unittest.TestCase):
             with self.assertRaises(storage.GitStateError):
                 storage.compact_history(Path("/tmp/clone"), make_config(storage), expected_remote="old-writer")
             run.assert_not_called()
+
+
+class RuntimeEnvironmentBackupTests(unittest.TestCase):
+    def test_settings_and_custom_credentials_are_encrypted_backup_candidates(self):
+        storage = load_storage()
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "123", "CUSTOM_PROVIDER_URL": "https://custom/v1", "CUSTOM_CREDENTIAL": "secret", "HERMES_API_MAX_RETRIES": "10", "STORAGE_ENCRYPTION_KEY": "bootstrap-only", "RENDER_EXTERNAL_URL": "https://old-service", "PATH": "/old/bin"}, clear=True):
+            root = Path(directory)
+            storage.capture_runtime_secrets(root, make_config(storage, env_mode="encrypt"))
+            data = json.loads((root / ".render-runtime-env.json").read_text())["variables"]
+            self.assertEqual(data["TELEGRAM_ALLOWED_USERS"], "123")
+            self.assertEqual(data["CUSTOM_CREDENTIAL"], "secret")
+            self.assertEqual(data["HERMES_API_MAX_RETRIES"], "10")
+            for name in ("STORAGE_ENCRYPTION_KEY", "RENDER_EXTERNAL_URL", "PATH"):
+                self.assertNotIn(name, data)
+            self.assertIn(".render-runtime-env.json", storage.SENSITIVE_FILES)

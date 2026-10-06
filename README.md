@@ -12,11 +12,21 @@ and private GitHub persistence. This replaces the Nanobot deployment.
 2. Enter `GIT_STATE_TOKEN`: a fine-grained GitHub token scoped to the private
    `Sugamdeol/hermes-storage` repository, with Contents read/write and Metadata read.
    The existing `state` branch is restored; memories, skills and plugins are kept.
-3. Render generates `HERMES_GATEWAY_TOKEN` and `STORAGE_ENCRYPTION_KEY`.
-   Save both securely. Keep the same encryption key when recreating this service;
-   changing it prevents restoring encrypted settings.
+3. Enter the **existing** `STORAGE_ENCRYPTION_KEY` when restoring an existing backup.
+   Never generate a different key for a migration. Only this key and
+   `GIT_STATE_TOKEN` are required: a private GitHub repository cannot be fetched
+   using its encryption key alone. The repository and branch have built-in defaults.
+   Saved Telegram credentials, allowed users, provider endpoints/keys, dashboard
+   password, retry counts and custom settings load before services start.
+   A new runtime snapshot is created on the next successful encrypted backup.
+   Older backups can restore their `.env` values but cannot contain settings that
+   were never captured. Run the updated source service and wait for a successful
+   backup before migrating. Host paths, Render URLs/IDs, and the encryption key
+   are intentionally excluded. The Telegram webhook uses the new service URL.
+   Saved settings override image defaults. To override a saved value explicitly,
+   set its new value and list its name in `HERMES_ENV_OVERRIDE_KEYS` (comma-separated).
 4. Open the service URL. Sign in as **hermes**, using `HERMES_GATEWAY_TOKEN`
-   as the password (find its value in Render Environment).
+   as the password (restored from the encrypted backup; on a fresh setup it is generated in the private `.env`).
 5. In **Models → API Providers**, enter a provider name, custom endpoint,
    OpenAI/Anthropic mode, API key or environment variable name, and model.
    Select that provider/model in the native model picker.
