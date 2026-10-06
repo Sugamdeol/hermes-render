@@ -1741,9 +1741,12 @@ def should_compact(commits: int, max_commits: int) -> bool:
     return max_commits > 0 and commits >= max_commits
 
 
-def compact_history(workdir: Path, config: GitConfig) -> None:
+def compact_history(workdir: Path, config: GitConfig, *, expected_remote: str | None = None) -> None:
     """Squash history, replacing it only if the remote has not advanced."""
-    expected_remote = remote_ref_sha(config)
+    observed_remote = remote_ref_sha(config)
+    expected_remote = expected_remote or observed_remote
+    if observed_remote != expected_remote:
+        raise GitStateError("backup writer changed during sync; refusing history compaction")
     if not expected_remote:
         raise GitStateError("cannot compact state history without a remote branch checkpoint")
     LOG.info("squashing state history to one commit")
@@ -1885,7 +1888,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
         raise GitStateError(redact(proc.stderr or proc.stdout))
 
     if should_compact(manifest.get("generation", 0), config.max_commits):
-        compact_history(workdir, config)
+        compact_history(workdir, config, expected_remote=remote_sha)
         _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
                          getattr(config, "_sqlite_hashes", {}))
         return True

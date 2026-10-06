@@ -1585,3 +1585,12 @@ class BackupShrinkTests(unittest.TestCase):
         storage = load_storage()
         storage.reject_destructive_shrink(0, 556)
         storage.reject_destructive_shrink(2466, 2400)
+
+
+class CompactionFenceTests(unittest.TestCase):
+    def test_new_writer_is_not_overwritten_during_compaction(self):
+        storage = load_storage()
+        with patch.object(storage, "remote_ref_sha", return_value="new-writer"), patch.object(storage, "run_git") as run:
+            with self.assertRaises(storage.GitStateError):
+                storage.compact_history(Path("/tmp/clone"), make_config(storage), expected_remote="old-writer")
+            run.assert_not_called()
