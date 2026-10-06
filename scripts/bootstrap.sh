@@ -267,6 +267,12 @@ else
   echo "[render-tools] saved environment could not load; refusing incomplete startup" >&2
   exit 1
 fi
+# These internal addresses are part of the nginx routing contract, not
+# portable user settings. A restored public dashboard port can collide with
+# the holding listener and leave the new gateway running without health checks.
+export HERMES_DASHBOARD=1
+export HERMES_DASHBOARD_HOST=127.0.0.1
+export HERMES_DASHBOARD_PORT=9119
 python /opt/render-tools/start-proxy.py
 if [ -n "${RENDER_EXTERNAL_URL:-}" ]; then
   TELEGRAM_WEBHOOK_URL="${RENDER_EXTERNAL_URL}/telegram"
