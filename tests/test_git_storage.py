@@ -1554,3 +1554,22 @@ class MidPushChangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InterruptedCloneTests(unittest.TestCase):
+    def test_clone_transfer_failure_is_not_empty_state(self):
+        storage = load_storage()
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config(storage, workdir=Path(directory) / "clone")
+            failed = subprocess.CompletedProcess([], 128, "", "early EOF")
+            with patch.object(storage, "run_git", return_value=failed), patch.object(storage, "remote_branch_state", return_value="present"):
+                with self.assertRaises(storage.GitStateError):
+                    storage.ensure_clone(config)
+
+    def test_probe_repairs_interrupted_checkout_from_git_objects(self):
+        storage = load_storage()
+        config = make_config(storage)
+        present = subprocess.CompletedProcess([], 0, "data/state.db.enc\n", "")
+        with patch.object(storage, "remote_branch_state", return_value="present"), patch.object(storage, "ensure_clone", return_value=Path("/tmp/clone")), patch.object(storage, "run_git", return_value=present) as run:
+            self.assertEqual(storage.probe_state(config), storage.REMOTE_HAS_STATE)
+            self.assertEqual(run.call_args_list[-1].args[0], ["reset", "--hard", "HEAD"])

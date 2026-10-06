@@ -564,6 +564,8 @@ def ensure_clone(config: GitConfig) -> Path:
         if origin_matches(workdir, config):
             proc = run_git(["fetch", "--depth", "1", "origin", config.branch],
                            cwd=workdir, check=False, config=config)
+            if proc.returncode != 0 and not (not head_commit(workdir, config) and remote_branch_state(config) == "absent"):
+                raise GitStateError("state fetch failed; refusing to classify a stale clone as empty: " + redact(proc.stderr.strip()))
             if proc.returncode == 0:
                 fetched = run_git(["rev-parse", "--verify", "FETCH_HEAD"],
                                   cwd=workdir, check=False, config=config)
@@ -595,7 +597,10 @@ def ensure_clone(config: GitConfig) -> Path:
         check=False, config=config,
     )
     if proc.returncode != 0:
-        # Branch (or repo content) does not exist yet: start an empty history.
+        # Failed transfers are not evidence of an absent branch.
+        if remote_branch_state(config) != "absent":
+            raise GitStateError("state clone failed; refusing to initialise empty state: " + redact(proc.stderr.strip()))
+        # The remote explicitly confirmed that the branch does not exist.
         stderr = redact(proc.stderr)
         if "not found" in stderr.lower() and "repository" in stderr.lower():
             raise GitStateError(
@@ -744,7 +749,14 @@ def probe_state(config: GitConfig) -> str:
     except GitStateError as exc:
         LOG.warning("could not read the state branch: %s", redact(str(exc)))
         return REMOTE_UNKNOWN
-    return REMOTE_HAS_STATE if remote_has_data(workdir) else REMOTE_EMPTY
+    tree = run_git(["ls-tree", "-r", "--name-only", "HEAD", "--", DATA_SUBDIR], cwd=workdir, check=False, config=config)
+    if tree.returncode != 0:
+        return REMOTE_UNKNOWN
+    if tree.stdout.strip():
+        # Repair an interrupted checkout before restore reads filesystem bytes.
+        run_git(["reset", "--hard", "HEAD"], cwd=workdir, config=config)
+        return REMOTE_HAS_STATE
+    return REMOTE_EMPTY
 
 
 def state_fingerprint(data_dir: Path) -> str:
