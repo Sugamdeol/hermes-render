@@ -3,8 +3,8 @@
 
 Render's Free tier has no persistent disk, so /opt/data has to live somewhere
 else. This backend mirrors it into a private GitHub repository and transfers
-*deltas*: a 30 MB session database costs a few kilobytes when one conversation
-moves a few kilobytes, rather than a whole-archive upload of the entire tree.
+only changed files. Encrypted database snapshots are compressed before sealing;
+their ciphertext must be uploaded again when the database changes.
 
 Layout in the state repo (default branch ``state``):
 
@@ -562,6 +562,11 @@ def ensure_clone(config: GitConfig) -> Path:
     workdir = config.workdir
     if (workdir / ".git").is_dir():
         if origin_matches(workdir, config):
+            current = head_commit(workdir, config)
+            # Most saves are by the current writer. Compare a tiny ref reply
+            # before asking GitHub to negotiate another object transfer.
+            if current and remote_ref_sha(config) == current:
+                return workdir
             proc = run_git(["fetch", "--depth", "1", "origin", config.branch],
                            cwd=workdir, check=False, config=config)
             if proc.returncode != 0 and not (not head_commit(workdir, config) and remote_branch_state(config) == "absent"):
@@ -1079,6 +1084,7 @@ def plan_tree(data_dir: Path,
 
 _SQLITE_HEADER = b"SQLite format 3\x00"
 _STREAM_SEALED_PREFIX = b"HERMES-AESGCM-STREAM-v1\n"
+_COMPRESSED_STREAM_PREFIX = b"HERMES-AESGCM-ZLIB-v2\n"
 _STREAM_CHUNK_BYTES = 1024 * 1024
 
 
@@ -1152,13 +1158,15 @@ def _stream_cipher(salt: bytes):
     return AESGCM(derived)
 
 
-def encrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> None:
+def encrypt_stream_file(source: Path, destination: Path, config: GitConfig, *, compress: bool = True) -> None:
     """Encrypt a large file in 1 MiB authenticated chunks with bounded RAM."""
     key = os.environ.get("STORAGE_ENCRYPTION_KEY", "")
     if key:
         salt, nonce_prefix = secrets.token_bytes(16), secrets.token_bytes(8)
         cipher = _stream_cipher(salt)
-        header = _STREAM_SEALED_PREFIX + salt + nonce_prefix
+        import zlib
+        prefix = _COMPRESSED_STREAM_PREFIX if compress else _STREAM_SEALED_PREFIX
+        header = prefix + salt + nonce_prefix
         destination.parent.mkdir(parents=True, exist_ok=True)
         with source.open("rb") as inp, destination.open("wb") as out:
             out.write(header)
@@ -1167,6 +1175,8 @@ def encrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> N
                 block = inp.read(_STREAM_CHUNK_BYTES)
                 if not block:
                     break
+                if compress:
+                    block = zlib.compress(block, level=6)
                 nonce = nonce_prefix + index.to_bytes(4, "big")
                 aad = header + index.to_bytes(8, "big") + b"D"
                 sealed = cipher.encrypt(nonce, block, aad)
@@ -1202,8 +1212,8 @@ def encrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> N
 def decrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> None:
     """Decrypt a chunked snapshot, rejecting altered or truncated files."""
     with source.open("rb") as inp:
-        prefix = inp.read(len(_STREAM_SEALED_PREFIX))
-        if prefix != _STREAM_SEALED_PREFIX:
+        prefix = inp.readline(64)
+        if prefix not in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
             raise ValueError("not a streamed Hermes ciphertext")
         salt = inp.read(16)
         nonce_prefix = inp.read(8)
@@ -1221,7 +1231,7 @@ def decrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> N
                     if len(raw_length) != 4:
                         raise ValueError("truncated Hermes ciphertext frame")
                     (length,) = struct.unpack(">I", raw_length)
-                    if length > _STREAM_CHUNK_BYTES:
+                    if length > _STREAM_CHUNK_BYTES + 1024:
                         raise ValueError("oversized Hermes ciphertext frame")
                     encrypted = inp.read(length + 16 if length else 16)
                     if len(encrypted) != (length + 16 if length else 16):
@@ -1229,7 +1239,15 @@ def decrypt_stream_file(source: Path, destination: Path, config: GitConfig) -> N
                     nonce = nonce_prefix + index.to_bytes(4, "big")
                     if length:
                         aad = header + index.to_bytes(8, "big") + b"D"
-                        out.write(cipher.decrypt(nonce, encrypted, aad))
+                        block = cipher.decrypt(nonce, encrypted, aad)
+                        if prefix == _COMPRESSED_STREAM_PREFIX:
+                            import zlib
+                            decoder = zlib.decompressobj()
+                            block = decoder.decompress(block, _STREAM_CHUNK_BYTES + 1)
+                            if (len(block) > _STREAM_CHUNK_BYTES or not decoder.eof
+                                    or decoder.unused_data or decoder.unconsumed_tail):
+                                raise ValueError("invalid compressed Hermes frame")
+                        out.write(block)
                         index += 1
                         continue
                     aad = header + index.to_bytes(8, "big") + b"F"
@@ -1582,8 +1600,8 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
             Path(str(destination) + "-shm").unlink(missing_ok=True)
             destination.parent.mkdir(parents=True, exist_ok=True)
             with source.open("rb") as handle:
-                prefix = handle.read(len(_STREAM_SEALED_PREFIX))
-            if prefix == _STREAM_SEALED_PREFIX:
+                prefix = handle.readline(64)
+            if prefix in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
                 decrypt_stream_file(source, destination, config)
             elif relative.endswith(ENCRYPTED_SUFFIX):
                 decrypt_age_file(source, destination, config)

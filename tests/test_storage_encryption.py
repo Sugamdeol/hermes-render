@@ -87,7 +87,9 @@ class EncryptedRestoreTests(unittest.TestCase):
             self.assertFalse((work / "data/state.db").exists())
             self.assertFalse(Path(str(work / "data/state.db") + "-wal").exists())
             with cipher_path.open("rb") as handle:
-                self.assertEqual(handle.read(len(storage._STREAM_SEALED_PREFIX)), storage._STREAM_SEALED_PREFIX)
+                self.assertEqual(handle.readline(), storage._COMPRESSED_STREAM_PREFIX)
+            self.assertLess(cipher_path.stat().st_size, 230000,
+                            "compress sparse database pages before encryption")
             first_ciphertext = cipher_path.read_bytes()
             storage._write_sync_base(config, "checkpoint", "fingerprint",
                                      config._sqlite_hashes)
@@ -107,6 +109,23 @@ class EncryptedRestoreTests(unittest.TestCase):
             storage.build_worktree(restored, work, config)
             self.assertEqual((work / "data/state.db.enc").read_bytes(), first_ciphertext,
                              "restore followed by sync should not churn encrypted database commits")
+
+    def test_legacy_and_compressed_streams_restore_random_data(self):
+        config = storage.GitConfig(repo="owner/repo", token="test", env_mode="encrypt")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"STORAGE_ENCRYPTION_KEY": "test-only-key"}):
+            root = Path(tmp)
+            source, sealed, opened = root / "source", root / "sealed", root / "opened"
+            payload = os.urandom(2 * storage._STREAM_CHUNK_BYTES + 37)
+            source.write_bytes(payload)
+            for compress in (False, True):
+                storage.encrypt_stream_file(source, sealed, config, compress=compress)
+                storage.decrypt_stream_file(sealed, opened, config)
+                self.assertEqual(opened.read_bytes(), payload)
+                sealed.write_bytes(sealed.read_bytes()[:-1])
+                opened.unlink()
+                with self.assertRaises(ValueError):
+                    storage.decrypt_stream_file(sealed, opened, config)
+                self.assertFalse(opened.exists())
 
     def test_streamed_sqlite_ciphertext_tampering_fails_closed(self):
         config = storage.GitConfig(repo="owner/repo", token="test", env_mode="encrypt")

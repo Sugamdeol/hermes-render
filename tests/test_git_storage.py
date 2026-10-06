@@ -566,6 +566,14 @@ class SeedTests(LocalRemoteTests):
         self.assertEqual(storage.probe_state(self.make_config(workdir=self.root / "w2")),
                          storage.REMOTE_HAS_STATE)
 
+    def test_current_remote_skips_object_fetch(self):
+        config = self.make_config()
+        self.storage.seed(self._data_dir(), config)
+        with patch.object(self.storage, "run_git", wraps=self.storage.run_git) as git:
+            self.storage.ensure_clone(config)
+        self.assertFalse(any(call.args[0][0] == "fetch" for call in git.call_args_list))
+        self.assertTrue(any(call.args[0][0] == "ls-remote" for call in git.call_args_list))
+
     def test_sync_skips_noop_checkout_with_a_modified_legacy_sqlite_sidecar(self):
         storage = self.storage
         data_dir = self._data_dir()
