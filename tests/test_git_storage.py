@@ -1573,3 +1573,15 @@ class InterruptedCloneTests(unittest.TestCase):
         with patch.object(storage, "remote_branch_state", return_value="present"), patch.object(storage, "ensure_clone", return_value=Path("/tmp/clone")), patch.object(storage, "run_git", return_value=present) as run:
             self.assertEqual(storage.probe_state(config), storage.REMOTE_HAS_STATE)
             self.assertEqual(run.call_args_list[-1].args[0], ["reset", "--hard", "HEAD"])
+
+
+class BackupShrinkTests(unittest.TestCase):
+    def test_partial_state_cannot_replace_backup(self):
+        storage = load_storage()
+        with self.assertRaises(storage.GitStateError):
+            storage.reject_destructive_shrink(2466, 556)
+
+    def test_first_backup_and_small_deletions_are_allowed(self):
+        storage = load_storage()
+        storage.reject_destructive_shrink(0, 556)
+        storage.reject_destructive_shrink(2466, 2400)

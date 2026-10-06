@@ -1806,6 +1806,15 @@ def capture_runtime_secrets(data_dir: Path, config: GitConfig) -> None:
         Path(temporary).unlink(missing_ok=True)
 
 
+def reject_destructive_shrink(previous_files: int, current_files: int) -> None:
+    """An empty/partial source must never replace an established backup."""
+    if previous_files >= 100 and current_files < previous_files * 0.5:
+        raise GitStateError(
+            f"backup would shrink from {previous_files} to {current_files} files; "
+            "refusing to replace established state with a partial tree"
+        )
+
+
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
@@ -1844,8 +1853,13 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
             "other writers and restart this service to restore the newer copy."
         )
 
+    saved_manifest = run_git(["show", f"HEAD:{MANIFEST_NAME}"], cwd=workdir, check=False, config=config)
+    previous_files = 0
+    if saved_manifest.returncode == 0:
+        previous_files = int(json.loads(saved_manifest.stdout).get("files", 0) or 0)
     capture_runtime_secrets(data_dir, config)
     manifest = build_worktree(data_dir, workdir, config)
+    reject_destructive_shrink(previous_files, int(manifest["files"]))
 
     run_git(["add", "-A"], cwd=workdir, config=config)
     # Only real state changes are worth a commit. The manifest carries a
