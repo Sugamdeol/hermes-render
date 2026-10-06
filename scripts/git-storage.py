@@ -1754,6 +1754,46 @@ def compact_history(workdir: Path, config: GitConfig) -> None:
     push_branch(workdir, config, force_lease_sha=expected_remote)
 
 
+def capture_runtime_secrets(data_dir: Path, config: GitConfig) -> None:
+    """Include live Render credentials in the encrypted dotenv backup."""
+    if config.env_mode != ENV_MODE_ENCRYPT:
+        return
+    excluded = {'STORAGE_ENCRYPTION_KEY', 'SOPS_AGE_KEY', 'SOPS_AGE_KEY_FILE',
+                'GIT_STATE_AGE_RECIPIENT'}
+    values = {key: value for key, value in os.environ.items()
+              if value and key not in excluded
+              and key.endswith(('_KEY', '_TOKEN', '_SECRET', '_PASSWORD', '_CREDENTIALS'))}
+    if not values:
+        return
+    path = data_dir / '.env'
+    original = path.read_text() if path.exists() else ''
+    remaining = dict(values)
+    lines = []
+    for line in original.splitlines():
+        raw = line.strip()
+        raw = raw[7:].lstrip() if raw.startswith('export ') else raw
+        name = raw.split('=', 1)[0].strip() if '=' in raw and not raw.startswith('#') else ''
+        if name in values:
+            if name in remaining:
+                lines.append(name + '=' + json.dumps(remaining.pop(name)))
+        else:
+            lines.append(line)
+    lines.extend(name + '=' + json.dumps(value) for name, value in sorted(remaining.items()))
+    content = '\n'.join(lines) + '\n'
+    if content == original:
+        return
+    data_dir.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=data_dir, prefix='.runtime-secrets-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
@@ -1792,6 +1832,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
             "other writers and restart this service to restore the newer copy."
         )
 
+    capture_runtime_secrets(data_dir, config)
     manifest = build_worktree(data_dir, workdir, config)
 
     run_git(["add", "-A"], cwd=workdir, config=config)
