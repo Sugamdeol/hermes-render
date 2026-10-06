@@ -259,7 +259,7 @@ class SavedRuntimeTests(unittest.TestCase):
         seed = load_seed_env()
         with TemporaryDirectory() as directory:
             env = Path(directory) / ".env"
-            env.write_text('TELEGRAM_BOT_TOKEN="saved-token"\nHERMES_GATEWAY_TOKEN="saved-password"\n')
+            env.write_text('TELEGRAM_BOT_TOKEN="saved-token"\nHERMES_GATEWAY_TOKEN="saved-password"\nHERMES_API_MAX_RETRIES=1\n')
             (env.parent / ".render-runtime-env.json").write_text(json.dumps({"version": 1, "variables": {"CUSTOM_ENDPOINT": "https://provider/v1", "HERMES_API_MAX_RETRIES": "10", "SPECIAL": 'quotes " slash \\ dollar $ newline\nnext', "STORAGE_ENCRYPTION_KEY": "never-export"}}))
             output = io.StringIO()
             with mock.patch.dict(os.environ, {"HERMES_API_MAX_RETRIES": "2", "STORAGE_ENCRYPTION_KEY": "real-key"}, clear=True), contextlib.redirect_stdout(output):

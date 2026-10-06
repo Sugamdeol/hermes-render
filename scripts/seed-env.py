@@ -173,14 +173,14 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.load_existing:
         env_path = Path(args.env_file)
         runtime_path = env_path.parent / ".render-runtime-env.json"
-        values = {}
+        values = dict(parse_dotenv(read_text(env_path)))
         if runtime_path.exists():
             payload = json.loads(runtime_path.read_text())
             if payload.get("version") != 1 or not isinstance(payload.get("variables"), dict):
                 raise ValueError("invalid saved runtime environment")
             values.update(payload["variables"])
-        # UI edits in dotenv override the captured process snapshot.
-        values.update(parse_dotenv(read_text(env_path)))
+        # The captured process includes active settings; old image defaults
+        # seeded into dotenv must not replace those values on migration.
         gateway = os.environ.get("HERMES_GATEWAY_TOKEN") or values.get("HERMES_GATEWAY_TOKEN")
         if not gateway:
             gateway = secrets.token_urlsafe(32)
