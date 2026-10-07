@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,7 +91,7 @@ class LauncherTests(unittest.TestCase):
     def test_colab_repeat_start_keeps_same_running_agent(self):
         from types import SimpleNamespace
         module = load('run-colab')
-        agent = SimpleNamespace(process=SimpleNamespace(poll=lambda:None))
+        agent = SimpleNamespace(process=SimpleNamespace(poll=lambda:None), password=Mock())
         module.HERMES_COLAB = agent
         with patch('builtins.input', side_effect=AssertionError('must not prompt')), patch.object(module, 'install', side_effect=AssertionError('must not reinstall')):
             self.assertIs(module.main(confirm_switch=True), agent)
@@ -130,7 +130,9 @@ class LauncherTests(unittest.TestCase):
         display_module.display = shown.append
         with patch.dict(sys.modules, {'google.colab':fake, 'IPython.display':display_module}):
             agent = module.ColabAgent(None, {'GIT_STATE_TOKEN':'private-token'})
-            self.assertEqual(agent.dashboard(),url)
+            with patch.object(agent, 'password') as password:
+                self.assertEqual(agent.dashboard(),url)
+                password.assert_called_once_with()
         self.assertIn('Open Dashboard',shown[0])
         self.assertIn('&quot;quoted&quot;',shown[0])
         self.assertNotIn('private-token',shown[0])

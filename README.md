@@ -13,7 +13,8 @@ and private GitHub persistence. This replaces the Nanobot deployment.
 Open the notebook above. Once only, add `GIT_STATE_TOKEN` and the existing
 `STORAGE_ENCRYPTION_KEY` to Colab's Secrets panel and enable Notebook access.
 Then press **▶ Start Hermes**. It starts the dashboard and Telegram together,
-waits for them to be ready and shows an **Open Dashboard** button.
+waits for them to be ready and shows an **Open Dashboard** button, URL,
+username and password together.
 Use `HERMES_COLAB.dashboard()` to show the button again.
 Future runtimes reuse those account secrets;
 no source copying, Drive mount, model setup or Telegram setup is required.
@@ -39,7 +40,7 @@ launchers use Telegram polling instead of the saved Render webhook.
 Use a normal current Linux Python runtime; no GPU or Docker is needed. The first
 install builds the native web UI and can take several minutes. Open the printed
 dashboard link through Colab's browser proxy. Username is `hermes`; the saved
-password is shown only when you call `HERMES_COLAB.password()`. Keep the notebook private.
+password is shown with the dashboard link after startup. Keep the notebook private.
 
 In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
 `HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses

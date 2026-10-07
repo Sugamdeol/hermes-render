@@ -274,6 +274,7 @@ class ColabAgent:
             from google.colab import output
         except ImportError:
             print("Dashboard: http://127.0.0.1:10000")
+            self.password()
             return "http://127.0.0.1:10000"
         try:
             url = output.eval_js("google.colab.kernel.proxyPort(10000)")
@@ -288,7 +289,8 @@ class ColabAgent:
                      'style="display:inline-block;padding:12px 20px;border-radius:10px;'
                      'background:#087f70;color:white;text-decoration:none;font-weight:600">'
                      'Open Dashboard ↗</a>'))
-        print("Username: hermes. Run HERMES_COLAB.password() for your saved password.")
+        print("Dashboard URL:", url)
+        self.password()
         return url
 
     def password(self):
