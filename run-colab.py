@@ -92,6 +92,27 @@ def runtime_env(token, key):
     return dict(base, **values)
 
 
+def get_bootstrap_secret(name, prompt):
+    """Reuse account-owned Colab Secrets without copying them into a notebook."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        from google.colab import userdata
+    except ImportError:
+        userdata = None
+    if userdata is not None:
+        try:
+            value = userdata.get(name)
+        except Exception:
+            # Missing/disabled secrets still work through a hidden prompt.
+            # Never print exception text, which may contain credential details.
+            value = None
+        if value:
+            return value
+    return getpass.getpass(prompt)
+
+
 def install_node():
     if shutil.which("node"):
         version = run(["node", "--version"], capture_output=True, text=True).stdout.strip()
@@ -283,7 +304,7 @@ class ColabAgent:
         print("Saved and stopped. You can now start the Render/local copy.")
 
 
-def main():
+def main(confirm_switch=False):
     if sys.version_info < (3, 11):
         raise RuntimeError("Use a current Colab Python runtime (Python 3.11 or newer)")
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -296,10 +317,10 @@ def main():
         if sock.connect_ex(("127.0.0.1", 10000)) == 0:
             raise RuntimeError("Port 10000 is already occupied; stop the old launcher first")
     print("Stop the Render/local copy after its latest successful backup before switching.")
-    if input("Type SWITCH to confirm the other copy is stopped: ").strip() != "SWITCH":
+    if not confirm_switch and input("Type SWITCH to confirm the other copy is stopped: ").strip() != "SWITCH":
         raise RuntimeError("No changes made")
-    token = os.environ.get("GIT_STATE_TOKEN") or getpass.getpass("GitHub storage token: ")
-    key = os.environ.get("STORAGE_ENCRYPTION_KEY") or getpass.getpass("Existing storage encryption key: ")
+    token = get_bootstrap_secret("GIT_STATE_TOKEN", "GitHub storage token: ")
+    key = get_bootstrap_secret("STORAGE_ENCRYPTION_KEY", "Existing storage encryption key: ")
     env = runtime_env(token, key)
     install()
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)

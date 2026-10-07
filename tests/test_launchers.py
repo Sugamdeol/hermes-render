@@ -69,6 +69,45 @@ class LauncherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.runtime_env('token\nGIT_STATE_ENV_MODE=plaintext', 'key')
 
+    def test_colab_secret_reuses_saved_account_value(self):
+        from types import ModuleType, SimpleNamespace
+        module = load('run-colab')
+        fake = ModuleType('google.colab')
+        fake.userdata = SimpleNamespace(get=lambda name:'saved-'+name)
+        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {'google.colab':fake}), patch.object(module.getpass, 'getpass') as prompt:
+            self.assertEqual(module.get_bootstrap_secret('GIT_STATE_TOKEN','token: '), 'saved-GIT_STATE_TOKEN')
+        prompt.assert_not_called()
+
+    def test_colab_secret_failure_uses_hidden_prompt(self):
+        from types import ModuleType, SimpleNamespace
+        module = load('run-colab')
+        fake = ModuleType('google.colab')
+        def missing(name): raise RuntimeError('secret unavailable')
+        fake.userdata = SimpleNamespace(get=missing)
+        with patch.dict(os.environ, {}, clear=True), patch.dict(sys.modules, {'google.colab':fake}), patch.object(module.getpass, 'getpass', return_value='hidden-value') as prompt:
+            self.assertEqual(module.get_bootstrap_secret('STORAGE_ENCRYPTION_KEY','key: '),'hidden-value')
+        prompt.assert_called_once_with('key: ')
+
+    def test_colab_repeat_start_keeps_same_running_agent(self):
+        from types import SimpleNamespace
+        module = load('run-colab')
+        agent = SimpleNamespace(process=SimpleNamespace(poll=lambda:None))
+        module.HERMES_COLAB = agent
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')), patch.object(module, 'install', side_effect=AssertionError('must not reinstall')):
+            self.assertIs(module.main(confirm_switch=True), agent)
+
+    def test_colab_notebook_has_one_executable_cell_and_verified_launcher(self):
+        import hashlib, json
+        notebook = json.loads((ROOT/'Hermes.ipynb').read_text())
+        cells = [cell for cell in notebook['cells'] if cell['cell_type']=='code']
+        self.assertEqual(len(cells),1)
+        source = ''.join(cells[0]['source'])
+        compile(source,'Hermes.ipynb','exec')
+        self.assertIn(hashlib.sha256((ROOT/'run-colab.py').read_bytes()).hexdigest(),source)
+        self.assertIn('confirm_switch=True',source)
+        self.assertIn('finally:',source)
+        self.assertEqual(cells[0]['outputs'],[])
+
 
 if __name__ == '__main__':
     unittest.main()
