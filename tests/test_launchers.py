@@ -105,6 +105,8 @@ class LauncherTests(unittest.TestCase):
         compile(source,'Hermes.ipynb','exec')
         self.assertIn(hashlib.sha256((ROOT/'run-colab.py').read_bytes()).hexdigest(),source)
         self.assertIn('confirm_switch=True',source)
+        self.assertNotIn('/hermes-render/main/run-colab.py',source)
+        self.assertRegex(source,r'/hermes-render/[a-f0-9]{40}/run-colab.py')
         self.assertIn('finally:',source)
         self.assertEqual(cells[0]['outputs'],[])
 

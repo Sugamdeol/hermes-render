@@ -19,7 +19,9 @@ with 404 when opened in a separate tab because of browser storage partitioning.
 Use `HERMES_COLAB.dashboard()` to reopen the embedded dashboard.
 Future runtimes reuse those account secrets;
 no source copying, Drive mount, model setup or Telegram setup is required.
-Missing secrets use hidden prompts. Stop your other host before pressing Run.
+Missing secrets use hidden prompts. The notebook downloads a fixed launcher
+version with a matching checksum, so saved notebooks survive later updates.
+Stop your other host before pressing Run.
 Colab may ask you to connect/approve execution; the launcher cannot skip that.
 
 ## Single-file Colab and PC launchers
