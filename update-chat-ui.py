@@ -5,7 +5,8 @@ import os
 import tempfile
 import urllib.request
 
-EXPECTED = {'bundle/index.js': '002ba6776ef65c5cc774850cb50f1649100b205b1b9dc26f0852b2e2462df5dc', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '2cd46f0420d1bdbc8dc377b24f54c7ebfcfd70ddaf7a08e345277c58e3d3373d', 'plugin_api.py': 'd14d1d28f15d43c1c20100d7265257b1ca82d7d55455b1bb7c81306f4dfe23e7'}
+EXPECTED = {'bundle/index.js': 'ae278176b301104233391e04f4f09544c8f11771985aa52254c1abeccd7f079d', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '65edab15d6ecbc083db1657a2ee5aee06f9f4a5f6b0a825d8d7fbabc801eaa83', 'plugin_api.py': '6cd9e0ee22a74300bd1d2c52c8f84c032c824de1208cd049191f06c7ae450d0f'}
+LAUNCHER_SHA = 'a150c0723c2e35e596174cf47775fec42d6500e5974bf12d606bed83097c6de9'
 BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/main/dashboard-plugins/hermes-chat-dashboard/dashboard/'
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
@@ -17,25 +18,7 @@ for name, digest in EXPECTED.items():
     if hashlib.sha256(payload).hexdigest() != digest:
         raise RuntimeError('UI version changed. Download the latest update-chat-ui.py and retry.')
     payloads[name] = payload
-# Update the bundled copy too, so bootstrap cannot reinstall an older UI.
-for destination in (target, Path('/opt/render-tools/dashboard-plugins/hermes-chat-dashboard/dashboard')):
-    for name, payload in payloads.items():
-        path = destination / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        info = path.stat() if path.exists() else target.stat()
-        fd, temporary = tempfile.mkstemp(prefix='.chat-ui-', dir=path.parent)
-        try:
-            with os.fdopen(fd, 'wb') as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary, 0o644)
-            if os.geteuid() == 0:
-                os.chown(temporary, info.st_uid, info.st_gid)
-            os.replace(temporary, path)
-        finally:
-            if os.path.exists(temporary): os.unlink(temporary)
-# Update the already-installed isolated WS bridge without reapplying all patches.
+# Validate the installed bridge and launcher before changing any files.
 web = Path('/opt/hermes/hermes_cli/web_server.py')
 code = web.read_text()
 old = "stdout=asyncio.subprocess.PIPE, start_new_session=True,"
@@ -45,7 +28,39 @@ if old in code:
 elif new not in code:
     raise RuntimeError('Unknown chat bridge version; update the launcher before retrying.')
 code = code.replace("sys.executable, '-m', 'tui_gateway.entry',", "sys.executable, '-u', '-m', 'tui_gateway.entry',", 1)
-web.write_text(code)
+compile(code, str(web), 'exec')
+with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/main/run-colab.py', timeout=60) as response:
+    launcher = response.read()
+if hashlib.sha256(launcher).hexdigest() != LAUNCHER_SHA:
+    raise RuntimeError('Launcher version changed. Download the latest updater and retry.')
+compile(launcher, 'run-colab.py', 'exec')
+
+def atomic_write(path, payload, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    info = path.stat() if path.exists() else target.stat()
+    fd, temporary = tempfile.mkstemp(prefix='.chat-ui-', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        if os.geteuid() == 0:
+            os.chown(temporary, info.st_uid, info.st_gid)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+
+# Update bootstrap's bundled copy as well as the restored runtime plugin.
+for destination in (target, Path('/opt/render-tools/dashboard-plugins/hermes-chat-dashboard/dashboard')):
+    for name, payload in payloads.items():
+        atomic_write(destination / name, payload)
+atomic_write(web, code.encode())
+launcher_path = Path('/content/hermes-colab-launcher.py')
+atomic_write(launcher_path, launcher, 0o600)
+import runpy
+namespace = runpy.run_path(str(launcher_path), run_name='hermes_launcher_update')
+HERMES_COLAB.__class__ = namespace['ColabAgent']
 print('Saving the updated UI and your data before restarting…')
 HERMES_COLAB.stop()  # Includes a confirmed backup; failure leaves it running.
 import subprocess
@@ -57,7 +72,8 @@ with os.fdopen(fd, 'a') as logfile:
         ['bash', '/opt/render-tools/bootstrap.sh', 'sleep', 'infinity'],
         env=HERMES_COLAB.env, cwd='/opt/hermes', stdout=logfile,
         stderr=subprocess.STDOUT, start_new_session=True)
-print('Restarting with the faster history backend…')
+HERMES_COLAB.started_at = time.monotonic()
+print('Restarting with the updated chat backend…')
 deadline = time.monotonic() + 600
 while time.monotonic() < deadline:
     if HERMES_COLAB.process.poll() is not None:

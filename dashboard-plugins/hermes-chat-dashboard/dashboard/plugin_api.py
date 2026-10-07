@@ -24,6 +24,7 @@ import mimetypes
 import os
 import re
 import secrets
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -74,18 +75,25 @@ def _json_path(name: str) -> Path:
 def _read_json(name: str, default: Any) -> Any:
     path = _json_path(name)
     try:
-        if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        pass
-    return default
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        # Never turn damaged state into empty metadata and overwrite it.
+        raise HTTPException(status_code=500, detail=f"Cannot read saved UI state {name}; restore this file from backup.") from exc
 
 
 def _write_json(name: str, value: Any) -> None:
     path = _json_path(name)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".chat-state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _session_db():
@@ -905,19 +913,23 @@ async def upload_attachment(request: Request, file: UploadFile = File(...), conv
     upload_dir.mkdir(parents=True, exist_ok=True)
     target = upload_dir / f"{int(time.time())}_{secrets.token_hex(4)}_{filename}"
     total = 0
-    with target.open("wb") as fh:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > MAX_UPLOAD_BYTES:
-                try:
-                    target.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                raise HTTPException(status_code=413, detail="file exceeds upload limit")
-            fh.write(chunk)
+    fd, temporary = tempfile.mkstemp(dir=upload_dir, prefix=".upload-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="file exceeds upload limit")
+                fh.write(chunk)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+        await file.close()
     is_image = content_type.startswith("image/") or ext in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
     return {
         "ok": True,
@@ -972,7 +984,7 @@ async def branch_from_message(request: Request, body: dict):
 
 
 @router.get("/export/{session_id}")
-async def export_session(request: Request, session_id: str, format: str = "markdown"):
+def export_session(request: Request, session_id: str, format: str = "markdown"):
     _require_session(request)
     fmt = (format or "markdown").lower()
     db = _session_db()
@@ -1034,7 +1046,7 @@ async def create_share(request: Request, session_id: str, body: dict | None = No
 
 
 @router.get("/shares")
-async def list_shares(request: Request):
+def list_shares(request: Request):
     """Every share (active + revoked) with its session title, for management."""
     _require_session(request)
     shares = _read_json(SHARES_FILE, {})
@@ -1090,7 +1102,7 @@ async def revoke_share(request: Request, token: str):
 
 
 @router.get("/shared/{token}")
-async def get_shared(token: str):
+def get_shared(token: str, limit: int = 80, offset: int = -80):
     shares = _read_json(SHARES_FILE, {})
     share = shares.get(token)
     if not isinstance(share, dict) or share.get("revoked"):
@@ -1101,11 +1113,11 @@ async def get_shared(token: str):
         session = db.get_session(sid)
         if not session:
             raise HTTPException(status_code=404, detail="session not found")
-        try:
-            messages = db.get_messages(sid) or []
-        except Exception:
-            messages = []
-        return {"share": {k: v for k, v in share.items() if k != "session_id"}, "session": session, "messages": messages}
+        limit = max(1, min(int(limit), MAX_SESSION_ROWS))
+        messages, total = _get_messages_page(db, sid, limit, int(offset))
+        start = max(0, total + int(offset)) if int(offset) < 0 else int(offset)
+        return {"share": {k: v for k, v in share.items() if k != "session_id"}, "session": session, "messages": messages,
+                "offset": start, "total": total, "has_more": start + len(messages) < total}
     finally:
         try:
             db.close()

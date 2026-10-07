@@ -25,12 +25,20 @@ launchers use Telegram polling instead of the saved Render webhook.
 Use a normal current Linux Python runtime; no GPU or Docker is needed. The first
 install builds the native web UI and can take several minutes. Open the printed
 dashboard link through Colab's browser proxy. Username is `hermes`; the saved
-password is printed in your notebook. Keep the notebook private.
+password is shown only when you call `HERMES_COLAB.password()`. Keep the notebook private.
 
 In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
 `HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses
 to shut down on a failed backup. Colab can end a runtime without warning, so it
 is temporary hosting: work not uploaded before termination can be lost.
+
+Free Colab runs for **at most 12 hours**, and can end earlier due to idle timeouts,
+usage and availability. Pro+ supports up to **24 hours** of continuous execution
+with sufficient compute units. Primarily using an external web UI on the free
+tier without a positive compute balance can trigger termination without warning;
+Colab is not a reliable always-on Telegram/web host. See the
+[official Colab FAQ](https://research.google.com/colaboratory/faq.html).
+`HERMES_COLAB.status()` reports agent uptime, not guaranteed remaining VM time.
 
 **Your PC:** install Python 3.9+, Git and Docker Desktop (Windows/macOS) or
 Docker Engine (Linux). Start Docker, then run:

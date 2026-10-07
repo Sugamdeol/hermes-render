@@ -234,13 +234,26 @@ def descendants(parent):
 class ColabAgent:
     def __init__(self, process, env):
         self.process, self.env = process, env
+        self.started_at = time.monotonic()
 
     def status(self):
         with urllib.request.urlopen("http://127.0.0.1:10000/healthz", timeout=5) as response:
             payload = json.load(response)
         result = {name: payload.get(name) for name in ("gateway_running", "gateway_state", "gateway_platforms", "active_sessions")}
+        result["agent_uptime_hours"] = round((time.monotonic() - self.started_at) / 3600, 2)
         print(json.dumps(result, indent=2))
         return result
+
+    def password(self):
+        """Display the dashboard password only when explicitly requested."""
+        spec = importlib.util.spec_from_file_location("seed", TOOLS / "seed-env.py")
+        seed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(seed)
+        values = dict(seed.parse_dotenv((DATA / ".env").read_text()))
+        saved = DATA / ".render-runtime-env.json"
+        if saved.exists():
+            values.update(json.loads(saved.read_text()).get("variables", {}))
+        print("Username: hermes\nPassword:", values.get("HERMES_GATEWAY_TOKEN", "Password is not ready yet"))
 
     def backup(self):
         if self.process.poll() is not None:
@@ -318,14 +331,7 @@ def main():
         print("Open dashboard:", url)
     except ImportError:
         print("Dashboard: http://127.0.0.1:10000")
-    spec = importlib.util.spec_from_file_location("seed", TOOLS / "seed-env.py")
-    seed = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(seed)
-    values = dict(seed.parse_dotenv((DATA / ".env").read_text()))
-    saved = DATA / ".render-runtime-env.json"
-    if saved.exists():
-        values.update(json.loads(saved.read_text()).get("variables", {}))
-    print("Username: hermes\nPassword:", values.get("HERMES_GATEWAY_TOKEN", "Use your saved dashboard password"))
+    print("Username: hermes. Run HERMES_COLAB.password() to display your saved dashboard password.")
     print("Telegram polling is running. Use HERMES_COLAB.backup() and HERMES_COLAB.stop() before switching hosts.")
     return agent
 
