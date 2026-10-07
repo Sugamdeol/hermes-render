@@ -167,3 +167,19 @@ async def _legacy_chat(ws):
   module=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))
   with self.assertRaises(module['BridgeCompatibilityError']):
    module['patch']('async def gateway_ws(ws):\n    from tui_gateway.ws import handle_ws\n    await handle_ws(ws)\n')
+
+ def test_updater_keeps_unknown_chat_and_still_patches_dashboard(self):
+  import contextlib,io,tempfile
+  source=(ROOT/'update-chat-ui.py').read_text()
+  preflight='web = Path'+source.split('web = Path',1)[1].split('with urllib.request.urlopen',1)[0]
+  with tempfile.TemporaryDirectory() as td:
+   path=Path(td)/'web_server.py'
+   original=(ROOT/'tests/fixtures/dashboard-pinned.txt').read_text()
+   path.write_text(original)
+   namespace={'Path':lambda _:path,'tool_payloads':{
+    name:(ROOT/'scripts'/name).read_bytes() for name in ('patch-chat-bridge.py','patch-dashboard.py')}}
+   with contextlib.redirect_stdout(io.StringIO()) as output:
+    exec(compile(preflight,'updater-preflight','exec'),namespace)
+   self.assertIn('Chat compatibility:',output.getvalue())
+   self.assertIn('render dashboard reliability v2',namespace['code'])
+   self.assertEqual(path.read_text(),original)
