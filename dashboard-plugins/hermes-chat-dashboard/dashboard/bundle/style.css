@@ -1945,3 +1945,78 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
 .hcd .hcd-message { content-visibility: auto; contain-intrinsic-size: auto 180px; }
 .hcd .hcd-history-loading,.hcd .hcd-history-error { padding: 10px 16px; font-size: 13px; }
 .hcd .hcd-history-error { color: var(--hcd-danger); }
+
+/* v1.4: quiet workspace surfaces, a floating composer and quick feedback.
+   Semantic colors continue to come from the host theme. */
+.hcd {
+  --hcd-motion: 140ms;
+  --hcd-user-surface: color-mix(in srgb, var(--hcd-accent) 7%, var(--hcd-panel));
+  --hcd-control-hover: color-mix(in srgb, var(--hcd-fg) 7%, transparent);
+  --hcd-composer-shadow: 0 6px 24px #0002;
+  gap: 12px;
+}
+.hcd .hcd-main { background: var(--hcd-bg); border-radius: 22px; }
+.hcd .hcd-sidebar { background: color-mix(in srgb, var(--hcd-panel) 80%, var(--hcd-bg)); border-radius: 20px; padding: 18px 12px; gap: 14px; }
+.hcd .hcd-workspace-brand { display: flex; align-items: center; gap: 10px; padding: 0 6px 16px; }
+.hcd .hcd-brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 11px; background: var(--hcd-accent-soft); border: 1px solid var(--hcd-border-strong); font-size: 19px; font-weight: 700; color: var(--hcd-accent); }
+.hcd .hcd-workspace-brand strong { display: block; font-size: 17px; font-weight: 650; letter-spacing: -.4px; }
+.hcd .hcd-workspace-brand small { display: block; color: var(--hcd-muted); font-size: 11px; }
+.hcd .hcd-side-top { gap: 10px; }
+.hcd .hcd-new { border-radius: 12px; padding: 11px 14px; text-align: left; font-size: 13px; }
+.hcd .hcd-search { padding: 0; background: transparent; border: 0; }
+.hcd .hcd-search input { min-height: 39px; background: var(--hcd-bg); border-radius: 11px; }
+.hcd .hcd-side-tools button { border-color: transparent; background: transparent; color: var(--hcd-muted); }
+.hcd .hcd-conv { padding: 12px 11px; border-radius: 12px; border-color: transparent; }
+.hcd .hcd-conv.active { background: var(--hcd-accent-soft); border-color: var(--hcd-border-strong); box-shadow: inset 3px 0 var(--hcd-accent); }
+.hcd .hcd-conv-title { font-weight: 550; line-height: 1.5; }
+.hcd .hcd-conv-sub { margin-top: 4px; font-size: 10px; }
+.hcd .hcd-topbar { min-height: 70px; padding: 14px 22px; background: transparent; }
+.hcd .hcd-topbar button { border-color: transparent; background: transparent; border-radius: 10px; }
+.hcd .hcd-topbar button:hover { background: var(--hcd-control-hover); }
+.hcd .hcd-topbar button[aria-pressed="true"] { background: var(--hcd-accent-soft); }
+.hcd .hcd-scroll { padding: 32px 30px 12px; }
+.hcd .hcd-message { margin-bottom: 32px; }
+.hcd .hcd-avatar { border-radius: 10px; background: var(--hcd-accent-soft); border: 1px solid var(--hcd-border); color: var(--hcd-fg); font-weight: 650; }
+.hcd .hcd-user .hcd-avatar { background: var(--hcd-control-hover); }
+.hcd .hcd-user .hcd-bubble { background: var(--hcd-user-surface); border: 1px solid var(--hcd-border); padding: 15px 18px 10px; border-radius: 4px 18px 18px 18px; }
+.hcd .hcd-meta { margin-bottom: 9px; font-size: 11px; gap: 10px; }
+.hcd .hcd-meta strong { font-size: 12px; font-weight: 600; }
+.hcd .hcd-markdown h2 { font-size: 21px; letter-spacing: -.3px; margin-bottom: 14px; }
+.hcd .hcd-actions { gap: 4px; margin-top: 12px; opacity: 1; }
+.hcd .hcd-actions button { background: transparent; border-color: transparent; padding: 4px 8px; min-height: 30px; border-radius: 8px; font-size: 11px; }
+.hcd .hcd-message:hover .hcd-actions,.hcd .hcd-message:focus-within .hcd-actions { opacity: 1; }
+.hcd .hcd-actions button:hover { background: var(--hcd-control-hover); color: var(--hcd-fg); }
+.hcd .hcd-composer { border-radius: 22px; border: 1px solid var(--hcd-border-strong); padding: 16px; margin-bottom: 22px; background: var(--hcd-panel); box-shadow: var(--hcd-composer-shadow); }
+.hcd .hcd-composer:focus-within { border-color: var(--hcd-accent); }
+.hcd .hcd-composer textarea { min-height: 62px; background: transparent; }
+.hcd .hcd-composer-foot { border-top-color: var(--hcd-border); }
+.hcd .hcd-composer .hcd-send { background: var(--hcd-accent); color: var(--hcd-bg); border-color: transparent; border-radius: 13px; min-height: 42px; }
+.hcd .hcd-ctl-btn { border-radius: 9px; }
+.hcd :is(button,.hcd-conv,.hcd-composer,input) { transition: background-color var(--hcd-motion), border-color var(--hcd-motion), color var(--hcd-motion), opacity var(--hcd-motion); }
+.hcd button:not(:disabled):active { transform: translateY(1px); }
+.hcd .hcd-refresh:active { transform: translateY(-50%); }
+.hcd .hcd-welcome { max-width: 660px; margin-top: clamp(32px, 7vh, 80px); }
+.hcd .hcd-welcome-logo { width: 58px; height: 58px; border-radius: 18px; background: var(--hcd-accent-soft); border: 1px solid var(--hcd-border-strong); color: var(--hcd-accent); font-size: 26px; }
+.hcd .hcd-welcome-hero h2 { font-size: clamp(24px, 3vw, 32px); font-weight: 550; letter-spacing: -.7px; margin: 22px 0 12px; }
+.hcd .hcd-welcome-hero p { font-size: 14px; line-height: 1.7; max-width: 420px; opacity: 1; }
+.hcd .hcd-examples { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; text-align: left; }
+.hcd .hcd-examples h5 { grid-column: 1 / -1; font-size: 11px; font-weight: 500; color: var(--hcd-muted); margin: 12px 0 0; }
+.hcd .hcd-example { display: flex; justify-content: space-between; align-items: center; gap: 16px; text-align: left; padding: 16px; font-size: 13px; line-height: 1.6; border-radius: 13px; background: var(--hcd-panel); border: 1px solid var(--hcd-border); color: var(--hcd-fg); }
+.hcd .hcd-example:hover { border-color: var(--hcd-accent); background: var(--hcd-accent-soft); }
+.hcd .hcd-shortcut-hint { margin-top: 24px; font-size: 11px; }
+@container (max-width: 620px) {
+  .hcd .hcd-main { border-radius: 15px; }
+  .hcd .hcd-topbar { min-height: 60px; padding: 10px; }
+  .hcd .hcd-scroll { padding: 20px 12px 8px; }
+  .hcd .hcd-user .hcd-bubble { padding: 12px; }
+  .hcd .hcd-composer { padding: 12px; margin-bottom: max(10px, env(safe-area-inset-bottom)); border-radius: 18px; }
+  .hcd .hcd-composer textarea { font-size: 16px; min-height: 54px; }
+  .hcd .hcd-actions { flex-wrap: wrap; opacity: 1; }
+  .hcd .hcd-actions button { min-height: 36px; }
+  .hcd .hcd-examples { grid-template-columns: 1fr; }
+  .hcd .hcd-welcome { margin-top: 28px; }
+}
+@media (prefers-reduced-motion: reduce) { .hcd button:not(:disabled):active { transform: none; } }
+
+.hcd .hcd-ui-icon { flex: 0 0 auto; vertical-align: middle; }
+.hcd .hcd-composer-ctls .hcd-ctl-btn,.hcd .hcd-model-pick { display: inline-flex; align-items: center; gap: 7px; }

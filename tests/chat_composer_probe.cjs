@@ -10,7 +10,7 @@ function mount(overrides = {}) {
   const ctx = {
     useState: value => [value, () => {}], useRef: value => ({current: value}), useEffect: () => {},
     h: (type, props, ...children) => ({type, props: props || {}, children}),
-    cn: (...values) => values.filter(Boolean).join(' '), CommandBar() {},
+    UIIcon() {}, cn: (...values) => values.filter(Boolean).join(' '), CommandBar() {},
   };
   vm.createContext(ctx);
   vm.runInContext(composer + '\nthis.Composer = Composer;', ctx);

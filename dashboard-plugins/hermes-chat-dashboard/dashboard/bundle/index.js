@@ -1056,7 +1056,7 @@
     return h(
       "article",
       { className: cn("hcd-message", `hcd-${msg.role || "assistant"}`), id: msg.id || undefined },
-      h("div", { className: "hcd-avatar", title: roleLabel(msg.role) }, isHermes ? "H" : isUser ? "🧑" : isTool ? "⚙️" : "ℹ️"),
+      h("div", { className: "hcd-avatar", title: roleLabel(msg.role) }, isHermes ? "H" : isUser ? "Y" : isTool ? "⚙️" : "ℹ️"),
       h(
         "div",
         { className: "hcd-bubble" },
@@ -1143,6 +1143,15 @@
 
   // ── model picker (searchable; pin to favourites) ────────────────────
 
+  function UIIcon({name}) {
+    const paths = {
+      attach: "M21 11.5l-8.5 8.5a6 6 0 01-8.5-8.5l9-9a4 4 0 015.7 5.7l-9 9a2 2 0 01-2.8-2.8L15 7",
+      model: "M12 3l9 5-9 5-9-5 9-5z M3 12l9 5 9-5 M3 16l9 5 9-5",
+      tools: "M14 6l4 4 M3 21l8-8 M14 3a6 6 0 00-7 7L3 14a3 3 0 004 4l4-4a6 6 0 007-7l-4 4-4-4 4-4z",
+    };
+    return h("svg", {className:"hcd-ui-icon", width:16, height:16, viewBox:"0 0 24 24", fill:"none", stroke:"currentColor", strokeWidth:1.6, strokeLinecap:"round", strokeLinejoin:"round", "aria-hidden":true}, h("path", {d:paths[name] || paths.model}));
+  }
+
   function modelSwitchInput(id, models) {
     const entry = models.find(m => m.id === id);
     return entry ? `${entry.model} --provider ${entry.provider}` : id;
@@ -1214,7 +1223,7 @@
         "aria-label": "Choose model",
         "aria-expanded": open,
       },
-        "🧠 ", label, " ▾"),
+        h(UIIcon, {name:"model"}), label, " ▾"),
       open
         ? h("div", { className: "hcd-model-pop", role: "listbox" },
             h("input", {
@@ -1504,7 +1513,7 @@
         { className: "hcd-composer-foot" },
         h("div", { className: "hcd-composer-ctls" },
           h("label", { className: "hcd-file-btn", title: "Attach files" },
-            "📎",
+            h(UIIcon, {name:"attach"}),
             h("input", {
               type: "file",
               multiple: true,
@@ -1513,7 +1522,7 @@
               "aria-label": "Attach files",
             }),
           ),
-          h("button", { className: "hcd-ctl-btn", onClick: onOpenTools, title: "Tool configuration" }, `🧰 ${toolsSummary || "tools"}`),
+          h("button", { className: "hcd-ctl-btn", onClick: onOpenTools, title: "Tool configuration" }, h(UIIcon, {name:"tools"}), toolsSummary || "tools"),
           modes && modes.length
             ? h("select", {
                 className: "hcd-ctl-btn hcd-mode-select",
@@ -1704,7 +1713,8 @@
 
     return h("aside", { className: "hcd-sidebar", ref: sidebarRef },
       h("div", { className: "hcd-side-top" },
-        h("button", { className: "hcd-new", onClick: onNew, "aria-label": "New conversation" }, "＋ New conversation"),
+        h("div", { className: "hcd-workspace-brand" }, h("span", { className: "hcd-brand-mark", "aria-hidden": true }, "H"), h("div", null, h("strong", null, "Hermes"), h("small", null, "Your workspace"))),
+        h("button", { className: "hcd-new", onClick: onNew, "aria-label": "New conversation" }, "+ New conversation"),
         h("div", { className: "hcd-search" },
           h("input", {
             value: query,
@@ -1730,7 +1740,7 @@
             onClick: () => { setBulkMode(!bulkMode); if (bulkMode) bulkNone(); },
             "aria-pressed": bulkMode,
             title: "Select multiple conversations for bulk actions",
-          }, bulkMode ? "✓ Selecting" : "☐ Select"),
+          }, bulkMode ? "✓ Selecting" : "Select"),
           h("button", {
             className: cn("hcd-ctl-btn", showArchived && "on"),
             onClick: () => setShowArchived(!showArchived),
@@ -3565,7 +3575,7 @@
                   h("button", { onClick: () => setRenderLimit((r) => r + RENDER_WINDOW) }, `Show ${messages.length - renderLimit} earlier messages…`))
               : null,
             !messages.length && !generating
-              ? h(Welcome, { modes, onPick: (m) => { onModeChange(m.id); composerRef.current && composerRef.current.focus(); } })
+              ? h(Welcome, { modes, onExample: value => { setText(value); composerRef.current && composerRef.current.focus(); }, onPick: (m) => { onModeChange(m.id); composerRef.current && composerRef.current.focus(); } })
               : windowedMessages.map((m, i) =>
                   h(MessageView, {
                     key: m.id || `i${i}`,
@@ -3703,20 +3713,20 @@
 
   // ── welcome / mode picker ────────────────────────────────────────────
 
-  function Welcome({ modes, onPick }) {
+  function Welcome({ modes, onPick, onExample }) {
     const examples = [
       "Summarize this repository and its architecture",
-      "Research the latest changes in the EU AI Act",
+      "Help me revise chemical equilibrium for JEE",
       "Write a Python script that renames files by EXIF date",
-      "Explain CRDTs like I'm a senior engineer",
+      "Plan my research and save the useful findings",
     ];
     return h(
       "div",
       { className: "hcd-welcome" },
       h("div", { className: "hcd-welcome-hero" },
         h("div", { className: "hcd-welcome-logo" }, "H"),
-        h("h2", null, "How can I help you today?"),
-        h("p", null, "Chat runs on the real Hermes agent — tools, subagents, memory and all. Everything is stored server-side.")),
+        h("h2", null, "What shall we work on?"),
+        h("p", null, "A place to think, research and build. Pick a starting point or write your own.")),
       modes && modes.length
         ? h("div", { className: "hcd-mode-grid" },
             modes.slice(0, 8).map((m) =>
@@ -3732,7 +3742,7 @@
         : null,
       h("div", { className: "hcd-examples" },
         h("h5", null, "Try asking…"),
-        examples.map((e) => h("div", { key: e, className: "hcd-example" }, e))),
+        examples.map((e) => h("button", { key: e, className: "hcd-example", onClick: () => onExample(e) }, h("span", null, e), h("span", {"aria-hidden": true}, "↗")))),
       h("p", { className: "hcd-shortcut-hint" },
         "⌘K palette · ⌘⇧O new chat · ⌘/ focus input · / slash commands · Esc stops generation"),
     );
