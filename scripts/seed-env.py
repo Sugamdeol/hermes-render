@@ -191,7 +191,9 @@ def main(argv: "list[str] | None" = None) -> int:
         for key, value in values.items():
             if not isinstance(key, str) or not is_valid_key(key) or not isinstance(value, str):
                 raise ValueError("invalid saved environment entry")
-            if key in {"STORAGE_ENCRYPTION_KEY", "SOPS_AGE_KEY", "SOPS_AGE_KEY_FILE", "PORT", "HERMES_HOME"}:
+            if key in {"STORAGE_ENCRYPTION_KEY", "SOPS_AGE_KEY", "SOPS_AGE_KEY_FILE", "PORT", "HERMES_HOME",
+                       "GIT_STATE_WORKDIR", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                       "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"}:
                 continue
             overrides = {name.strip() for name in os.environ.get("HERMES_ENV_OVERRIDE_KEYS", "").split(",")}
             bootstrap_keys = {"GIT_STATE_TOKEN", "GITHUB_TOKEN", "GIT_STATE_REPO", "GIT_STATE_BRANCH"}
@@ -249,4 +251,3 @@ def main(argv: "list[str] | None" = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

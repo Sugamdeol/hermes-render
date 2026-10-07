@@ -1605,6 +1605,17 @@ class CompactionFenceTests(unittest.TestCase):
 
 
 class RuntimeEnvironmentBackupTests(unittest.TestCase):
+    def test_host_cache_and_checkpoint_paths_are_not_portable_settings(self):
+        storage = load_storage()
+        names = ["GIT_STATE_WORKDIR", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                 "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"]
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
+                {name: "host-specific" for name in names}, clear=True):
+            storage.capture_runtime_secrets(Path(directory), make_config(storage, env_mode="encrypt"))
+            values = json.loads((Path(directory) / ".render-runtime-env.json").read_text())["variables"]
+            for name in names:
+                self.assertNotIn(name, values)
+
     def test_settings_and_custom_credentials_are_encrypted_backup_candidates(self):
         storage = load_storage()
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "123", "CUSTOM_PROVIDER_URL": "https://custom/v1", "CUSTOM_CREDENTIAL": "secret", "HERMES_API_MAX_RETRIES": "10", "STORAGE_ENCRYPTION_KEY": "bootstrap-only", "RENDER_EXTERNAL_URL": "https://old-service", "PATH": "/old/bin"}, clear=True):

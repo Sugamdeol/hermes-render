@@ -1799,6 +1799,8 @@ def capture_runtime_secrets(data_dir: Path, config: GitConfig) -> None:
                  "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "PORT",
                  "VIRTUAL_ENV", "UV_LINK_MODE", "UV_COMPILE_BYTECODE",
                  "HERMES_HOME", "HERMES_TUI_DIR", "GIT_STATE_SEED_ON_BOOT",
+                 "GIT_STATE_WORKDIR", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                 "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS",
                  "TELEGRAM_WEBHOOK_URL", "TELEGRAM_WEBHOOK_PORT", "TELEGRAM_WEBHOOK_SECRET"}
     runtime = {key: value for key, value in os.environ.items()
                if key not in excluded and key not in host_keys

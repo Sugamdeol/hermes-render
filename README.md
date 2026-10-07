@@ -6,6 +6,49 @@ and private GitHub persistence. This replaces the Nanobot deployment.
 
 [Deploy with Render Blueprint](https://dashboard.render.com/select-repo?type=blueprint)
 
+## Single-file Colab and PC launchers
+
+Download just **run-colab.py** or **run-local.py**. Each automatically downloads
+the current application code and restores the same private
+`Sugamdeol/hermes-storage` repository and `state` branch. Supply your GitHub
+storage token and the **existing** encryption key through the hidden prompts.
+Providers, Telegram credentials, memories, skills, plugins and chat history
+come from that backup. Neither launcher creates an empty replacement when
+the existing backup cannot be restored.
+
+Before switching hosts, finish/stop active tasks, wait for a successful backup,
+and stop the old Render/local/Colab copy. Type `SWITCH` in the new launcher to
+confirm. Run only one copy against this bot and snapshot repository. Both new
+launchers use Telegram polling instead of the saved Render webhook.
+
+**Colab:** paste the entire `run-colab.py` file into one code cell and run it.
+Use a normal current Linux Python runtime; no GPU or Docker is needed. The first
+install builds the native web UI and can take several minutes. Open the printed
+dashboard link through Colab's browser proxy. Username is `hermes`; the saved
+password is printed in your notebook. Keep the notebook private.
+
+In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
+`HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses
+to shut down on a failed backup. Colab can end a runtime without warning, so it
+is temporary hosting: work not uploaded before termination can be lost.
+
+**Your PC:** install Python 3.9+, Git and Docker Desktop (Windows/macOS) or
+Docker Engine (Linux). Start Docker, then run:
+
+```sh
+python run-local.py
+python run-local.py logs
+python run-local.py backup
+python run-local.py stop
+```
+
+On Windows, `py run-local.py` works too. The dashboard binds only to
+`http://127.0.0.1:10000`; use `--port 10001` if needed. Username and saved password
+are shown after startup. `python run-local.py password` shows the password again.
+The local data and Git clone live in persistent Docker volumes, which are kept
+when stopping. Stop the container before restarting Render or Colab. A failed
+backup leaves it running so you can inspect logs and retry.
+
 ## Setup
 
 1. Select this repository in the Render account where you want the service.

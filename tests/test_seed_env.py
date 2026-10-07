@@ -254,6 +254,22 @@ if __name__ == "__main__":
 
 
 class SavedRuntimeTests(unittest.TestCase):
+    def test_migration_does_not_load_old_host_paths_or_launcher_overrides(self):
+        import contextlib, io, json
+        seed = load_seed_env()
+        names = ["GIT_STATE_WORKDIR", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                 "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"]
+        with TemporaryDirectory() as directory:
+            env = Path(directory) / ".env"
+            env.write_text('HERMES_GATEWAY_TOKEN=saved\nGIT_STATE_WORKDIR=/old/path\n')
+            (env.parent / ".render-runtime-env.json").write_text(json.dumps({"version": 1,
+                "variables": {name: "old-host-only" for name in names}}))
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, {"HERMES_ENV_OVERRIDE_KEYS": "CUSTOM"}, clear=True), contextlib.redirect_stdout(output):
+                seed.main(["--env-file", str(env), "--load-existing"])
+            for name in names:
+                self.assertNotIn(f"export {name}=", output.getvalue())
+
     def test_cold_boot_exports_settings_tokens_and_exact_values(self):
         import contextlib, io, json
         seed = load_seed_env()
