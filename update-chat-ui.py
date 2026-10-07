@@ -6,7 +6,7 @@ import tempfile
 import urllib.request
 
 EXPECTED = {'bundle/index.js': 'ae278176b301104233391e04f4f09544c8f11771985aa52254c1abeccd7f079d', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '65edab15d6ecbc083db1657a2ee5aee06f9f4a5f6b0a825d8d7fbabc801eaa83', 'plugin_api.py': '6cd9e0ee22a74300bd1d2c52c8f84c032c824de1208cd049191f06c7ae450d0f'}
-LAUNCHER_SHA = 'b7deb98889f61fc580a1e7926138896c2984f3ff612faa3a0b279d745eebdc67'
+LAUNCHER_SHA = '8eb62d2ccd38d10e46fcad84b2ef222285fa15702b0472bf78f7339dbb07574e'
 BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/main/dashboard-plugins/hermes-chat-dashboard/dashboard/'
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
@@ -83,7 +83,8 @@ while time.monotonic() < deadline:
             import json
             status = json.load(response)
         if status.get('gateway_running') and status.get('gateway_state') == 'running':
-            print('Updated, backed up and restarted. Press Ctrl+Shift+R on your dashboard.')
+            HERMES_COLAB.dashboard()
+            print('Updated, backed up and restarted. Refresh your dashboard.')
             break
     except (OSError, ValueError):
         pass

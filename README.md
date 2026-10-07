@@ -12,7 +12,10 @@ and private GitHub persistence. This replaces the Nanobot deployment.
 
 Open the notebook above. Once only, add `GIT_STATE_TOKEN` and the existing
 `STORAGE_ENCRYPTION_KEY` to Colab's Secrets panel and enable Notebook access.
-Then press **▶ Start Hermes**. Future runtimes reuse those account secrets;
+Then press **▶ Start Hermes**. It starts the dashboard and Telegram together,
+waits for them to be ready and shows an **Open Dashboard** button.
+Use `HERMES_COLAB.dashboard()` to show the button again.
+Future runtimes reuse those account secrets;
 no source copying, Drive mount, model setup or Telegram setup is required.
 Missing secrets use hidden prompts. Stop your other host before pressing Run.
 Colab may ask you to connect/approve execution; the launcher cannot skip that.

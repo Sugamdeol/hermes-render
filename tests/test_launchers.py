@@ -108,6 +108,33 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('finally:',source)
         self.assertEqual(cells[0]['outputs'],[])
 
+    def test_colab_forces_dashboard_enabled_on_private_port(self):
+        module = load('run-colab')
+        with patch.dict(os.environ, {'HERMES_DASHBOARD':'0'}, clear=True):
+            env = module.runtime_env('token','key')
+        self.assertEqual(env['HERMES_DASHBOARD'],'1')
+        self.assertEqual(env['HERMES_DASHBOARD_HOST'],'127.0.0.1')
+        self.assertEqual(env['HERMES_DASHBOARD_PORT'],'9119')
+        for key in ('HERMES_DASHBOARD','HERMES_DASHBOARD_HOST','HERMES_DASHBOARD_PORT'):
+            self.assertIn(key,env['HERMES_ENV_OVERRIDE_KEYS'].split(','))
+
+    def test_colab_dashboard_button_uses_proxy_and_keeps_credentials_private(self):
+        from types import ModuleType, SimpleNamespace
+        module = load('run-colab')
+        fake = ModuleType('google.colab')
+        url = 'https://runtime.example.test/?value="quoted"'
+        fake.output = SimpleNamespace(eval_js=lambda code:url)
+        display_module = ModuleType('IPython.display')
+        display_module.HTML = lambda html:html
+        shown = []
+        display_module.display = shown.append
+        with patch.dict(sys.modules, {'google.colab':fake, 'IPython.display':display_module}):
+            agent = module.ColabAgent(None, {'GIT_STATE_TOKEN':'private-token'})
+            self.assertEqual(agent.dashboard(),url)
+        self.assertIn('Open Dashboard',shown[0])
+        self.assertIn('&quot;quoted&quot;',shown[0])
+        self.assertNotIn('private-token',shown[0])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -15,6 +15,7 @@ Colab runtimes are temporary. An abrupt runtime deletion cannot run a final
 save; automatic backups preserve only work that reached GitHub beforehand.
 """
 import getpass
+import html
 import hashlib
 import importlib.util
 import json
@@ -80,6 +81,8 @@ def runtime_env(token, key):
         "HERMES_TUI_DIR": str(INSTALL / "ui-tui"),
         "VIRTUAL_ENV": str(INSTALL / ".venv"),
         "PYTHONUNBUFFERED": "1", "HERMES_DASHBOARD_TUI": "1",
+        "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
+        "HERMES_DASHBOARD_PORT": "9119",
         "MALLOC_ARENA_MAX": "1", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
     }
     values["HERMES_ENV_OVERRIDE_KEYS"] = ",".join([*values, "PATH", "HERMES_ENV_OVERRIDE_KEYS"])
@@ -265,6 +268,29 @@ class ColabAgent:
         print(json.dumps(result, indent=2))
         return result
 
+    def dashboard(self):
+        """Show a clickable dashboard link through the Colab browser proxy."""
+        try:
+            from google.colab import output
+        except ImportError:
+            print("Dashboard: http://127.0.0.1:10000")
+            return "http://127.0.0.1:10000"
+        try:
+            url = output.eval_js("google.colab.kernel.proxyPort(10000)")
+        except Exception:
+            print("Could not create the browser link. Retry HERMES_COLAB.dashboard() in a notebook cell.")
+            return None
+        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
+            raise RuntimeError("Colab did not return a valid dashboard URL")
+        from IPython.display import HTML, display
+        display(HTML('<a href="' + html.escape(url, quote=True) +
+                     '" target="_blank" rel="noopener noreferrer" '
+                     'style="display:inline-block;padding:12px 20px;border-radius:10px;'
+                     'background:#087f70;color:white;text-decoration:none;font-weight:600">'
+                     'Open Dashboard ↗</a>'))
+        print("Username: hermes. Run HERMES_COLAB.password() for your saved password.")
+        return url
+
     def password(self):
         """Display the dashboard password only when explicitly requested."""
         spec = importlib.util.spec_from_file_location("seed", TOOLS / "seed-env.py")
@@ -312,6 +338,7 @@ def main(confirm_switch=False):
     previous = globals().get("HERMES_COLAB")
     if previous and previous.process.poll() is None:
         print("Already running. Use HERMES_COLAB.status() or HERMES_COLAB.stop().")
+        ColabAgent.dashboard(previous)
         return previous
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", 10000)) == 0:
@@ -346,13 +373,7 @@ def main(confirm_switch=False):
         time.sleep(2)
     else:
         raise RuntimeError(f"Startup is still pending. Inspect {LOG} and use HERMES_COLAB.status()")
-    try:
-        from google.colab import output
-        url = output.eval_js("google.colab.kernel.proxyPort(10000)")
-        print("Open dashboard:", url)
-    except ImportError:
-        print("Dashboard: http://127.0.0.1:10000")
-    print("Username: hermes. Run HERMES_COLAB.password() to display your saved dashboard password.")
+    agent.dashboard()
     print("Telegram polling is running. Use HERMES_COLAB.backup() and HERMES_COLAB.stop() before switching hosts.")
     return agent
 
