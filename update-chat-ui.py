@@ -1,4 +1,4 @@
-"""Run in the existing Colab notebook to install and back up the chat UI."""
+"""Run in the existing Colab notebook to install dashboard fixes and back up the chat UI."""
 from pathlib import Path
 import hashlib
 import os
@@ -7,8 +7,8 @@ import urllib.request
 
 EXPECTED = {'bundle/index.js': '9a27a4bbf1db59847284ec6efd7482bc641167aab9918c9bff19d3afa73695f8', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': 'ad69bcf5f5c1c746a5b9dd35a46082f506d44f9bfbc12b307f51a94d712b79ff', 'plugin_api.py': 'c2b9283e6e96b1692a7e510e48c37356726df941b9b71f77896a6d86be8cd90d'}
 LAUNCHER_SHA = 'b383691b085f6ec2c51a55e9479f5f69a51b69711aea195fcec7302383f733f8'
-BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/f6014949d4623c6cf62fc104d922b31f7c64162b/dashboard-plugins/hermes-chat-dashboard/dashboard/'
-TOOLS_EXPECTED = {'chat-bridge.py': 'b7f7301f5c6d50d96a00d06c75cc3d6ecad4e44b1de2a9ccbea9f8cf9896d8eb', 'patch-chat-bridge.py': 'e45faa08e831fc19c17a3673c1a5321364b91c67c4bd944ac7effaa776853a26'}
+BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/b56d2dd82959ba9012c2386b62079d99c2a56e8d/dashboard-plugins/hermes-chat-dashboard/dashboard/'
+TOOLS_EXPECTED = {'chat-bridge.py': 'b7f7301f5c6d50d96a00d06c75cc3d6ecad4e44b1de2a9ccbea9f8cf9896d8eb', 'patch-chat-bridge.py': 'e45faa08e831fc19c17a3673c1a5321364b91c67c4bd944ac7effaa776853a26', 'dashboard-runtime.py': 'f2e1f692a1ee3be6458e8159d99e198d8fd47bbd0092ad9aa7c71a6c58f697f8', 'patch-dashboard.py': '0f61d9f219187cf06d5edad3a15fa1e6c8348f8db5b6331138d8a0cd595b68af', 'debug-master.js': '967ef89275e56bbb7641f957cecb50af3131415375c8769592b6c6ddb54d886c', 'repair-dashboard-plugins.py': '537388dc0419122f7f742c13f5f7833f6baf1bdeb5b88e41636c8f759ee8cf62', 'bootstrap.sh': '01485bf50a06d8b72ed686ec6024d93f5fef6eb79949ac230d8a91dc09783774'}
 ROOT_URL = BASE.split('/dashboard-plugins/')[0]
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
@@ -27,15 +27,19 @@ for name, digest in TOOLS_EXPECTED.items():
         payload = response.read()
     if hashlib.sha256(payload).hexdigest() != digest:
         raise RuntimeError('Chat bridge download failed verification; no files changed.')
-    compile(payload, name, 'exec')
+    if name.endswith('.py'):
+        compile(payload, name, 'exec')
     tool_payloads[name] = payload
 web = Path('/opt/hermes/hermes_cli/web_server.py')
 namespace = {'__name__': 'verified_chat_bridge_patch'}
 exec(compile(tool_payloads['patch-chat-bridge.py'], 'patch-chat-bridge.py', 'exec'), namespace)
 code = namespace['patch'](web.read_text())
+namespace = {'__name__': 'verified_dashboard_patch'}
+exec(compile(tool_payloads['patch-dashboard.py'], 'patch-dashboard.py', 'exec'), namespace)
+code = namespace['patch'](code)
 if '_lite_pty_lock = asyncio.Lock()' not in code:
     raise RuntimeError('Unknown dashboard version; update the full launcher first.')
-with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/f6014949d4623c6cf62fc104d922b31f7c64162b/run-colab.py', timeout=60) as response:
+with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/b56d2dd82959ba9012c2386b62079d99c2a56e8d/run-colab.py', timeout=60) as response:
     launcher = response.read()
 if hashlib.sha256(launcher).hexdigest() != LAUNCHER_SHA:
     raise RuntimeError('Launcher version changed. Download the latest updater and retry.')
@@ -62,8 +66,10 @@ for destination in (target, Path('/opt/render-tools/dashboard-plugins/hermes-cha
     for name, payload in payloads.items():
         atomic_write(destination / name, payload)
 for name, payload in tool_payloads.items():
-    atomic_write(Path("/opt/render-tools") / name, payload)
+    atomic_write(Path("/opt/render-tools") / name, payload, 0o755 if name.endswith('.sh') else 0o644)
 atomic_write(web, code.encode())
+run_repair = __import__("runpy").run_path("/opt/render-tools/repair-dashboard-plugins.py")
+run_repair["repair"](target.parent.parent)
 launcher_path = Path('/content/hermes-colab-launcher.py')
 atomic_write(launcher_path, launcher, 0o600)
 import runpy
