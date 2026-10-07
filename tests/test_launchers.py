@@ -172,6 +172,28 @@ class LauncherTests(unittest.TestCase):
         password.assert_called_once()
         self.assertIn('example.trycloudflare.com',display.display.call_args.args[0])
 
+    def test_cloudflared_direct_download_retries_without_release_api(self):
+        module = load('run-colab')
+        with patch.object(module.shutil,'which',return_value=None), patch.object(module.urllib.request,'urlopen',side_effect=OSError('download unavailable')) as fetch, patch.object(module.time,'sleep'):
+            with self.assertRaisesRegex(OSError,'download unavailable'):
+                module.install_cloudflared()
+        self.assertEqual(fetch.call_count,3)
+        self.assertIn('/releases/download/2026.10.0/',fetch.call_args.args[0].full_url)
+        self.assertNotIn('api.github.com',fetch.call_args.args[0].full_url)
+
+    def test_cloudflare_failure_is_visible_without_credentials(self):
+        import contextlib,io
+        from types import ModuleType,SimpleNamespace
+        module = load('run-colab')
+        fake = ModuleType('google.colab')
+        fake.output = SimpleNamespace(eval_js=lambda code:'https://runtime.colab.dev',serve_kernel_port_as_iframe=Mock())
+        agent = module.ColabAgent(None,{'GIT_STATE_TOKEN':'private-token'})
+        text = io.StringIO()
+        with patch.dict(sys.modules,{'google.colab':fake}), patch.object(module.ColabAgent,'start_tunnel',side_effect=RuntimeError('DNS failed private-token')), patch.object(agent,'password'), contextlib.redirect_stdout(text):
+            agent.dashboard()
+        self.assertIn('DNS failed',text.getvalue())
+        self.assertNotIn('private-token',text.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

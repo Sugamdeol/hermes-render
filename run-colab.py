@@ -121,15 +121,24 @@ def install_cloudflared():
     if binary:
         return binary
     arch = "arm64" if os.uname().machine in ("aarch64", "arm64") else "amd64"
-    request = urllib.request.Request("https://api.github.com/repos/cloudflare/cloudflared/releases/latest",
-                                     headers={"User-Agent": "Hermes-Colab"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        release = json.load(response)
-    asset = next(a for a in release["assets"] if a["name"] == "cloudflared-linux-" + arch)
-    with urllib.request.urlopen(asset["browser_download_url"], timeout=60) as response:
-        payload = response.read()
-    digest = asset.get("digest")
-    if digest and digest.startswith("sha256:") and hashlib.sha256(payload).hexdigest() != digest[7:]:
+    # Fixed official release avoids GitHub's unauthenticated API rate limit
+    # on shared Colab IPs and verifies the published binary checksum.
+    checksums = {
+        "amd64": "d33ff2d14475178d2012c2c56beba87389ac5ded27649519f198a7d3134a99db",
+        "arm64": "e6422b9d4f72d3194bc5a38676f13667c06666523217b842a877d72a80b5ac08",
+    }
+    url = "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-linux-" + arch
+    for attempt in range(3):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "Hermes-Colab"})
+            with urllib.request.urlopen(request, timeout=60) as response:
+                payload = response.read()
+            break
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+    if hashlib.sha256(payload).hexdigest() != checksums[arch]:
         raise RuntimeError("cloudflared checksum mismatch")
     target = Path("/usr/local/bin/cloudflared")
     fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".cloudflared-")
@@ -315,6 +324,7 @@ class ColabAgent:
         if existing and existing.poll() is None and getattr(self, "tunnel_url", None):
             return self.tunnel_url
         ColabAgent.stop_tunnel(self)
+        print("Starting Cloudflare tunnel…")
         binary = install_cloudflared()
         home = Path("/content/hermes-cloudflare")
         home.mkdir(mode=0o700, exist_ok=True)
@@ -323,20 +333,22 @@ class ColabAgent:
         with os.fdopen(fd, "w") as logfile:
             self.tunnel_process = subprocess.Popen(
                 [binary, "tunnel", "--url", "http://127.0.0.1:10000", "--no-autoupdate", "--protocol", "http2"],
-                env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                env={**{key: os.environ[key] for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                      "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
+                      if key in os.environ}, "HOME": str(home), "PATH": os.environ.get("PATH", "")},
                 stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if self.tunnel_process.poll() is not None:
                 ColabAgent.stop_tunnel(self)
-                raise RuntimeError("Cloudflare tunnel exited; inspect /content/hermes-cloudflare/tunnel.log")
+                raise RuntimeError("Cloudflare tunnel exited: " + log.read_text(errors="replace")[-2000:])
             match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log.read_text(errors="replace"))
             if match:
                 self.tunnel_url = match.group(0)
                 return self.tunnel_url
             time.sleep(1)
         ColabAgent.stop_tunnel(self)
-        raise RuntimeError("Cloudflare tunnel timed out; retry HERMES_COLAB.dashboard()")
+        raise RuntimeError("Cloudflare tunnel timed out: " + log.read_text(errors="replace")[-2000:])
 
     def dashboard(self):
         """Open the dashboard in Colab's supported embedded browser context."""
@@ -344,7 +356,12 @@ class ColabAgent:
             cloudflare_url = ColabAgent.start_tunnel(self)
         except Exception as exc:
             cloudflare_url = None
-            print("Cloudflare link unavailable:", type(exc).__name__, "— retry HERMES_COLAB.dashboard().")
+            detail = str(exc)
+            for name, value in getattr(self, "env", {}).items():
+                if value and re.search(r"TOKEN|KEY|PASSWORD|SECRET", name):
+                    detail = detail.replace(value, "[redacted]")
+            print("Cloudflare link unavailable:", type(exc).__name__, detail[:2000])
+            print("Tunnel logs: /content/hermes-cloudflare/tunnel.log. Retry HERMES_COLAB.dashboard().")
         colab_url = None
         try:
             from google.colab import output
