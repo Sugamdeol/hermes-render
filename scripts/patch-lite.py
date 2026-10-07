@@ -29,10 +29,7 @@ path.write_text(dashboard_patch["patch"](path.read_text()))
 
 path = root / "hermes_cli/web_server.py"
 old = '@app.websocket("/api/pty")\nasync def pty_ws(ws: WebSocket) -> None:\n'
-new = '''_lite_pty_lock = asyncio.Lock()
-
-
-@app.websocket("/api/pty")
+new = '''@app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     if _lite_pty_lock.locked():
         await ws.close(code=4429)

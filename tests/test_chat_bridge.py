@@ -96,7 +96,9 @@ class BridgePatch(unittest.TestCase):
  def test_patch_keeps_authentication_and_is_idempotent(self):
   import runpy
   patch=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))['patch']
-  source='''async def gateway_ws(ws):
+  source='''import asyncio
+_lite_pty_lock = asyncio.Lock()
+async def gateway_ws(ws):
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
         await ws.close(code=4403)
         return
@@ -112,3 +114,56 @@ class BridgePatch(unittest.TestCase):
   self.assertEqual(fixed.split('    import importlib.util')[0],source.split('    from tui_gateway.ws')[0])
   self.assertEqual(patch(fixed),fixed)
   self.assertIn('app.add_event_handler("shutdown", module.bridge.shutdown)',fixed)
+
+ def test_renamed_handler_is_found_by_route_and_retains_auth(self):
+  import runpy
+  patch=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))['patch']
+  source='''@app.websocket("/api/ws")
+async def chat_socket(websocket):
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        await websocket.close(code=4401)
+        return
+    if not _ws_client_is_allowed(websocket):
+        await websocket.close(code=4403)
+        return
+    import asyncio
+    cmd = ["python", "-m", "tui_gateway.entry"]
+    await run_stdio(websocket, cmd)
+'''
+  result=patch(source)
+  self.assertIn('await module.handle_ws(websocket)',result)
+  self.assertIn('await websocket.close(code=4401)',result)
+  self.assertEqual(patch(result),result)
+
+ def test_legacy_wrapper_does_not_lock_twice(self):
+  import runpy
+  patch=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))['patch']
+  source='''import asyncio
+_lite_pty_lock = asyncio.Lock()
+@app.websocket("/api/ws")
+async def chat_socket(ws):
+    async with _lite_pty_lock:
+        await _legacy_chat(ws)
+async def _legacy_chat(ws):
+    if not hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        return
+    if not _ws_client_is_allowed(ws):
+        return
+    from tui_gateway.ws import handle_ws
+    await handle_ws(ws)
+'''
+  result=patch(source)
+  self.assertEqual(result.count('async with _lite_pty_lock:'),1)
+  self.assertEqual(patch(result),result)
+
+ def test_unsupported_handler_has_clear_error_instead_of_stopiteration(self):
+  import runpy
+  module=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))
+  with self.assertRaises(module['BridgeCompatibilityError']):
+   module['patch']('async def other_route(ws):\n    pass\n')
+
+ def test_unknown_authentication_is_never_replaced(self):
+  import runpy
+  module=runpy.run_path(str(ROOT/'scripts/patch-chat-bridge.py'))
+  with self.assertRaises(module['BridgeCompatibilityError']):
+   module['patch']('async def gateway_ws(ws):\n    from tui_gateway.ws import handle_ws\n    await handle_ws(ws)\n')
