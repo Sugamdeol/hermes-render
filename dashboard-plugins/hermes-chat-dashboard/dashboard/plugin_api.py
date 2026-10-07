@@ -136,7 +136,7 @@ def _default_modes(toolsets: list[dict]) -> list[dict]:
 
 
 @router.get("/capabilities")
-async def capabilities(request: Request):
+def capabilities(request: Request):
     _require_session(request)
     cfg = _load_config()
 
@@ -516,7 +516,7 @@ def _row_summary(s: dict, snippet: str = "") -> dict:
 
 
 @router.get("/sessions")
-async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = ""):
+def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = ""):
     """List stored conversations (works even when the gateway WebSocket is down).
 
     Mirrors the gateway's ``session.list`` shape (id/title/preview/started_at/
@@ -574,31 +574,35 @@ async def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0
 
 
 def _get_messages_page(db: Any, session_id: str, limit: int, offset: int) -> tuple[list, int]:
-    """One chronological page of messages plus the total row count.
-
-    The pinned ``SessionDB.get_messages(session_id)`` takes no limit/offset, so
-    pagination is applied here (load once per request, return only the page —
-    transcripts are never retained between requests).  Newer surfaces that do
-    accept ``limit``/``offset`` are used directly.
-    """
+    """Read one bounded page, using the pinned database schema directly."""
+    conn = getattr(db, "_conn", None)
+    if conn is not None:
+        from contextlib import nullcontext
+        with getattr(db, "_lock", nullcontext()):
+            total = int(conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)).fetchone()[0])
+            start = max(0, total + offset) if offset < 0 else max(0, offset)
+            rows = conn.execute("SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp, id LIMIT ? OFFSET ?", (session_id, limit, start)).fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            decoder = getattr(db, "_decode_content", None)
+            if callable(decoder):
+                msg["content"] = decoder(msg.get("content"))
+            if isinstance(msg.get("tool_calls"), str):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (ValueError, TypeError):
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result, total
+    # Compatibility only for alternate backends without the pinned SQLite connection.
     fn = getattr(db, "get_messages", None)
     if not callable(fn):
         return [], 0
-    try:
-        rows = fn(session_id, limit=limit, offset=offset) or []
-        # With native pagination we cannot know the total cheaply; the
-        # session row's message_count is the best estimate.
-        return list(rows), max(len(rows) + offset, 0)
-    except TypeError:
-        pass  # pinned surface: get_messages(session_id) only
-    except Exception:
-        return [], 0
-    try:
-        rows = fn(session_id) or []
-    except Exception:
-        return [], 0
+    rows = fn(session_id) or []
     total = len(rows)
-    return list(rows[offset:offset + limit]), total
+    start = max(0, total + offset) if offset < 0 else max(0, offset)
+    return list(rows[start:start + limit]), total
 
 
 def _message_rows(records: list, session_id: str, offset: int) -> list[dict]:
@@ -633,11 +637,11 @@ def _message_rows(records: list, session_id: str, offset: int) -> list[dict]:
 
 
 @router.get("/sessions/{session_id}")
-async def get_chat_session(request: Request, session_id: str, limit: int = 0, offset: int = 0):
+def get_chat_session(request: Request, session_id: str, limit: int = 0, offset: int = 0):
     """Transcript for one conversation (read-only; no gateway needed).
 
     ``limit``/``offset`` page through the stored rows oldest-first.  ``limit=0``
-    (or absent) returns everything — the lazy-load path used when a saved chat
+    (or absent) returns a bounded default page — the lazy-load path used when a saved chat
     is first opened asks for the newest page only.
     """
     _require_session(request)
@@ -648,30 +652,11 @@ async def get_chat_session(request: Request, session_id: str, limit: int = 0, of
         session = db.get_session(session_id)
         if not session:
             raise HTTPException(status_code=404, detail="session not found")
-        fn = getattr(db, "get_messages", None)
-        if limit <= 0 or offset < 0:
-            # full fetch path: no pagination, or a negative offset which asks
-            # for the NEWEST page ("offset=-N&limit=N" → last N messages)
-            records = []
-            if callable(fn):
-                try:
-                    records = fn(session_id) or []
-                except Exception:
-                    records = []
-            total = len(records)
-            if limit <= 0:
-                messages = _message_rows(list(records), session_id, 0)
-                offset_out = 0
-            else:
-                limit = min(limit, MAX_SESSION_ROWS)
-                real = max(0, total + offset)
-                messages = _message_rows(records[real:real + limit], session_id, real)
-                offset_out = real
-        else:
-            limit = min(limit, MAX_SESSION_ROWS)
-            records, total = _get_messages_page(db, session_id, limit, offset)
-            messages = _message_rows(records, session_id, offset)
-            offset_out = offset
+        # All UI requests are bounded; full exports use their separate endpoint.
+        limit = max(1, min(limit or 80, MAX_SESSION_ROWS))
+        records, total = _get_messages_page(db, session_id, limit, offset)
+        offset_out = max(0, total + offset) if offset < 0 else max(0, offset)
+        messages = _message_rows(records, session_id, offset_out)
         return {
             "session": session,
             "messages": messages,
@@ -690,7 +675,7 @@ async def get_chat_session(request: Request, session_id: str, limit: int = 0, of
 
 
 @router.get("/sessions/{session_id}/tree")
-async def get_session_tree(request: Request, session_id: str):
+def get_session_tree(request: Request, session_id: str):
     """Branch lineage: the parent session plus every direct child (branches,
     compression continuations).  Children are discovered through
     ``list_sessions_rich(include_children=True)`` when the pinned runtime
@@ -811,7 +796,7 @@ async def delete_chat_session(request: Request, session_id: str):
 
 
 @router.get("/usage")
-async def usage_summary(request: Request, days: int = 14):
+def usage_summary(request: Request, days: int = 14):
     """Token usage rollups (per day, per model) derived from session rows.
 
     Cheap: one ``list_sessions_rich`` pass over the window — no message bodies

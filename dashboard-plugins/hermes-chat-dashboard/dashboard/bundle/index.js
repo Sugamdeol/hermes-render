@@ -1026,7 +1026,7 @@
 
   // ── message ─────────────────────────────────────────────────────────
 
-  function MessageView({ msg, index, active, onAction, showTime, showUsage }) {
+  function MessageViewBase({ msg, index, active, onAction, showTime, showUsage }) {
     const bodyRef = useRef(null);
     const [reasoningOpen, setReasoningOpen] = useState(null); // null = auto
     useEffect(() => {
@@ -1051,7 +1051,7 @@
     const reasoning = str(msg.reasoning || "");
     const thinking = str(msg.thinking || "");
     const hasStreamedThought = (reasoning || thinking).trim().length > 0;
-    const bodyContent = renderMarkdown(contentText || (active ? "▌" : "")) + (active && contentText ? '<span class="hcd-cursor">▌</span>' : "");
+    const bodyContent = (active ? esc(contentText).replace(/\n/g, "<br>") : compactRaw ? "" : renderMarkdown(contentText)) + (active && contentText ? '<span class="hcd-cursor">▌</span>' : "");
 
     return h(
       "article",
@@ -1117,6 +1117,8 @@
     );
   }
 
+  const MessageView = React.memo(MessageViewBase);
+
   // ── context meter (header) ──────────────────────────────────────────
 
   function ContextMeter({ usage, contextWindow, onCompact, disabled }) {
@@ -1141,6 +1143,11 @@
 
   // ── model picker (searchable; pin to favourites) ────────────────────
 
+  function modelSwitchInput(id, models) {
+    const entry = models.find(m => m.id === id);
+    return entry ? `${entry.model} --provider ${entry.provider}` : id;
+  }
+
   function ModelPicker({ models, pinned, value, onChange, onPinnedChange, disabled }) {
     const [open, setOpen] = useState(false);
     const [q, setQ] = useState("");
@@ -1163,7 +1170,7 @@
       return () => document.removeEventListener("mousedown", close);
     }, [open]);
 
-    const chosen = models.find((m) => m.id === value) || null;
+    const chosen = models.find((m) => m.id === value || m.model === value) || null;
     const label = value === "auto" || !value ? "Auto" : `${chosen?.provider || ""}${chosen ? "/" : ""}${chosen?.name || chosen?.model || value}`;
     const ql = q.trim().toLowerCase();
     const pins = (Array.isArray(pinned) ? pinned : []).map((p) => String(p));
@@ -1960,8 +1967,8 @@
 
   // ── main component ──────────────────────────────────────────────────
 
-  const PAGE = 200;        // transcript page size (REST)
-  const RENDER_WINDOW = 400; // max messages mounted in the DOM at once
+  const PAGE = 80;        // transcript page size (REST)
+  const RENDER_WINDOW = 160; // max messages mounted in the DOM at once
   const MAX_TOOLS = 120;   // activity list cap for the live turn
 
   function ChatDashboard() {
@@ -1988,6 +1995,31 @@
     const [generating, setGenerating] = useState(false);
     const [prompts, setPrompts] = useState([]);
     const [streamingId, setStreamingId] = useState(null);
+    const historyRequest = useRef(0);
+    const olderBusy = useRef(false);
+    const [loadingOlder, setLoadingOlder] = useState(false);
+    const [historyError, setHistoryError] = useState("");
+    const [openingHistory, setOpeningHistory] = useState(false);
+    const streamBuffer = useRef({text: "", reasoning: ""});
+    const streamTimer = useRef(null);
+    const discardStream = () => {
+      clearTimeout(streamTimer.current); streamTimer.current = null;
+      streamBuffer.current = {text: "", reasoning: ""};
+    };
+    const flushStream = useCallback(() => {
+      clearTimeout(streamTimer.current); streamTimer.current = null;
+      const chunk = streamBuffer.current;
+      streamBuffer.current = {text: "", reasoning: ""};
+      if (!chunk.text && !chunk.reasoning) return;
+      setMessages(ms => {
+        const i = ms.findLastIndex(m => m.role === "assistant" && m.streaming);
+        if (i < 0) return ms;
+        const copy = ms.slice();
+        copy[i] = {...ms[i], content: ms[i].content + chunk.text, reasoning: (ms[i].reasoning || "") + chunk.reasoning};
+        return copy;
+      });
+    }, []);
+    useEffect(() => () => clearTimeout(streamTimer.current), []);
     const [olderOffset, setOlderOffset] = useState(0); // 0 = everything loaded
     const [renderLimit, setRenderLimit] = useState(RENDER_WINDOW);
 
@@ -2109,10 +2141,10 @@
         } catch {
           setSettings({});
         }
-        try {
-          const c = await fetchJSON(`${BASE}/capabilities`);
-          setCaps(c);
-        } catch { setCaps({ modes: [], models: [], toolsets: [], agents: [] }); }
+        // Provider discovery can involve slow remote endpoints. Never hold
+        // history or chat startup behind it.
+        fetchJSON(`${BASE}/capabilities`).then(setCaps)
+          .catch(() => setCaps({ modes: [], models: [], toolsets: [], agents: [] }));
         refreshSessions({});
         loadMeta();
         loadFolders();
@@ -2142,7 +2174,7 @@
     useEffect(() => {
       const gw = new Gateway();
       gwRef.current = gw;
-      const offStatus = gw.on("status", (ev) => setGwStatus(ev.status));
+      const offStatus = gw.on("status", (ev) => { setGwStatus(ev.status); if (ev.status !== "open") gwSidRef.current = null; });
       const offEvent = gw.on("*", (ev) => handleEventRef.current(ev));
       gw.connect().catch(() => { /* surfaced via status */ });
       const onHide = () => { try { gw.ws && gw.ws.close(); } catch { /* noop */ } };
@@ -2193,6 +2225,7 @@
           else if (p.total || p.context_used) setUsage(p);
           break;
         case "message.start": {
+          flushStream();
           const id = str(p.message_id) || nowId();
           setStreamingId(id);
           setMessages((ms) => [...ms, {
@@ -2204,23 +2237,19 @@
         case "message.delta": {
           const t = str(p.text || p.content || "");
           const r = str(p.reasoning || p.thinking || "");
-          setMessages((ms) => {
-            if (!ms.length) return ms;
-            const i = ms.length - 1;
-            const last = ms[i];
-            if (last.role !== "assistant") return ms;
-            const copy = ms.slice();
-            copy[i] = { ...last, content: last.content + t, reasoning: last.reasoning + r, streaming: true };
-            return copy;
-          });
+          streamBuffer.current.text += t;
+          streamBuffer.current.reasoning += r;
+          if (!streamTimer.current) streamTimer.current = setTimeout(flushStream, 80);
           break;
         }
         case "message.complete": {
+          flushStream();
           setStreamingId(null);
           setGenerating(false);
           setMessages((ms) => {
             if (!ms.length) return ms;
-            const i = ms.length - 1;
+            const i = ms.findLastIndex(m => m.role === "assistant" && m.streaming);
+            if (i < 0) return p.text ? [...ms, {id: nowId(), role: "assistant", content: str(p.text), streaming: false, timestamp: Date.now()/1000}] : ms;
             const copy = ms.slice();
             const last = copy[i];
             copy[i] = {
@@ -2252,6 +2281,8 @@
           break;
         }
         case "error": {
+          flushStream();
+          setMessages(ms => ms.map(m => m.streaming ? {...m, streaming: false, status: "error"} : m));
           const msg = str(p.message || p.error || "gateway error");
           setGenerating(false);
           setStreamingId(null);
@@ -2379,6 +2410,7 @@
     // ── session lifecycle ────────────────────────────────────────────
 
     const newChat = useCallback(() => {
+      historyRequest.current++; discardStream(); setOpeningHistory(false);
       setSelected(null);
       setMessages([]);
       setToolRows([]);
@@ -2392,11 +2424,14 @@
       setGoal(null);
       gwSidRef.current = null;
       pendingModelRef.current = null;
+      setModelValue("auto");
       setAttachments([]);
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
     }, []);
 
     const openSession = useCallback(async (s) => {
+      const request = ++historyRequest.current;
+      discardStream(); setHistoryError(""); setOpeningHistory(true); gwSidRef.current = null;
       const sid = typeof s === "string" ? s : s.id;
       const row = typeof s === "string" ? sessions.find((x) => x.id === sid) || { id: sid } : s;
       stickBottom.current = true;
@@ -2413,35 +2448,41 @@
       setRenderLimit(RENDER_WINDOW);
       setSessionsError("");
       pendingModelRef.current = null;
+      setModelValue("auto");
       // newest page first; older pages load on demand when scrolling up
       try {
         const res = await fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}?limit=${PAGE}&offset=-${PAGE}`);
+        if (request !== historyRequest.current) return;
         setSelected({ id: sid, title: res.session && res.session.title, key: sid, readOnly: false, model: res.session && res.session.model });
         setMessages(res.messages || []);
         setOlderOffset(num(res.offset) > 0 ? num(res.offset) : 0);
       } catch (e) {
+        if (request !== historyRequest.current) return;
         setSelected({ id: sid, title: row.title, key: sid, readOnly: false });
         setMessages([]);
         toast(`Could not load transcript (${str(e.message || e)})`, "error");
       }
+      if (request !== historyRequest.current) return;
       // resume through the gateway when it is up so new turns append to the
       // stored history; re-resume every open — session ids are never cached
       // across reconnects (the server finalizes sessions on disconnect).
       const gw = gwRef.current;
       if (gw) {
-        gw.connect().then(() =>
-          gw.request("session.resume", { session_id: sid }, 60000).then((res) => {
-            gwSidRef.current = str((res && res.session_id) || sid);
-            if (res && res.usage) setUsage(res.usage);
-            if (res && res.title) setSelected((sel) => sel && { ...sel, title: res.title });
-          }).catch(() => {
-            // not resumable (e.g. finalized child / compressed continuation)
-            setSelected((sel) => sel && { ...sel, readOnly: true });
-          }),
-        ).catch(() => {});
+        try {
+          await gw.connect();
+          if (request !== historyRequest.current) return;
+          const res = await gw.request("session.resume", {session_id: sid}, 60000);
+          if (request !== historyRequest.current) return;
+          gwSidRef.current = str((res && res.session_id) || sid);
+          if (res && res.usage) setUsage(res.usage);
+          if (res && res.title) setSelected(sel => sel && {...sel, title: res.title});
+        } catch (e) {
+          if (request === historyRequest.current) setHistoryError(`History is readable, but chat could not reconnect: ${str(e.message || e)}. Reopen the conversation to retry.`);
+        }
       }
+      if (request === historyRequest.current) setOpeningHistory(false);
       try {
-        fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}/tree`).then(setTree).catch(() => setTree(null));
+        fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}/tree`).then(tree => { if (request === historyRequest.current) setTree(tree); }).catch(() => {});
       } catch { /* optional */ }
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
     }, [sessions, toast]);
@@ -2458,16 +2499,15 @@
       const gw = gwRef.current;
       if (!gw || !sid) return;
       try {
-        await gw.request("config.set", { key: "model", value: want, session_id: sid }, 30000);
+        await gw.request("config.set", { key: "model", value: modelSwitchInput(want, (caps && caps.models) || []), session_id: sid }, 30000);
+        if (pendingModelRef.current !== want || gwSidRef.current !== sid) throw new Error("Conversation changed during model switch; retry your message.");
         pendingModelRef.current = null;
         setSelected((s) => s && { ...s, model: want });
       } catch (e) {
-        // best-effort: don't block the send; leave the toast + model picker
-        // state to surface the failure to the user.
-        const m = str((e && e.message) || e);
-        if (!/busy|4009/i.test(m)) pendingModelRef.current = null;
+        toast(`Model switch failed: ${str(e.message || e)}. Your message has not been sent.`, "error");
+        throw e;
       }
-    }, []);
+    }, [caps, toast]);
 
     const ensureSession = useCallback(async () => {
       const sel = selRef.current;
@@ -2479,15 +2519,11 @@
         const gw = gwRef.current;
         if (!gw) throw new Error("gateway is not connected");
         await gw.connect();
-        try {
-          const res = await gw.request("session.resume", { session_id: sel.id }, 60000);
-          gwSidRef.current = str((res && res.session_id) || sel.id);
-          await flushPendingModel(gwSidRef.current);
-          return { session_id: gwSidRef.current, key: sel.key || sel.id };
-        } catch {
-          setSelected((s) => s && { ...s, readOnly: true });
-          throw new Error("This conversation cannot be continued (session is closed).");
-        }
+        const res = await gw.request("session.resume", { session_id: sel.id }, 60000);
+        if (selRef.current && selRef.current.id !== sel.id) throw new Error("Conversation changed; retry your message.");
+        gwSidRef.current = str((res && res.session_id) || sel.id);
+        await flushPendingModel(gwSidRef.current);
+        return { session_id: gwSidRef.current, key: sel.key || sel.id };
       }
       const gw = gwRef.current;
       if (!gw) throw new Error("gateway is not connected");
@@ -2805,6 +2841,10 @@
         runUndo();
       }
     }, [messages, settings, ensureSession, submitGatewayText, runUndo, runRetry, refreshSessions, openSession, toast]);
+
+    const messageActionRef = useRef(onMessageAction);
+    messageActionRef.current = onMessageAction;
+    const stableMessageAction = useCallback((...args) => messageActionRef.current(...args), []);
 
     // ── slash-command dispatch ───────────────────────────────────────
 
@@ -3241,45 +3281,45 @@
     // ── model ────────────────────────────────────────────────────────
 
     const changeModel = useCallback(async (id) => {
-      const prev = (selRef.current && selRef.current.model) || modelValue;
       if (id === "auto") {
-        setModelValue("auto");
         pendingModelRef.current = null;
-        setSelected((s) => s && { ...s, model: "" });
+        setModelValue("auto");
+        toast("Using the current conversation model; a new chat uses the default.");
         return;
       }
+      const prev = (selRef.current && selRef.current.model) || modelValue;
+      pendingModelRef.current = id;
       setModelValue(id);
-      setSelected((s) => s && { ...s, model: id });
-      // A real model switch is `config.set {key:"model", value, session_id}`
-      // against a LIVE gateway session (this is what the pinned v2026.5.7
-      // gateway uses to hot-swap the running agent).  Without a live
-      // session_id the write only updates global config for *new* sessions,
-      // so when none is active yet we queue the choice and apply it the
-      // moment the conversation gets its gateway session (see ensureSession).
+      if (generating) {
+        toast(`Queued ${id} for your next reply.`);
+        return;
+      }
       const gw = gwRef.current;
       const live = gwSidRef.current;
-      if (gw && live) {
-        try {
-          await gw.request("config.set", { key: "model", value: id, session_id: live }, 30000);
-          pendingModelRef.current = null;
-          setSelected((s) => s && { ...s, model: id });
-          toast(`Model: ${id}`);
-        } catch (e) {
-          const m = str((e && e.message) || e);
-          // revert the optimistic label so it never lies about the active model
-          setSelected((s) => s && { ...s, model: s.model === id ? prev : s.model });
-          setModelValue(prev);
-          toast(/busy|4009/i.test(m)
-            ? "Stop the current reply first (■ Stop), then switch the model."
-            : `Model switch failed: ${m}`, "error");
-        }
+      if (!gw || !live) {
+        toast(`Selected ${id} for your next reply.`);
         return;
       }
-      // No live gateway session yet (new chat / not resumed): remember it.
-      pendingModelRef.current = id;
-      patchSettings({ defaultModel: id });
-      toast(`Model: ${id} — applies to this conversation`);
-    }, [modelValue, patchSettings, toast]);
+      try {
+        const result = await gw.request("config.set", {
+          key: "model", value: modelSwitchInput(id, (caps && caps.models) || []), session_id: live,
+        }, 30000);
+        if (pendingModelRef.current !== id || gwSidRef.current !== live) return;
+        pendingModelRef.current = null;
+        setSelected(s => s && {...s, model: id});
+        toast(result.warning || `Model switched to ${id}`);
+      } catch (e) {
+        if (pendingModelRef.current !== id || gwSidRef.current !== live) return;
+        const message = str(e.message || e);
+        if (/busy|4009/i.test(message)) {
+          toast(`Queued ${id} for your next reply.`);
+        } else {
+          pendingModelRef.current = null;
+          setModelValue(prev);
+          toast(`Model switch failed: ${message}`, "error");
+        }
+      }
+    }, [modelValue, generating, caps, toast]);
 
     const changePinnedModels = useCallback((pins) => {
       setPinnedModels(pins);
@@ -3311,29 +3351,31 @@
       const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
       stickBottom.current = atBottom || el.scrollHeight <= el.clientHeight;
       setShowJump(!stickBottom.current);
-      if (nearTop && olderOffset > 0) loadOlder();
+      // Earlier pages load only on explicit request, not repeated scroll events.
     }, [olderOffset]);
 
     const loadOlder = useCallback(async () => {
       const sel = selRef.current;
-      if (!sel || olderOffset <= 0) return;
+      if (!sel || olderOffset <= 0 || olderBusy.current) return;
+      const request = historyRequest.current;
+      olderBusy.current = true; setLoadingOlder(true); setHistoryError("");
       const nextOffset = Math.max(0, olderOffset - PAGE);
       try {
         const res = await fetchJSON(`${BASE}/sessions/${encodeURIComponent(sel.id)}?limit=${olderOffset - nextOffset}&offset=${nextOffset}`);
+        if (request !== historyRequest.current) return;
         const older = res.messages || [];
-        if (older.length) {
-          const el = scrollRef.current;
-          const prevHeight = el ? el.scrollHeight : 0;
-          setMessages((ms) => [...older, ...ms]);
-          setOlderOffset(nextOffset);
-          setRenderLimit((r) => r + older.length);
-          requestAnimationFrame(() => {
-            if (el) el.scrollTop = el.scrollHeight - prevHeight + el.scrollTop;
-          });
-        } else {
-          setOlderOffset(0);
-        }
-      } catch { /* offline — keep current view */ }
+        const el = scrollRef.current;
+        const previousHeight = el ? el.scrollHeight : 0;
+        stickBottom.current = false;
+        setMessages(ms => { const ids = new Set(ms.map(m => m.id)); return [...older.filter(m => !ids.has(m.id)), ...ms]; });
+        setRenderLimit(r => r + older.length);
+        setOlderOffset(nextOffset);
+        requestAnimationFrame(() => { if (el && request === historyRequest.current) el.scrollTop += el.scrollHeight - previousHeight; });
+      } catch (e) {
+        if (request === historyRequest.current) setHistoryError(`History could not load: ${str(e.message || e)}. Try again.`);
+      } finally {
+        olderBusy.current = false; setLoadingOlder(false);
+      }
     }, [olderOffset]);
 
     useEffect(() => {
@@ -3512,9 +3554,11 @@
           h(
             "div",
             { className: "hcd-scroll", ref: scrollRef, onScroll },
+            openingHistory ? h("p", {className: "hcd-history-loading", role: "status"}, "Loading conversation…") : null,
+            historyError ? h("p", { className: "hcd-history-error", role: "alert" }, historyError) : null,
             olderOffset > 0
               ? h("div", { className: "hcd-load-older" },
-                  h("button", { onClick: loadOlder }, `Load ${Math.min(PAGE, olderOffset)} earlier messages…`))
+                  h("button", { onClick: loadOlder, disabled: loadingOlder }, loadingOlder ? "Loading earlier messages…" : `Load ${Math.min(PAGE, olderOffset)} earlier messages…`))
               : null,
             messages.length > renderLimit
               ? h("div", { className: "hcd-load-older" },
@@ -3526,11 +3570,11 @@
                   h(MessageView, {
                     key: m.id || `i${i}`,
                     msg: m,
-                    index: messages.indexOf(m),
+                    index: Math.max(0, messages.length - renderLimit) + i,
                     active: streamingId === m.id,
                     showTime: settings.showTimestamps !== false,
                     showUsage: settings.showUsage,
-                    onAction: onMessageAction,
+                    onAction: stableMessageAction,
                   })),
             toolRows.length
               ? h("div", { className: "hcd-turn-tools" },
@@ -3552,12 +3596,12 @@
             onSteer: steer,
             onDispatchCommand: dispatchCommand,
             commandCatalog,
-            generating, disabled: gwStatus !== "open" && !selected, readOnly,
+            generating, disabled: openingHistory || (gwStatus !== "open" && !selected), readOnly,
             attachments, onAttach, onRemoveAttachment: removeAttachment,
             onOpenTools: openTools, toolsSummary,
             mode: currentMode, onModeChange, modes,
             modelPicker: h(ModelPicker, {
-              models, pinned: pinnedModels, value: (selected && selected.model) || modelValue,
+              models, pinned: pinnedModels, value: modelValue !== "auto" ? modelValue : (selected && selected.model) || "auto",
               onChange: changeModel, onPinnedChange: changePinnedModels, disabled: false,
             }),
             enterToSend: settings.enterToSend !== false,

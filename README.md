@@ -61,9 +61,14 @@ rapid duplicate sends; IME typing, read-only sessions and pending uploads are
 handled before submission. No extra agent process is added.
 
 For an already running Colab notebook, run `update-chat-ui.py` in that notebook.
-It verifies downloaded UI files, replaces only this plugin's frontend assets,
-then asks the existing daemon to back them up. After it reports a saved backup,
-hard-refresh the dashboard. A new launcher boot installs the bundled version.
+It verifies downloaded plugin files, updates the frontend and paged history
+backend, then saves through the existing daemon before restarting the Colab
+agent with its current credentials. Backup failure leaves it running. After
+it reports a healthy restart, hard-refresh the dashboard. History loads in
+80-message pages; earlier pages stay accessible. Completed messages are memoized
+and streaming chunks are batched every 80ms. Slow provider discovery does not
+block history or the dashboard event loop. A new launcher boot installs the
+bundled version.
 
 
 1. Select this repository in the Render account where you want the service.

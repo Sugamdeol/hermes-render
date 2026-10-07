@@ -11,3 +11,8 @@ class ChatUI(unittest.TestCase):
     def test_composer_interactions(self):
         subprocess.run(['node', str(ROOT / 'tests/chat_composer_probe.cjs'),
                         str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed for the model probe')
+    def test_model_switching(self):
+        subprocess.run(['node', str(ROOT / 'tests/chat_model_probe.cjs'),
+                        str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)

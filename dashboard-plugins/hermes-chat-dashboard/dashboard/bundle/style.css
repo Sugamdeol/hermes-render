@@ -1941,3 +1941,7 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
 
 .hcd .hcd-side-tools { flex-wrap: wrap; gap: 5px; }
 .hcd .hcd-side-tools button { font-size: 12px; padding: 6px 8px; }
+
+.hcd .hcd-message { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+.hcd .hcd-history-loading,.hcd .hcd-history-error { padding: 10px 16px; font-size: 13px; }
+.hcd .hcd-history-error { color: var(--hcd-danger); }
