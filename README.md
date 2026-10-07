@@ -14,7 +14,11 @@ Open the notebook above. Once only, add `GIT_STATE_TOKEN` and the existing
 `STORAGE_ENCRYPTION_KEY` to Colab's Secrets panel and enable Notebook access.
 Then press **▶ Start Hermes**. It starts the dashboard and Telegram together,
 waits for them to be ready, shows the URL, username and password together,
-and opens the dashboard **inside the notebook**. Colab proxy links may fail
+and provides **two dashboard URLs**: a password-protected Cloudflare link
+for a separate tab and a Colab link with an embedded view. The tunnel starts
+automatically, reuses its running process and stops after a successful backup.
+No Cloudflare account or extra token is needed. Quick Tunnel URLs change when
+the tunnel restarts; availability depends on Cloudflare and the Colab runtime. Colab proxy links may fail
 with 404 when opened in a separate tab because of browser storage partitioning.
 Use `HERMES_COLAB.dashboard()` to reopen the embedded dashboard.
 Future runtimes reuse those account secrets;

@@ -116,6 +116,36 @@ def get_bootstrap_secret(name, prompt):
     return getpass.getpass(prompt)
 
 
+def install_cloudflared():
+    binary = shutil.which("cloudflared")
+    if binary:
+        return binary
+    arch = "arm64" if os.uname().machine in ("aarch64", "arm64") else "amd64"
+    request = urllib.request.Request("https://api.github.com/repos/cloudflare/cloudflared/releases/latest",
+                                     headers={"User-Agent": "Hermes-Colab"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        release = json.load(response)
+    asset = next(a for a in release["assets"] if a["name"] == "cloudflared-linux-" + arch)
+    with urllib.request.urlopen(asset["browser_download_url"], timeout=60) as response:
+        payload = response.read()
+    digest = asset.get("digest")
+    if digest and digest.startswith("sha256:") and hashlib.sha256(payload).hexdigest() != digest[7:]:
+        raise RuntimeError("cloudflared checksum mismatch")
+    target = Path("/usr/local/bin/cloudflared")
+    fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".cloudflared-")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o755)
+        run([temporary, "--version"], capture_output=True)
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return str(target)
+
+
 def install_node():
     if shutil.which("node"):
         version = run(["node", "--version"], capture_output=True, text=True).stdout.strip()
@@ -268,28 +298,77 @@ class ColabAgent:
         print(json.dumps(result, indent=2))
         return result
 
+    def stop_tunnel(self):
+        process = getattr(self, "tunnel_process", None)
+        if process and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        self.tunnel_process = None
+        self.tunnel_url = None
+
+    def start_tunnel(self):
+        existing = getattr(self, "tunnel_process", None)
+        if existing and existing.poll() is None and getattr(self, "tunnel_url", None):
+            return self.tunnel_url
+        ColabAgent.stop_tunnel(self)
+        binary = install_cloudflared()
+        home = Path("/content/hermes-cloudflare")
+        home.mkdir(mode=0o700, exist_ok=True)
+        log = home / "tunnel.log"
+        fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as logfile:
+            self.tunnel_process = subprocess.Popen(
+                [binary, "tunnel", "--url", "http://127.0.0.1:10000", "--no-autoupdate", "--protocol", "http2"],
+                env={"HOME": str(home), "PATH": os.environ.get("PATH", "")},
+                stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            if self.tunnel_process.poll() is not None:
+                ColabAgent.stop_tunnel(self)
+                raise RuntimeError("Cloudflare tunnel exited; inspect /content/hermes-cloudflare/tunnel.log")
+            match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log.read_text(errors="replace"))
+            if match:
+                self.tunnel_url = match.group(0)
+                return self.tunnel_url
+            time.sleep(1)
+        ColabAgent.stop_tunnel(self)
+        raise RuntimeError("Cloudflare tunnel timed out; retry HERMES_COLAB.dashboard()")
+
     def dashboard(self):
         """Open the dashboard in Colab's supported embedded browser context."""
         try:
-            from google.colab import output
-        except ImportError:
-            print("Dashboard: http://127.0.0.1:10000")
-            self.password()
-            return "http://127.0.0.1:10000"
+            cloudflare_url = ColabAgent.start_tunnel(self)
+        except Exception as exc:
+            cloudflare_url = None
+            print("Cloudflare link unavailable:", type(exc).__name__, "— retry HERMES_COLAB.dashboard().")
+        colab_url = None
         try:
-            url = output.eval_js("google.colab.kernel.proxyPort(10000)")
+            from google.colab import output
+            colab_url = output.eval_js("google.colab.kernel.proxyPort(10000)")
+            if not isinstance(colab_url, str) or not colab_url.startswith(("https://", "http://")):
+                colab_url = None
         except Exception:
-            print("Could not create the browser link. Retry HERMES_COLAB.dashboard() in a notebook cell.")
-            return None
-        if not isinstance(url, str) or not url.startswith(("https://", "http://")):
-            raise RuntimeError("Colab did not return a valid dashboard URL")
-        # Colab's cross-tab proxy URLs no longer work reliably with browser
-        # storage partitioning. Keep the dashboard in the notebook's context.
-        print("Dashboard URL (use the embedded view below):", url)
+            output = None
+        if cloudflare_url:
+            from IPython.display import HTML, display
+            display(HTML('<a target="_blank" rel="noopener noreferrer" href="' +
+                         html.escape(cloudflare_url, quote=True) + '">Open Cloudflare Dashboard ↗</a>'))
+            print("Cloudflare dashboard:", cloudflare_url)
+        if colab_url:
+            print("Colab dashboard (embedded view):", colab_url)
+        if not cloudflare_url and not colab_url:
+            print("Local dashboard: http://127.0.0.1:10000")
         self.password()
-        print("Opening dashboard inside this notebook…")
-        output.serve_kernel_port_as_iframe(10000, height=850, cache_in_notebook=False)
-        return url
+        if colab_url and output:
+            try:
+                output.serve_kernel_port_as_iframe(10000, height=850, cache_in_notebook=False)
+            except Exception:
+                print("Embedded view unavailable. Use the Cloudflare link above.")
+        return {"cloudflare": cloudflare_url, "colab": colab_url}
 
     def password(self):
         """Display the dashboard password only when explicitly requested."""
@@ -309,6 +388,7 @@ class ColabAgent:
 
     def stop(self):
         self.backup()  # On failure, leave the agent and local data running.
+        ColabAgent.stop_tunnel(self)
         processes = descendants(self.process.pid)
         for pid in reversed(processes):
             try:

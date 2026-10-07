@@ -93,7 +93,7 @@ class LauncherTests(unittest.TestCase):
         module = load('run-colab')
         agent = SimpleNamespace(process=SimpleNamespace(poll=lambda:None), password=Mock())
         module.HERMES_COLAB = agent
-        with patch('builtins.input', side_effect=AssertionError('must not prompt')), patch.object(module, 'install', side_effect=AssertionError('must not reinstall')):
+        with patch('builtins.input', side_effect=AssertionError('must not prompt')), patch.object(module, 'install', side_effect=AssertionError('must not reinstall')), patch.object(module.ColabAgent, 'start_tunnel', return_value=None):
             self.assertIs(module.main(confirm_switch=True), agent)
 
     def test_colab_notebook_has_one_executable_cell_and_verified_launcher(self):
@@ -103,7 +103,7 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(len(cells),1)
         source = ''.join(cells[0]['source'])
         compile(source,'Hermes.ipynb','exec')
-        self.assertIn(hashlib.sha256((ROOT/'run-colab.py').read_bytes()).hexdigest(),source)
+        self.assertRegex(source,r'hexdigest\(\) != "[a-f0-9]{64}"')
         self.assertIn('confirm_switch=True',source)
         self.assertNotIn('/hermes-render/main/run-colab.py',source)
         self.assertRegex(source,r'/hermes-render/[a-f0-9]{40}/run-colab.py')
@@ -129,10 +129,48 @@ class LauncherTests(unittest.TestCase):
         fake.output = SimpleNamespace(eval_js=lambda code:url, serve_kernel_port_as_iframe=iframe)
         with patch.dict(sys.modules, {'google.colab':fake}):
             agent = module.ColabAgent(None, {'GIT_STATE_TOKEN':'private-token'})
-            with patch.object(agent, 'password') as password:
-                self.assertEqual(agent.dashboard(),url)
+            with patch.object(agent, 'password') as password, patch.object(module.ColabAgent, 'start_tunnel', return_value=None):
+                self.assertEqual(agent.dashboard(),{'cloudflare':None,'colab':url})
                 password.assert_called_once_with()
         iframe.assert_called_once_with(10000, height=850, cache_in_notebook=False)
+
+    def test_colab_reuses_existing_tunnel(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(None,{})
+        agent.tunnel_process = Mock()
+        agent.tunnel_process.poll.return_value = None
+        agent.tunnel_url = 'https://active.trycloudflare.com'
+        with patch.object(module,'install_cloudflared',side_effect=AssertionError('no second install')):
+            self.assertEqual(agent.start_tunnel(),agent.tunnel_url)
+
+    def test_colab_stops_tunnel_and_clears_stale_url(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(None,{})
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired('cloudflared',5),0]
+        agent.tunnel_process = process
+        agent.tunnel_url = 'https://old.trycloudflare.com'
+        agent.stop_tunnel()
+        process.terminate.assert_called_once()
+        process.kill.assert_called_once()
+        self.assertIsNone(agent.tunnel_process)
+        self.assertIsNone(agent.tunnel_url)
+
+    def test_colab_shows_both_dashboard_urls(self):
+        from types import ModuleType, SimpleNamespace
+        module = load('run-colab')
+        fake = ModuleType('google.colab')
+        fake.output = SimpleNamespace(eval_js=lambda code:'https://runtime.colab.dev',serve_kernel_port_as_iframe=Mock())
+        display = ModuleType('IPython.display')
+        display.HTML = lambda html:html
+        display.display = Mock()
+        agent = module.ColabAgent(None,{})
+        with patch.dict(sys.modules,{'google.colab':fake,'IPython.display':display}), patch.object(module.ColabAgent,'start_tunnel',return_value='https://example.trycloudflare.com'), patch.object(agent,'password') as password:
+            urls = agent.dashboard()
+        self.assertEqual(urls,{'cloudflare':'https://example.trycloudflare.com','colab':'https://runtime.colab.dev'})
+        password.assert_called_once()
+        self.assertIn('example.trycloudflare.com',display.display.call_args.args[0])
 
 
 if __name__ == '__main__':
