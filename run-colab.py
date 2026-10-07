@@ -269,7 +269,7 @@ class ColabAgent:
         return result
 
     def dashboard(self):
-        """Show a clickable dashboard link through the Colab browser proxy."""
+        """Open the dashboard in Colab's supported embedded browser context."""
         try:
             from google.colab import output
         except ImportError:
@@ -283,14 +283,12 @@ class ColabAgent:
             return None
         if not isinstance(url, str) or not url.startswith(("https://", "http://")):
             raise RuntimeError("Colab did not return a valid dashboard URL")
-        from IPython.display import HTML, display
-        display(HTML('<a href="' + html.escape(url, quote=True) +
-                     '" target="_blank" rel="noopener noreferrer" '
-                     'style="display:inline-block;padding:12px 20px;border-radius:10px;'
-                     'background:#087f70;color:white;text-decoration:none;font-weight:600">'
-                     'Open Dashboard ↗</a>'))
-        print("Dashboard URL:", url)
+        # Colab's cross-tab proxy URLs no longer work reliably with browser
+        # storage partitioning. Keep the dashboard in the notebook's context.
+        print("Dashboard URL (use the embedded view below):", url)
         self.password()
+        print("Opening dashboard inside this notebook…")
+        output.serve_kernel_port_as_iframe(10000, height=850, cache_in_notebook=False)
         return url
 
     def password(self):

@@ -118,24 +118,19 @@ class LauncherTests(unittest.TestCase):
         for key in ('HERMES_DASHBOARD','HERMES_DASHBOARD_HOST','HERMES_DASHBOARD_PORT'):
             self.assertIn(key,env['HERMES_ENV_OVERRIDE_KEYS'].split(','))
 
-    def test_colab_dashboard_button_uses_proxy_and_keeps_credentials_private(self):
+    def test_colab_dashboard_uses_supported_iframe_and_shows_login(self):
         from types import ModuleType, SimpleNamespace
         module = load('run-colab')
         fake = ModuleType('google.colab')
-        url = 'https://runtime.example.test/?value="quoted"'
-        fake.output = SimpleNamespace(eval_js=lambda code:url)
-        display_module = ModuleType('IPython.display')
-        display_module.HTML = lambda html:html
-        shown = []
-        display_module.display = shown.append
-        with patch.dict(sys.modules, {'google.colab':fake, 'IPython.display':display_module}):
+        url = 'https://runtime.example.test/'
+        iframe = Mock()
+        fake.output = SimpleNamespace(eval_js=lambda code:url, serve_kernel_port_as_iframe=iframe)
+        with patch.dict(sys.modules, {'google.colab':fake}):
             agent = module.ColabAgent(None, {'GIT_STATE_TOKEN':'private-token'})
             with patch.object(agent, 'password') as password:
                 self.assertEqual(agent.dashboard(),url)
                 password.assert_called_once_with()
-        self.assertIn('Open Dashboard',shown[0])
-        self.assertIn('&quot;quoted&quot;',shown[0])
-        self.assertNotIn('private-token',shown[0])
+        iframe.assert_called_once_with(10000, height=850, cache_in_notebook=False)
 
 
 if __name__ == '__main__':

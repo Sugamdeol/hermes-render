@@ -6,7 +6,7 @@ import tempfile
 import urllib.request
 
 EXPECTED = {'bundle/index.js': 'ae278176b301104233391e04f4f09544c8f11771985aa52254c1abeccd7f079d', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '65edab15d6ecbc083db1657a2ee5aee06f9f4a5f6b0a825d8d7fbabc801eaa83', 'plugin_api.py': '6cd9e0ee22a74300bd1d2c52c8f84c032c824de1208cd049191f06c7ae450d0f'}
-LAUNCHER_SHA = '766edd71d407c8f6c49189ea8e11ac8af591a9cf3dd1766879f1fd8d7ed1e101'
+LAUNCHER_SHA = '2598973971977a850e8bce7f5fe3e4c61a45ebf5e423a042283e37bf28c3ae63'
 BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/main/dashboard-plugins/hermes-chat-dashboard/dashboard/'
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
