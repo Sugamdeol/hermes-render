@@ -24,6 +24,8 @@ path = root / "hermes_cli/web_server.py"
 import runpy
 bridge_patch = runpy.run_path(str(Path(__file__).with_name("patch-chat-bridge.py")))
 path.write_text(bridge_patch["patch"](path.read_text()))
+dashboard_patch = runpy.run_path(str(Path(__file__).with_name("patch-dashboard.py")))
+path.write_text(dashboard_patch["patch"](path.read_text()))
 
 path = root / "hermes_cli/web_server.py"
 old = '@app.websocket("/api/pty")\nasync def pty_ws(ws: WebSocket) -> None:\n'

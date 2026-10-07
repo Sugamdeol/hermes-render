@@ -340,6 +340,11 @@ if [ -d "${PLUGINS_SRC}" ]; then
   fi
 fi
 
+# Repair recognized generated plugin mistakes after restore, before backup.
+if [ -f /opt/render-tools/repair-dashboard-plugins.py ]; then
+  gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/repair-dashboard-plugins.py "${PLUGINS_DST}"
+fi
+
 # Failover role. When several instances share a state backend (typically this
 # Render service plus a laptop), the highest-priority one with a fresh lease is
 # ACTIVE and the others are STANDBY. A standby keeps its dashboard, but must
