@@ -241,3 +241,12 @@ All unfinished gateway lanes are queued one at a time. Waiting does not consume 
 The intent journal is encrypted by Git storage. With private Git storage configured, each gateway turn waits for the existing storage daemon to upload its task intent and saved session state before allocating the agent. This upload bypasses the normal debounce and push interval. Backup failure or a 180-second acknowledgement timeout leaves the task queued for a later recovery attempt instead of starting work without a durable checkpoint. The journal includes the session entry and routing source, so startup can reconstruct a missing session-index entry with its original ID. A full Render-instance replacement can recover the acknowledged checkpoint; tool progress written after that checkpoint still depends on subsequent backups. Browser TUI and cron-job runners are separate execution paths from this gateway turn recovery.
 
 Unfinished task records protect their session IDs from idle/daily expiry. Manual `continue` retains the original task. Context compression updates both the recovery ID and existing Telegram topic binding. Completed recovery records are removed only after native transcript persistence.
+
+### Refreshing an active dashboard chat
+
+The dashboard keeps its isolated worker alive when the browser refreshes, reloads
+the partial reply and reattaches to the same turn without submitting the prompt
+again. It also remembers the selected conversation. This requires the updated
+chat bridge and UI together; use `update-chat-ui.py` in the running Colab notebook
+when no task is active. The updater backs up before restarting the service.
+Full server/runtime loss still relies on the existing recovery and backup system.

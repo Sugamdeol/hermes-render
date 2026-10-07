@@ -1,0 +1,12 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync(process.argv[2],'utf8');
+const body=source.slice(source.indexOf('    const applyLiveSnapshot = useCallback'),source.indexOf('    const openSession = useCallback'));
+const context={useCallback:f=>f,str:x=>String(x??''),liveReplyId:{current:null},promptAccepted:{current:false},lastReplyEvent:{current:0},messages:[{role:'user',content:'Question'}],setGenerating:x=>context.running=x,setStreamingId:x=>context.id=x,setMessages:f=>context.messages=f(context.messages)};
+vm.createContext(context);vm.runInContext(body+'\nthis.apply=applyLiveSnapshot;',context);
+context.apply({session_id:'live',running:true,user:'Question',text:'Partial',reasoning:'thinking',timestamp:1});
+assert.equal(context.messages.length,2);assert.equal(context.messages[1].content,'Partial');assert.equal(context.running,true);
+context.apply({session_id:'live',running:true,user:'Question',text:'Partial reply',timestamp:1});
+assert.equal(context.messages.length,2);assert.equal(context.messages[1].content,'Partial reply');
+context.apply({session_id:'live',running:false,user:'Question',text:'Final reply',timestamp:1});
+assert.equal(context.messages.length,2);assert.equal(context.messages[1].content,'Final reply');assert.equal(context.running,false);
+console.log('Refresh restores partial reply and completion without duplicate messages');

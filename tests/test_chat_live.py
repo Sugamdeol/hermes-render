@@ -34,9 +34,9 @@ class ChatHistorySources(unittest.TestCase):
 
 class ChatBridge(unittest.IsolatedAsyncioTestCase):
     async def test_long_completion_frame_crosses_pipe_without_disconnect(self):
-        source = (ROOT / 'scripts/patch-lite.py').read_text()
+        source = (ROOT / 'scripts/chat-bridge.py').read_text()
         self.assertIn("sys.executable, '-u', '-m', 'tui_gateway.entry'", source)
-        match = re.search(r'stdout=asyncio.subprocess.PIPE, limit=([^,]+), start_new_session=True',source)
+        match = re.search(r'limit=([^,]+), start_new_session=True',source)
         self.assertIsNotNone(match)
         limit = eval(match.group(1), {'__builtins__':{}})
         proc = await asyncio.create_subprocess_exec(sys.executable,'-u','-c',

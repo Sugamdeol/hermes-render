@@ -30,3 +30,7 @@ Live deltas create a reply even when the start event is lost. Live replies bypas
 ## Audit fixes — 1.4.2
 
 New conversations resolve the persistent database session ID after prompt acceptance. Reconnecting interrupts the displayed streaming state rather than leaving the composer stuck. Secret and sudo inputs are masked. Markdown protects links and inline code before formatting; very large code blocks skip syntax highlighting. Uploads and UI metadata use private atomic temporary files, and damaged metadata fails visibly instead of being replaced with empty defaults. Shared transcript reads are bounded and blocking database endpoints run outside the event loop.
+
+## Refresh during a reply — 1.5.0
+
+A browser disconnect detaches the client, not the isolated agent worker. The latest partial assistant text and reasoning are bounded snapshots. History reads include this snapshot; session.resume reattaches to an existing live session instead of creating a new turn. The UI merges the latest snapshot before accepting further deltas, remembers the selected conversation and restores it on a page refresh. RPC request IDs are remapped so replies for a disconnected browser cannot complete a newer browser's request. Idle disconnected workers are reaped after two minutes once no turn is running. Dashboard shutdown terminates the worker group. This covers browser refresh/reconnect; snapshots are in memory and are not a guarantee against whole-host loss.

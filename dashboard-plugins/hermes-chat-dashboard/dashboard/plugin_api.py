@@ -24,6 +24,7 @@ import mimetypes
 import os
 import re
 import secrets
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -668,6 +669,8 @@ def get_chat_session(request: Request, session_id: str, limit: int = 0, offset: 
         return {
             "session": session,
             "messages": messages,
+            "live": (sys.modules["_hermes_chat_bridge"].snapshot(session_id)
+                     if "_hermes_chat_bridge" in sys.modules else None),
             "count": len(messages),
             "total": total,
             # has_more = more rows exist outside this page. For the UI's

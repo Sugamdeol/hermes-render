@@ -2482,9 +2482,30 @@
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
     }, []);
 
+    const applyLiveSnapshot = useCallback(snapshot => {
+      if (!snapshot || (!snapshot.running && !snapshot.text)) return;
+      const live = str(snapshot.session_id), id = `live:${live}`;
+      liveReplyId.current = snapshot.running ? id : null;
+      promptAccepted.current = !!snapshot.running;
+      lastReplyEvent.current = Date.now();
+      setGenerating(!!snapshot.running);
+      setStreamingId(snapshot.running ? id : null);
+      setMessages(ms => {
+        const next = ms.slice();
+        if (snapshot.user && !next.slice(-6).some(m => m.role === "user" && m.content === snapshot.user))
+          next.push({id:`${id}:user`, role:"user", content:snapshot.user, timestamp:snapshot.timestamp});
+        const i = next.findLastIndex(m => m.id === id || (m.role === "assistant" && m.streaming));
+        const message = {id, role:"assistant", content:(snapshot.truncated ? "… [earlier live text omitted]\n" : "") + str(snapshot.text),
+          reasoning:str(snapshot.reasoning), streaming:!!snapshot.running, timestamp:snapshot.timestamp};
+        if (i >= 0) next[i] = message;
+        else if (!(next.at(-1)?.role === "assistant" && next.at(-1)?.content === message.content)) next.push(message);
+        return next;
+      });
+    }, []);
+
     const openSession = useCallback(async (s) => {
       const request = ++historyRequest.current;
-      discardStream(); setHistoryError(""); setOpeningHistory(true); gwSidRef.current = null;
+      discardStream(); setGenerating(false); setHistoryError(""); setOpeningHistory(true); gwSidRef.current = null;
       const sid = typeof s === "string" ? s : s.id;
       const row = typeof s === "string" ? sessions.find((x) => x.id === sid) || { id: sid } : s;
       stickBottom.current = true;
@@ -2508,6 +2529,7 @@
         if (request !== historyRequest.current) return;
         setSelected({ id: sid, title: res.session && res.session.title, key: sid, readOnly: false, model: res.session && res.session.model });
         setMessages(res.messages || []);
+        applyLiveSnapshot(res.live);
         setOlderOffset(num(res.offset) > 0 ? num(res.offset) : 0);
       } catch (e) {
         if (request !== historyRequest.current) return;
@@ -2527,6 +2549,7 @@
           const res = await gw.request("session.resume", {session_id: sid}, 60000);
           if (request !== historyRequest.current) return;
           gwSidRef.current = str((res && res.session_id) || sid);
+          applyLiveSnapshot(res && res.live_snapshot);
           if (res && res.usage) setUsage(res.usage);
           if (res && res.title) setSelected(sel => sel && {...sel, title: res.title});
         } catch (e) {
@@ -2538,7 +2561,23 @@
         fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}/tree`).then(tree => { if (request === historyRequest.current) setTree(tree); }).catch(() => {});
       } catch { /* optional */ }
       try { composerRef.current && composerRef.current.focus(); } catch { /* noop */ }
-    }, [sessions, toast]);
+    }, [sessions, toast, applyLiveSnapshot]);
+
+    const restoredLastChat = useRef(false);
+    useEffect(() => {
+      if (restoredLastChat.current) return;
+      restoredLastChat.current = true;
+      try {
+        const sid = localStorage.getItem("hermes.chat.lastSession");
+        if (sid) openSession(sid);
+      } catch { /* unavailable browser storage */ }
+    }, [openSession]);
+    useEffect(() => {
+      try {
+        if (selected) localStorage.setItem("hermes.chat.lastSession", selected.key || selected.id);
+        else localStorage.removeItem("hermes.chat.lastSession");
+      } catch { /* unavailable browser storage */ }
+    }, [selected && (selected.key || selected.id)]);
 
     // A model chosen while no live gateway session existed yet (a brand-new
     // chat, or a conversation opened but not yet resumed) is queued in

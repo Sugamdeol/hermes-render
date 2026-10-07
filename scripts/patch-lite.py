@@ -21,50 +21,9 @@ path.write_text(text.replace(old, new, 1))
 # JSON-RPC clients must also run their agent outside the dashboard process.
 # Keep the native protocol by forwarding to Hermes' existing stdio backend.
 path = root / "hermes_cli/web_server.py"
-text = path.read_text()
-old = "    from tui_gateway.ws import handle_ws\n\n    await handle_ws(ws)"
-new = '''    if _lite_pty_lock.locked():
-        await ws.close(code=4429)
-        return
-    async with _lite_pty_lock:
-        await ws.accept()
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, '/opt/render-tools/agent-budget.py', 'run', 'chat',
-            sys.executable, '-u', '-m', 'tui_gateway.entry',
-            cwd=str(PROJECT_ROOT), stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, limit=8 * 1024 * 1024, start_new_session=True,
-        )
-        async def output():
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    return
-                await ws.send_text(line.decode('utf-8').rstrip('\\n'))
-        async def input_loop():
-            while True:
-                line = await ws.receive_text()
-                proc.stdin.write((line + '\\n').encode('utf-8'))
-                await proc.stdin.drain()
-        tasks = [asyncio.create_task(output()), asyncio.create_task(input_loop())]
-        try:
-            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        finally:
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            import signal
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-            try:
-                await ws.close(code=1013)
-            except Exception:
-                pass
-'''
-assert old in text, "JSON-RPC isolation patch no longer matches pinned source"
-path.write_text(text.replace(old, new, 1))
+import runpy
+bridge_patch = runpy.run_path(str(Path(__file__).with_name("patch-chat-bridge.py")))
+path.write_text(bridge_patch["patch"](path.read_text()))
 
 path = root / "hermes_cli/web_server.py"
 old = '@app.websocket("/api/pty")\nasync def pty_ws(ws: WebSocket) -> None:\n'
