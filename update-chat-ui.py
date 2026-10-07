@@ -7,8 +7,8 @@ import urllib.request
 
 EXPECTED = {'bundle/index.js': '9a27a4bbf1db59847284ec6efd7482bc641167aab9918c9bff19d3afa73695f8', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': 'ad69bcf5f5c1c746a5b9dd35a46082f506d44f9bfbc12b307f51a94d712b79ff', 'plugin_api.py': 'c2b9283e6e96b1692a7e510e48c37356726df941b9b71f77896a6d86be8cd90d'}
 LAUNCHER_SHA = 'b383691b085f6ec2c51a55e9479f5f69a51b69711aea195fcec7302383f733f8'
-BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/b56d2dd82959ba9012c2386b62079d99c2a56e8d/dashboard-plugins/hermes-chat-dashboard/dashboard/'
-TOOLS_EXPECTED = {'chat-bridge.py': 'b7f7301f5c6d50d96a00d06c75cc3d6ecad4e44b1de2a9ccbea9f8cf9896d8eb', 'patch-chat-bridge.py': 'e45faa08e831fc19c17a3673c1a5321364b91c67c4bd944ac7effaa776853a26', 'dashboard-runtime.py': 'f2e1f692a1ee3be6458e8159d99e198d8fd47bbd0092ad9aa7c71a6c58f697f8', 'patch-dashboard.py': '0f61d9f219187cf06d5edad3a15fa1e6c8348f8db5b6331138d8a0cd595b68af', 'debug-master.js': '967ef89275e56bbb7641f957cecb50af3131415375c8769592b6c6ddb54d886c', 'repair-dashboard-plugins.py': '537388dc0419122f7f742c13f5f7833f6baf1bdeb5b88e41636c8f759ee8cf62', 'bootstrap.sh': '01485bf50a06d8b72ed686ec6024d93f5fef6eb79949ac230d8a91dc09783774'}
+BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/22f3051cb1df204731549d4321b979a12058c0a5/dashboard-plugins/hermes-chat-dashboard/dashboard/'
+TOOLS_EXPECTED = {'chat-bridge.py': 'b7f7301f5c6d50d96a00d06c75cc3d6ecad4e44b1de2a9ccbea9f8cf9896d8eb', 'patch-chat-bridge.py': 'e45faa08e831fc19c17a3673c1a5321364b91c67c4bd944ac7effaa776853a26', 'dashboard-runtime.py': 'f2e1f692a1ee3be6458e8159d99e198d8fd47bbd0092ad9aa7c71a6c58f697f8', 'patch-dashboard.py': '6ad3b603b64d11efcf93998918abb8d55751e16ded05535069a1739c51efaa67', 'debug-master.js': '967ef89275e56bbb7641f957cecb50af3131415375c8769592b6c6ddb54d886c', 'debug-master-api.py': '815ac5c3926e9f43762e1add7016c41ff2bb33ec66845995749650183a9d0da1', 'repair-dashboard-plugins.py': 'f79cf0feea1fb6a5e3f5e0cfe389f3a98ed4648f3ca8f45d399e5dc9d3fb56f9', 'dashboard-supervisor.sh': '9a59c9563963d8f8ef50dd25557505b2862c4f1bd48973aa1fc75f5ab9e32726', 'check-dashboard.py': '8b8f3f2309ac4d06e9ec9777c7130e816299581199e7d1a45f906ee4947286ff', 'bootstrap.sh': '663f53ad762aff5663c186b086e45ed4fff1e38fe34eb84ec14f762e97776021'}
 ROOT_URL = BASE.split('/dashboard-plugins/')[0]
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
@@ -39,7 +39,7 @@ exec(compile(tool_payloads['patch-dashboard.py'], 'patch-dashboard.py', 'exec'),
 code = namespace['patch'](code)
 if '_lite_pty_lock = asyncio.Lock()' not in code:
     raise RuntimeError('Unknown dashboard version; update the full launcher first.')
-with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/b56d2dd82959ba9012c2386b62079d99c2a56e8d/run-colab.py', timeout=60) as response:
+with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/22f3051cb1df204731549d4321b979a12058c0a5/run-colab.py', timeout=60) as response:
     launcher = response.read()
 if hashlib.sha256(launcher).hexdigest() != LAUNCHER_SHA:
     raise RuntimeError('Launcher version changed. Download the latest updater and retry.')
@@ -96,8 +96,15 @@ while time.monotonic() < deadline:
         with urllib.request.urlopen('http://127.0.0.1:10000/healthz', timeout=5) as response:
             import json
             status = json.load(response)
-        if status.get('gateway_running') and status.get('gateway_state') == 'running':
+        if isinstance(status, dict):
             HERMES_COLAB.dashboard()
+            checks = __import__('runpy').run_path('/opt/render-tools/check-dashboard.py')['check']()
+            for result in checks:
+                print('Dashboard check:', result['path'], result['status'])
+            if not all(result['ok'] for result in checks):
+                raise RuntimeError('Dashboard restarted, but an API check failed. Keep this runtime and inspect its dashboard logs.')
+            if not status.get('gateway_running'):
+                print('Dashboard is ready; the messaging gateway is still starting.')
             print('Updated, backed up and restarted. Refresh your dashboard.')
             break
     except (OSError, ValueError):
