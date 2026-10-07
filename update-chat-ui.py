@@ -6,8 +6,8 @@ import tempfile
 import urllib.request
 
 EXPECTED = {'bundle/index.js': 'ae278176b301104233391e04f4f09544c8f11771985aa52254c1abeccd7f079d', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '65edab15d6ecbc083db1657a2ee5aee06f9f4a5f6b0a825d8d7fbabc801eaa83', 'plugin_api.py': '6cd9e0ee22a74300bd1d2c52c8f84c032c824de1208cd049191f06c7ae450d0f'}
-LAUNCHER_SHA = 'f1524d657581c61a9c7930208d0ee5c99375d0da239fb81c654e1e2babdbdc50'
-BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/aa1819e591b9adec064fd7835eebfb4c9642821c/dashboard-plugins/hermes-chat-dashboard/dashboard/'
+LAUNCHER_SHA = 'b383691b085f6ec2c51a55e9479f5f69a51b69711aea195fcec7302383f733f8'
+BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/f0fb7c1afe74593f55d1d9819b9814f69eb80440/dashboard-plugins/hermes-chat-dashboard/dashboard/'
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
     raise RuntimeError('Run this in the notebook where HERMES_COLAB is already running.')
@@ -29,7 +29,7 @@ elif new not in code:
     raise RuntimeError('Unknown chat bridge version; update the launcher before retrying.')
 code = code.replace("sys.executable, '-m', 'tui_gateway.entry',", "sys.executable, '-u', '-m', 'tui_gateway.entry',", 1)
 compile(code, str(web), 'exec')
-with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/aa1819e591b9adec064fd7835eebfb4c9642821c/run-colab.py', timeout=60) as response:
+with urllib.request.urlopen('https://raw.githubusercontent.com/Sugamdeol/hermes-render/f0fb7c1afe74593f55d1d9819b9814f69eb80440/run-colab.py', timeout=60) as response:
     launcher = response.read()
 if hashlib.sha256(launcher).hexdigest() != LAUNCHER_SHA:
     raise RuntimeError('Launcher version changed. Download the latest updater and retry.')
