@@ -2020,3 +2020,11 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
 
 .hcd .hcd-ui-icon { flex: 0 0 auto; vertical-align: middle; }
 .hcd .hcd-composer-ctls .hcd-ctl-btn,.hcd .hcd-model-pick { display: inline-flex; align-items: center; gap: 7px; }
+
+.hcd .hcd-source-tabs { display:flex; gap:4px; padding:3px; border:1px solid var(--hcd-border); border-radius:10px; }
+.hcd .hcd-source-tabs button { flex:1; background:transparent; border:0; border-radius:7px; font-size:12px; color:var(--hcd-muted); }
+.hcd .hcd-source-tabs button[aria-pressed="true"] { background:var(--hcd-accent-soft); color:var(--hcd-fg); }
+.hcd .hcd-history-more { width:100%; border:1px solid var(--hcd-border); background:var(--hcd-panel); border-radius:10px; padding:8px; margin-top:10px; font-size:12px; }
+
+/* Live replies must paint immediately rather than use an offscreen height estimate. */
+.hcd .hcd-message.hcd-live { content-visibility: visible; contain-intrinsic-size: none; }

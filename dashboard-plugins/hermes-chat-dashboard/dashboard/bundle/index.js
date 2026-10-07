@@ -1055,7 +1055,7 @@
 
     return h(
       "article",
-      { className: cn("hcd-message", `hcd-${msg.role || "assistant"}`), id: msg.id || undefined },
+      { className: cn("hcd-message", `hcd-${msg.role || "assistant"}`, msg.streaming && "hcd-live"), id: msg.id || undefined },
       h("div", { className: "hcd-avatar", title: roleLabel(msg.role) }, isHermes ? "H" : isUser ? "Y" : isTool ? "⚙️" : "ℹ️"),
       h(
         "div",
@@ -1577,10 +1577,11 @@
         h("span", { className: "hcd-conv-title" },
           entry.pinned ? h("span", { className: "hcd-pin-mark", title: "Pinned" }, "📌 ") : null,
           entry.starred ? h("span", { className: "hcd-star-mark", title: "Starred" }, "★ ") : null,
-          s.title || "Untitled conversation"),
+          s.title || s.preview || "Untitled conversation"),
         h("span", { className: "hcd-conv-sub" },
           s.message_count ? `${num(s.message_count)} msg` : "",
           s.last_active || s.started_at ? ` · ${relTime(s.last_active || s.started_at)}` : "",
+          s.source ? ` · ${str(s.source)}` : "",
           s.model ? ` · ${str(s.model)}` : ""),
         s.snippet
           ? h("span", { className: "hcd-conv-snippet" }, str(s.snippet))
@@ -1601,6 +1602,7 @@
   function SessionSidebar({
     sessions, meta, activeKey, loading, error, onRefresh, onOpen, onNew,
     query, setQuery, folders, allTags, activeTags, toggleTag,
+    source, onSource, hasMore, onMore,
     onRename, onDelete, onSetPinned, onSetStarred, onSetArchived,
     onSetFolder, onNewFolder, onRenameFolder, onDeleteFolder, onSetTags,
     showArchived, setShowArchived,
@@ -1724,6 +1726,9 @@
           }),
           h("button", { className: "hcd-refresh", onClick: onRefresh, disabled: loading, title: "Refresh", "aria-label": "Refresh conversation list" }, "⟳"),
         ),
+        h("div", {className:"hcd-source-tabs", role:"group", "aria-label":"Conversation source"},
+          h("button", {"aria-pressed":!source, onClick:()=>onSource("")}, "All chats"),
+          h("button", {"aria-pressed":source==="telegram", onClick:()=>onSource("telegram")}, "Telegram")),
         allTags.length
           ? h("div", { className: "hcd-tag-filter" },
               allTags.slice(0, 12).map((t) =>
@@ -1779,6 +1784,7 @@
                   !collapsed[name] && rows.length ? h("div", { className: "hcd-folder-body" }, renderRows(rows)) : null)),
                 unfiled.length ? h("div", { className: "hcd-side-group" }, h("h5", null, folders.length ? "Unfiled" : "Recent"), renderRows(unfiled)) : null,
               ),
+        hasMore ? h("button", {className:"hcd-history-more", disabled:loading, onClick:onMore}, loading ? "Loading conversations…" : "Load older conversations") : null,
         menu,
       ),
     );
@@ -1987,6 +1993,9 @@
     const [sessionsLoading, setSessionsLoading] = useState(false);
     const [sessionsError, setSessionsError] = useState("");
     const [hasMoreSessions, setHasMoreSessions] = useState(false);
+    const [sessionsOffset, setSessionsOffset] = useState(0);
+    const [sessionSource, setSessionSource] = useState("");
+    const sessionListRequest = useRef(0);
     const [query, setQuery] = useState("");
     const [meta, setMeta] = useState({});
     const [folders, setFolders] = useState([]);
@@ -2012,18 +2021,25 @@
     const [openingHistory, setOpeningHistory] = useState(false);
     const streamBuffer = useRef({text: "", reasoning: ""});
     const streamTimer = useRef(null);
+    const liveReplyId = useRef(null);
+    const lastReplyEvent = useRef(0);
+    const promptAccepted = useRef(false);
     const discardStream = () => {
       clearTimeout(streamTimer.current); streamTimer.current = null;
       streamBuffer.current = {text: "", reasoning: ""};
+      liveReplyId.current = null; promptAccepted.current = false;
     };
     const flushStream = useCallback(() => {
       clearTimeout(streamTimer.current); streamTimer.current = null;
       const chunk = streamBuffer.current;
       streamBuffer.current = {text: "", reasoning: ""};
       if (!chunk.text && !chunk.reasoning) return;
+      const id = liveReplyId.current || nowId();
+      liveReplyId.current = id;
+      setStreamingId(id);
       setMessages(ms => {
         const i = ms.findLastIndex(m => m.role === "assistant" && m.streaming);
-        if (i < 0) return ms;
+        if (i < 0) return [...ms, {id, role:"assistant", content:chunk.text, reasoning:chunk.reasoning, streaming:true, timestamp:Date.now()/1000}];
         const copy = ms.slice();
         copy[i] = {...ms[i], content: ms[i].content + chunk.text, reasoning: (ms[i].reasoning || "") + chunk.reasoning};
         return copy;
@@ -2127,20 +2143,24 @@
       } catch { setFolders([]); }
     }, []);
 
-    const refreshSessions = useCallback(async ({ offset = 0, q = query } = {}) => {
+    const refreshSessions = useCallback(async ({ offset = 0, q = query, source = sessionSource } = {}) => {
+      const request = ++sessionListRequest.current;
       setSessionsLoading(true);
       setSessionsError("");
       try {
-        const res = await fetchJSON(`${BASE}/sessions?limit=120&offset=${offset}&q=${encodeURIComponent(q || "")}`);
+        const res = await fetchJSON(`${BASE}/sessions?limit=120&offset=${offset}&q=${encodeURIComponent(q || "")}&source=${encodeURIComponent(source || "")}`);
+        if (request !== sessionListRequest.current) return;
         const rows = res.sessions || [];
-        setSessions((prev) => (offset ? [...prev, ...rows] : rows));
+        setSessions((prev) => (offset ? [...prev, ...rows.filter(row => !prev.some(old => old.id === row.id))] : rows));
+        setSessionsOffset(num(res.next_offset) || offset + 120);
         setHasMoreSessions(!!res.has_more);
       } catch (e) {
+        if (request !== sessionListRequest.current) return;
         setSessionsError(`History unavailable (${str(e.message || e)})`);
       } finally {
-        setSessionsLoading(false);
+        if (request === sessionListRequest.current) setSessionsLoading(false);
       }
-    }, [query]);
+    }, [query, sessionSource]);
 
     useEffect(() => {
       (async () => {
@@ -2213,13 +2233,14 @@
       const type = str(ev.type);
       const p = ev.payload || {};
       if (!ownsEvent(ev)) return;
+      if (type.startsWith("message.") || type.startsWith("tool.")) lastReplyEvent.current = Date.now();
 
       switch (type) {
         case "gateway.ready":
           setGwStatus("open");
           break;
         case "session.info": {
-          const sid = str(p.session_id || ev.session_id || "");
+          const sid = str(ev.session_id || p.session_id || "");
           if (sid) gwSidRef.current = sid;
           setSelected((sel) => sel && {
             ...sel,
@@ -2236,9 +2257,11 @@
           break;
         case "message.start": {
           flushStream();
-          const id = str(p.message_id) || nowId();
+          const id = liveReplyId.current || str(p.message_id) || nowId();
+          liveReplyId.current = id;
+          setGenerating(true);
           setStreamingId(id);
-          setMessages((ms) => [...ms, {
+          setMessages((ms) => ms.some(m => m.role === "assistant" && m.streaming) ? ms : [...ms, {
             id, role: "assistant", content: "", reasoning: "", streaming: true,
             timestamp: Date.now() / 1000, model: p.model || (selRef.current && selRef.current.model),
           }]);
@@ -2254,6 +2277,7 @@
         }
         case "message.complete": {
           flushStream();
+          liveReplyId.current = null; promptAccepted.current = false;
           setStreamingId(null);
           setGenerating(false);
           setMessages((ms) => {
@@ -2293,6 +2317,7 @@
         case "error": {
           flushStream();
           setMessages(ms => ms.map(m => m.streaming ? {...m, streaming: false, status: "error"} : m));
+          liveReplyId.current = null; promptAccepted.current = false;
           const msg = str(p.message || p.error || "gateway error");
           setGenerating(false);
           setStreamingId(null);
@@ -2598,6 +2623,7 @@
         textOut = `${body}\n\n${ready.map((a) => str(a.prompt_reference || a.path || a.name)).join("\n")}`.trim();
       }
       let created = null;
+      promptAccepted.current = false; lastReplyEvent.current = Date.now();
       setGenerating(true);
       setToolRows([]);
       setAgents({});
@@ -2620,6 +2646,7 @@
           { session_id: created.session_id, text: textOut },
           60000,
         );
+        promptAccepted.current = true;
         setAttachments((cur) => {
           cur.forEach((a) => { try { a.thumb && URL.revokeObjectURL(a.thumb); } catch { /* noop */ } });
           return [];
@@ -3392,7 +3419,47 @@
       const el = scrollRef.current;
       if (!el || !settings || settings.autoScroll === false || !stickBottom.current) return;
       el.scrollTop = el.scrollHeight;
+      const frame = requestAnimationFrame(() => {
+        if (stickBottom.current) el.scrollTop = el.scrollHeight;
+      });
+      return () => cancelAnimationFrame(frame);
     }, [messages, toolRows]);
+
+    // A completion event can be lost during a transient socket failure.
+    // Check only the active submitted turn, after a quiet interval; never replay it.
+    useEffect(() => {
+      if (!generating || !selected) return;
+      let cancelled = false, busy = false;
+      const request = historyRequest.current;
+      const check = async () => {
+        if (busy || cancelled || !promptAccepted.current || Date.now() - lastReplyEvent.current < 12000) return;
+        const gw = gwRef.current, sid = gwSidRef.current;
+        if (!gw || !sid || gw.status !== "open") return;
+        busy = true;
+        try {
+          const status = await gw.request("session.status", {session_id:sid}, 10000);
+          if (cancelled || request !== historyRequest.current || sid !== gwSidRef.current) return;
+          const output = str(status.output);
+          const key = (output.match(/^Session ID: (.+)$/m) || [])[1];
+          if (!key || !/^Agent Running: No$/m.test(output)) return;
+          const page = await fetchJSON(`${BASE}/sessions/${encodeURIComponent(key.trim())}?limit=${PAGE}&offset=-${PAGE}`);
+          if (cancelled || request !== historyRequest.current || sid !== gwSidRef.current) return;
+          if (!page.messages || !page.messages.length) return;
+          discardStream();
+          setMessages(ms => {
+            const cutoff = Number(page.messages[0].timestamp || 0);
+            const ids = new Set(page.messages.map(m => m.id));
+            return [...ms.filter(m => !m.streaming && !ids.has(m.id) && Number(m.timestamp || 0) < cutoff), ...page.messages];
+          });
+          setSelected(sel => sel && {...sel, key:key.trim()});
+          setStreamingId(null); setGenerating(false);
+          refreshSessions({});
+        } catch { /* Keep the current reply visible; retry the read next interval. */ }
+        finally { busy = false; }
+      };
+      const timer = setInterval(check, 5000);
+      return () => { cancelled = true; clearInterval(timer); };
+    }, [generating, selected && selected.id]);
 
     // ── keyboard shortcuts ───────────────────────────────────────────
 
@@ -3505,6 +3572,7 @@
       sidebarOpen && !focusMode
         ? h(SessionSidebar, {
             sessions, meta, activeKey: selected ? selected.id : "", loading: sessionsLoading,
+            source:sessionSource, onSource:value=>{setSessionSource(value);setSessions([]);refreshSessions({source:value});}, hasMore:hasMoreSessions, onMore:()=>refreshSessions({offset:sessionsOffset}),
             error: sessionsError, onRefresh: () => refreshSessions({}), onOpen: openSession, onNew: newChat,
             query, setQuery, folders, allTags, activeTags,
             toggleTag: (t) => setActiveTags((ts) => (ts.includes(t) ? ts.filter((x) => x !== t) : [...ts, t])),

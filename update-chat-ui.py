@@ -5,7 +5,7 @@ import os
 import tempfile
 import urllib.request
 
-EXPECTED = {'bundle/index.js': '54cb21ba270975172fa1f635259a7fc5b823d5817e6861a217799d1c47c9bdf7', 'bundle/style.css': '6feeb2f47639a0dd2e52d8e60162bd31c9b0620b5a98d7f51d5d95008239c795', 'manifest.json': 'f02207401b7540e9e6df15da31268e1d3043c4b8ed23532bda5357143d3b4027', 'plugin_api.py': '41ba458ce95277bc46adf76ba91ad653213a1422630be71dc0c126582d5e68ff'}
+EXPECTED = {'bundle/index.js': '002ba6776ef65c5cc774850cb50f1649100b205b1b9dc26f0852b2e2462df5dc', 'bundle/style.css': 'b9e2be173119885c46577bfd57902f07eec52541a389de196600807ffcd005aa', 'manifest.json': '2cd46f0420d1bdbc8dc377b24f54c7ebfcfd70ddaf7a08e345277c58e3d3373d', 'plugin_api.py': 'd14d1d28f15d43c1c20100d7265257b1ca82d7d55455b1bb7c81306f4dfe23e7'}
 BASE = 'https://raw.githubusercontent.com/Sugamdeol/hermes-render/main/dashboard-plugins/hermes-chat-dashboard/dashboard/'
 target = Path('/opt/data/plugins/hermes-chat-dashboard/dashboard')
 if 'HERMES_COLAB' not in globals() or not target.is_dir():
@@ -35,6 +35,17 @@ for destination in (target, Path('/opt/render-tools/dashboard-plugins/hermes-cha
             os.replace(temporary, path)
         finally:
             if os.path.exists(temporary): os.unlink(temporary)
+# Update the already-installed isolated WS bridge without reapplying all patches.
+web = Path('/opt/hermes/hermes_cli/web_server.py')
+code = web.read_text()
+old = "stdout=asyncio.subprocess.PIPE, start_new_session=True,"
+new = "stdout=asyncio.subprocess.PIPE, limit=8 * 1024 * 1024, start_new_session=True,"
+if old in code:
+    code = code.replace(old, new, 1)
+elif new not in code:
+    raise RuntimeError('Unknown chat bridge version; update the launcher before retrying.')
+code = code.replace("sys.executable, '-m', 'tui_gateway.entry',", "sys.executable, '-u', '-m', 'tui_gateway.entry',", 1)
+web.write_text(code)
 print('Saving the updated UI and your data before restarting…')
 HERMES_COLAB.stop()  # Includes a confirmed backup; failure leaves it running.
 import subprocess

@@ -24,3 +24,5 @@ history boot. Reconnect invalidates the old gateway session handle; a send
 resumes the stored conversation before submitting. No prompt is replayed.
 
 Model changes target the live conversation. Provider-qualified picker IDs are translated into Hermes' explicit provider flag, including model names containing colons. A selection during generation is queued for the next submitted reply; the active model is only changed after gateway acknowledgement. Failed queued switches preserve the draft and block submission so it cannot silently use the wrong model. Navigating to another conversation clears the pending choice.
+
+Live deltas create a reply even when the start event is lost. Live replies bypass offscreen content skipping. After 12 seconds without reply events, the active accepted turn receives a small status check every five seconds; when complete, one bounded history page reconciles the transcript. No prompt is replayed and idle chats do not poll. The sidebar includes native compression tips, supports source filtering and explicit older-session paging.

@@ -30,9 +30,9 @@ new = '''    if _lite_pty_lock.locked():
         await ws.accept()
         proc = await asyncio.create_subprocess_exec(
             sys.executable, '/opt/render-tools/agent-budget.py', 'run', 'chat',
-            sys.executable, '-m', 'tui_gateway.entry',
+            sys.executable, '-u', '-m', 'tui_gateway.entry',
             cwd=str(PROJECT_ROOT), stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE, start_new_session=True,
+            stdout=asyncio.subprocess.PIPE, limit=8 * 1024 * 1024, start_new_session=True,
         )
         async def output():
             while True:

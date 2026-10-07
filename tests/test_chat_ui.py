@@ -16,3 +16,8 @@ class ChatUI(unittest.TestCase):
     def test_model_switching(self):
         subprocess.run(['node', str(ROOT / 'tests/chat_model_probe.cjs'),
                         str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed for the stream probe')
+    def test_missing_start_event(self):
+        subprocess.run(['node', str(ROOT / 'tests/chat_stream_probe.cjs'),
+                        str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)

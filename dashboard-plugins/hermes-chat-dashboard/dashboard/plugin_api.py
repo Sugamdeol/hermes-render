@@ -465,18 +465,18 @@ def _search_hits(db: Any, query: str) -> list[dict]:
     return []
 
 
-def _list_rows(db: Any, limit: int, offset: int) -> tuple[list[dict], bool]:
+def _list_rows(db: Any, limit: int, offset: int, source: str = "") -> tuple[list[dict], bool]:
     """One page of session rows plus a has_more hint, native-offset first."""
     rich = getattr(db, "list_sessions_rich", None)
     rows: list = []
     if callable(rich):
         try:
-            rows = list(rich(source=None, limit=limit + 1, offset=offset)) or []
+            rows = list(rich(source=source or None, limit=limit + 1, offset=offset, order_by_last_active=True)) or []
         except TypeError:
             # Older pins without offset: fetch a superset and slice here,
             # the same strategy the gateway's session.list uses.
             try:
-                rows = list(rich(source=None, limit=limit + offset + 1)) or []
+                rows = list(rich(source=source or None, limit=limit + offset + 1)) or []
                 rows = rows[offset:offset + limit + 1]
             except Exception:
                 rows = []
@@ -508,15 +508,15 @@ def _row_summary(s: dict, snippet: str = "") -> dict:
         "parent_session_id": s.get("parent_session_id") or "",
         "input_tokens": s.get("input_tokens") or 0,
         "output_tokens": s.get("output_tokens") or 0,
-        # child rows (sub-agent runs, compression continuations) are noise in
-        # a chat picker — same deny rule as the gateway's session.list.
-        "_child": src == "tool" or bool(s.get("parent_session_id")),
+        # Native list_sessions_rich already projects compression chains to their
+        # current tip. A parent ID does not make that conversation a subagent.
+        "_child": src == "tool",
         "snippet": str(snippet or ""),
     }
 
 
 @router.get("/sessions")
-def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = ""):
+def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: str = "", source: str = ""):
     """List stored conversations (works even when the gateway WebSocket is down).
 
     Mirrors the gateway's ``session.list`` shape (id/title/preview/started_at/
@@ -531,11 +531,11 @@ def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: s
     query = str(q or "").strip()
     db = _session_db()
     try:
-        rows, has_more = _list_rows(db, limit, offset)
+        rows, has_more = _list_rows(db, limit, offset, source)
         out = []
         for s in rows:
             entry = _row_summary(s)
-            if not entry["id"] or entry["_child"]:
+            if not entry["id"] or entry["_child"] or (source and str(entry["source"]).lower() != source.lower()):
                 continue
             out.append(entry)
 
@@ -561,11 +561,11 @@ def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: s
                     if not isinstance(row, dict):
                         continue
                     entry = _row_summary(row, snippet)
-                    if entry["_child"]:
+                    if entry["_child"] or (source and str(entry["source"]).lower() != source.lower()):
                         continue
                     merged.append(entry)
                 out = sorted(merged, key=lambda s: s.get("started_at") or 0, reverse=True)[:limit]
-        return {"sessions": out, "has_more": has_more and not query}
+        return {"sessions": out, "has_more": has_more and not query, "next_offset": offset + limit}
     finally:
         try:
             db.close()
