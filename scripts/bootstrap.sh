@@ -395,6 +395,19 @@ fi
 
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
+# Own the dashboard restart loop here; suppress upstream's one-shot process.
+case "${HERMES_DASHBOARD:-}" in
+  1|true|TRUE|True|yes|YES|Yes)
+    dash_host="${HERMES_DASHBOARD_HOST:-127.0.0.1}"
+    dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+    if [ "$dash_host" = "127.0.0.1" ] || [ "$dash_host" = "localhost" ]; then
+      gosu hermes sh /opt/render-tools/dashboard-supervisor.sh --host "$dash_host" --port "$dash_port" --no-open &
+    else
+      gosu hermes sh /opt/render-tools/dashboard-supervisor.sh --host "$dash_host" --port "$dash_port" --no-open --insecure &
+    fi
+    export HERMES_DASHBOARD=0
+    ;;
+esac
 gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/memory-log.py &
 if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   # The entrypoint already starts the dashboard as a side process. Make the

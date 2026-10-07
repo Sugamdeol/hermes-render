@@ -1,5 +1,4 @@
 """Repair only the exact known broken debug-master files; preserve custom edits."""
-import ast
 import hashlib
 import os
 from pathlib import Path
@@ -8,33 +7,12 @@ import tempfile
 JS_HASH = 'bfdbc9307585cfe62396eaf9012041673988c8f96b457aea0adb50c90d29dcc4'
 API_HASH = '2916d9ace6475bbd61695fbc0a2affb85b286b81d893ef210f52a89b5041e950'
 
+API_PREVIOUS_HASH = 'a9d4eaaacf3664ef8f72b3618ad098cd0c71af12a375289ed2b8baf6e5142ea5'
 
 def repaired_api(source):
-    old = '''import sys
-sys.path.append("/opt/data/plugins/debug-master")
-from __init__ import _dump_memory, _dump_jobs, _dump_session_history, _load_state'''
-    new = '''import importlib.util
-from pathlib import Path
-import sys
-_helper_path = Path(__file__).resolve().parents[1] / "__init__.py"
-_helper_spec = importlib.util.spec_from_file_location("_hermes_debug_master_helpers", _helper_path)
-_helpers = importlib.util.module_from_spec(_helper_spec)
-sys.modules[_helper_spec.name] = _helpers
-_helper_spec.loader.exec_module(_helpers)
-_dump_memory = _helpers._dump_memory
-_dump_jobs = _helpers._dump_jobs
-_dump_session_history = _helpers._dump_session_history
-_load_state = _helpers._load_state'''
-    assert old in source
-    source = source.replace(old, new, 1)
-    node = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == '_require_session')
-    lines = source.splitlines(keepends=True)
-    lines[node.lineno-1:node.end_lineno] = ['''def _require_session(request: Request) -> None:
-    from hermes_cli.web_server import _has_valid_session_token
-    if not _has_valid_session_token(request):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-''']
-    result = ''.join(lines).replace('async def snapshot(', 'def snapshot(').replace('async def health(', 'def health(')
+    # The generated helper also crashes during import. The dashboard does not
+    # need agent hooks or tools to inspect a bounded read-only snapshot.
+    result = Path(__file__).with_name('debug-master-api.py').read_text()
     compile(result, 'plugin_api.py', 'exec')
     return result
 
@@ -60,7 +38,7 @@ def repair(root):
     if js.is_file() and hashlib.sha256(js.read_bytes()).hexdigest() == JS_HASH:
         write(js, Path(__file__).with_name('debug-master.js').read_bytes())
         print('[dashboard] repaired debug-master JavaScript')
-    if api.is_file() and hashlib.sha256(api.read_bytes()).hexdigest() == API_HASH:
+    if api.is_file() and hashlib.sha256(api.read_bytes()).hexdigest() in (API_HASH, API_PREVIOUS_HASH):
         write(api, repaired_api(api.read_text()).encode())
         print('[dashboard] repaired debug-master authentication')
 
