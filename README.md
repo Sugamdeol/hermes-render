@@ -51,6 +51,21 @@ backup leaves it running so you can inspect logs and retry.
 
 ## Setup
 
+### Updated chat workspace
+
+The bundled `hermes-chat-dashboard` plugin keeps the conversation central:
+readable system fonts, narrower history, optional details, Focus mode and a
+Latest messages button. Existing model selection, attachments, tool activity,
+steering, history and exports stay in the same plugin. Submission locks prevent
+rapid duplicate sends; IME typing, read-only sessions and pending uploads are
+handled before submission. No extra agent process is added.
+
+For an already running Colab notebook, run `update-chat-ui.py` in that notebook.
+It verifies downloaded UI files, replaces only this plugin's frontend assets,
+then asks the existing daemon to back them up. After it reports a saved backup,
+hard-refresh the dashboard. A new launcher boot installs the bundled version.
+
+
 1. Select this repository in the Render account where you want the service.
 2. Enter `GIT_STATE_TOKEN`: a fine-grained GitHub token scoped to the private
    `Sugamdeol/hermes-storage` repository, with Contents read/write and Metadata read.
