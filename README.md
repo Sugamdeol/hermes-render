@@ -62,8 +62,14 @@ password is shown with the dashboard link after startup. Keep the notebook priva
 
 In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
 `HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses
-to shut down on a failed backup. Colab can end a runtime without warning, so it
-is temporary hosting: work not uploaded before termination can be lost.
+to shut down on a failed backup. A failed `backup()` prints the reason from the
+storage log and leaves the agent running. A GitHub network problem means: wait
+and retry. `advanced since` means another copy saved newer state, so stop that
+copy first. Only for a stuck runtime, where you accept losing work that has not
+reached GitHub, `HERMES_COLAB.stop(force=True)` stops without saving; press ▶
+afterwards to restart from the last GitHub backup. Colab can end a runtime
+without warning, so it is temporary hosting: work not uploaded before termination
+can be lost.
 
 If a runtime started from an older copy of the notebook reports `Refusing to run
 the Hermes gateway as root` and the dashboard cannot restart it, add the opt-in

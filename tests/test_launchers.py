@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch, Mock
 
@@ -249,6 +250,88 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("'HERMES_ALLOW_ROOT_GATEWAY'", override)
         self.assertLess(source.index(override), restart)
         self.assertIn('env=HERMES_COLAB.env', source[restart:restart + 200])
+
+
+    def test_colab_backup_success_returns_quietly(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(Mock(poll=Mock(return_value=None)), {})
+        saved = subprocess.CompletedProcess(['gosu'], 0, stdout='Private GitHub backup saved.\n', stderr='')
+        with patch.object(module.subprocess, 'run', return_value=saved), patch('builtins.print') as printed:
+            agent.backup()
+        printed.assert_called_once_with('Private GitHub backup saved.')
+
+    def test_colab_backup_reports_why_this_save_failed(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(Mock(poll=Mock(return_value=None)), {'GIT_STATE_TOKEN': 'secret-token'})
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'hermes-colab.log'
+            # An earlier failure must not be blamed on this save attempt.
+            log.write_text('[hermes-git-state] recovery checkpoint failed: owner/repo@state advanced since this instance restored\n')
+
+            def checkpoint(*args, **kwargs):
+                with log.open('a') as handle:
+                    handle.write('[hermes-git-state] recovery checkpoint failed: could not confirm owner/repo is private (GitHub API unreachable)\n')
+                return subprocess.CompletedProcess(args[0], 1, stdout='', stderr='Backup failed; keep Colab running. secret-token\n')
+
+            with patch.object(module, 'LOG', log), patch.object(module.subprocess, 'run', side_effect=checkpoint), \
+                 patch('builtins.print') as printed:
+                with self.assertRaisesRegex(RuntimeError, 'Nothing was pushed') as raised:
+                    agent.backup()
+        shown = '\n'.join(' '.join(map(str, call.args)) for call in printed.call_args_list)
+        self.assertIn('could not confirm', shown)
+        self.assertNotIn('advanced since', shown)
+        self.assertNotIn('secret-token', shown)
+        self.assertIn('agent is still running', str(raised.exception))
+
+    def test_colab_backup_timeout_does_not_reuse_an_old_failure(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(Mock(poll=Mock(return_value=None)), {})
+        timed_out = subprocess.CompletedProcess(['gosu'], 1, stdout='',
+                                                stderr='Backup timed out; the agent has NOT been stopped.\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'hermes-colab.log'
+            log.write_text('[hermes-git-state] recovery checkpoint failed: could not confirm owner/repo is private\n')
+            with patch.object(module, 'LOG', log), patch.object(module.subprocess, 'run', return_value=timed_out), \
+                 patch('builtins.print'):
+                with self.assertRaisesRegex(RuntimeError, 'did not confirm a save within 5 minutes'):
+                    agent.backup()
+
+    def test_backup_failure_names_the_newest_known_cause(self):
+        module = load('run-colab')
+        explain = module.explain_backup_failure
+        advice, line = explain('', '[hermes-git-state] recovery checkpoint failed: could not confirm owner/repo is private\n'
+                                   '[hermes-git-state] git state push failed (safety-net interval); will retry: network down\n')
+        self.assertIn('Pushing to GitHub failed', advice)
+        self.assertIn('network down', line)
+        advice, _ = explain('', '[hermes-git-state] recovery checkpoint failed: owner/repo@state advanced since this instance restored\n')
+        self.assertIn('Another copy saved newer state', advice)
+        advice, _ = explain('', '[hermes-git-state] recovery checkpoint failed: something new\n')
+        self.assertIn('could not save this state', advice)
+        self.assertEqual(explain('Backup timed out; the agent has NOT been stopped.', ''), (module.NO_REPLY, None))
+        self.assertEqual(explain('Backup failed.', ''), (module.NO_REASON, None))
+
+    def test_colab_default_stop_saves_before_stopping(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(Mock(pid=4242), {})
+        with patch.object(agent, 'backup') as backup, patch.object(module, 'descendants', return_value={}), \
+             patch.object(module.ColabAgent, 'stop_tunnel'), patch.object(module.subprocess, 'run'), \
+             patch('builtins.print') as printed:
+            agent.stop()
+        backup.assert_called_once_with()
+        self.assertIn('Saved and stopped', printed.call_args_list[-1].args[0])
+
+    def test_colab_force_stop_skips_the_save_gate(self):
+        module = load('run-colab')
+        agent = module.ColabAgent(Mock(pid=4242), {})
+        with patch.object(agent, 'backup', side_effect=AssertionError('force must not try to save')), \
+             patch.object(module, 'descendants', return_value={}), \
+             patch.object(module.ColabAgent, 'stop_tunnel') as stop_tunnel, \
+             patch.object(module.subprocess, 'run') as nginx, patch('builtins.print') as printed:
+            agent.stop(force=True)
+        stop_tunnel.assert_called_once_with(agent)
+        nginx.assert_called_once()
+        self.assertIn('Force stop', printed.call_args_list[0].args[0])
+        self.assertIn('Stopped without a confirmed save', printed.call_args_list[-1].args[0])
 
 
 if __name__ == '__main__':

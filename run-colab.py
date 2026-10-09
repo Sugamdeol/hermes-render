@@ -12,6 +12,7 @@ After launch, use another cell:
     HERMES_COLAB.backup()    # wait for a confirmed GitHub save
     HERMES_COLAB.status()    # gateway/Telegram health
     HERMES_COLAB.stop()      # save, stop; then move back to Render/local
+    HERMES_COLAB.stop(force=True)  # last resort when a save keeps failing: stop WITHOUT saving
 
 Colab runtimes are temporary. An abrupt runtime deletion cannot run a final
 save; automatic backups preserve only work that reached GitHub beforehand.
@@ -61,6 +62,67 @@ while time.monotonic()<deadline:
     time.sleep(.5)
 else: raise SystemExit('Backup timed out; the agent has NOT been stopped.')
 '''
+# Why a save did not reach GitHub, read from the storage daemon's log lines
+# (scripts/git-storage.py). Most specific first: a failed checkpoint is logged as
+# "recovery checkpoint failed: <reason>", so the reason text decides the case.
+BACKUP_REASONS = (
+    ("advanced since",
+     "Another copy saved newer state to this backup repository, so this runtime will not "
+     "overwrite it. Stop that copy first. To take its newer state, run HERMES_COLAB.stop(force=True) "
+     "here (this runtime's unsaved changes are lost), then press \u25b6."),
+    ("could not confirm",
+     "GitHub could not confirm the backup repository is private (API unreachable, or the token "
+     "lacks access). Nothing was pushed. Wait a minute, then retry backup()."),
+    ("git state push failed",
+     "Pushing to GitHub failed, usually a network problem. The daemon retries by itself. "
+     "Wait a minute, then retry backup()."),
+    ("recovery checkpoint failed",
+     "The storage daemon could not save this state. Fix the reason in the log line above, "
+     "then retry backup()."),
+)
+NO_REPLY = ("The storage daemon did not confirm a save within 5 minutes and logged no reason. It may be "
+            "stuck on a slow GitHub upload, or it may have stopped. Retry backup() once. If it stays silent, "
+            "HERMES_COLAB.stop(force=True) stops without saving, and anything not yet pushed is lost.")
+NO_REASON = ("The save failed and the storage log has no reason for it. Check the output above and the "
+             "log tail, then retry backup().")
+
+
+def explain_backup_failure(output, log_text):
+    """Return (advice, log line) for a failed save.
+
+    `log_text` must hold only the storage log written during this save attempt,
+    so an older failure is never blamed for a new one.
+    """
+    for line in reversed(log_text.splitlines()):
+        for marker, advice in BACKUP_REASONS:
+            if marker in line:
+                return advice, line.strip()
+    if "timed out" in output:
+        return NO_REPLY, None
+    return NO_REASON, None
+
+
+def log_offset():
+    try:
+        return LOG.stat().st_size
+    except OSError:
+        return 0
+
+
+def log_since(offset):
+    try:
+        with LOG.open("rb") as handle:
+            handle.seek(offset)
+            return handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def redact_secrets(text, env):
+    for name, value in env.items():
+        if value and re.search(r"TOKEN|KEY|PASSWORD|SECRET", name):
+            text = text.replace(value, "[redacted]")
+    return text
 
 
 def run(args, **kwargs):
@@ -408,10 +470,7 @@ class ColabAgent:
             cloudflare_url = ColabAgent.start_tunnel(self)
         except Exception as exc:
             cloudflare_url = None
-            detail = str(exc)
-            for name, value in getattr(self, "env", {}).items():
-                if value and re.search(r"TOKEN|KEY|PASSWORD|SECRET", name):
-                    detail = detail.replace(value, "[redacted]")
+            detail = redact_secrets(str(exc), getattr(self, "env", {}))
             print("Cloudflare link unavailable:", type(exc).__name__, detail[:2000])
             print("Tunnel logs: /content/hermes-cloudflare/tunnel.log. Retry HERMES_COLAB.dashboard().")
         colab_url = None
@@ -451,12 +510,40 @@ class ColabAgent:
         print("Username: hermes\nPassword:", values.get("HERMES_GATEWAY_TOKEN", "Password is not ready yet"))
 
     def backup(self):
+        """Save now and wait until the storage daemon confirms GitHub has the state.
+
+        On failure, print the storage log's reason for this attempt and raise.
+        The agent keeps running, so the save can be retried.
+        """
         if self.process.poll() is not None:
             raise RuntimeError("Agent is not running; keep this runtime's files for recovery")
-        run(["gosu", "hermes", INSTALL / ".venv/bin/python", "-c", CHECKPOINT], env=self.env)
+        offset = log_offset()
+        result = subprocess.run(["gosu", "hermes", INSTALL / ".venv/bin/python", "-c", CHECKPOINT],
+                                env=self.env, capture_output=True, text=True)
+        output = redact_secrets(result.stdout + result.stderr, self.env).strip()
+        if output:
+            print(output)
+        if result.returncode == 0:
+            return
+        advice, line = explain_backup_failure(output, redact_secrets(log_since(offset), self.env))
+        if line:
+            print("Storage log:", line)
+        raise RuntimeError("Backup not confirmed; the agent is still running. " + advice)
 
-    def stop(self):
-        self.backup()  # On failure, leave the agent and local data running.
+    def stop(self, force=False):
+        """Save, then stop the agent and everything it started.
+
+        Without force, a failed backup() raises before anything is stopped.
+        force=True skips the save entirely, so a stuck runtime can always be
+        restarted. It accepts losing anything the storage daemon has not pushed
+        to GitHub, including the last changes before the save gate failed (the
+        daemon may still push during its shutdown). The next start restores the
+        last confirmed backup.
+        """
+        if force:
+            print("Force stop: no save is attempted. Anything not yet pushed to GitHub is lost.")
+        else:
+            self.backup()  # On failure, leave the agent and local data running.
         ColabAgent.stop_tunnel(self)
         processes = descendants(self.process.pid)
         for pid in reversed(processes):
@@ -476,7 +563,10 @@ class ColabAgent:
             except (OSError, ValueError, IndexError):
                 pass
         subprocess.run(["nginx", "-s", "quit"], capture_output=True)
-        print("Saved and stopped. You can now start the Render/local copy.")
+        if force:
+            print("Stopped without a confirmed save. Press \u25b6 to restart from the last GitHub backup.")
+        else:
+            print("Saved and stopped. You can now start the Render/local copy.")
 
 
 def main(confirm_switch=False):
