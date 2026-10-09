@@ -215,5 +215,41 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('private-token',text.getvalue())
 
 
+    def test_root_gateway_opt_in_is_colab_only(self):
+        colab = load('run-colab')
+        with patch.dict(os.environ, {}, clear=True):
+            env = colab.runtime_env('token', 'key')
+        self.assertEqual(env['HERMES_ALLOW_ROOT_GATEWAY'], '1')
+        self.assertIn('HERMES_ALLOW_ROOT_GATEWAY', env['HERMES_ENV_OVERRIDE_KEYS'].split(','))
+        local = load('run-local')
+        with patch.dict(os.environ, {}, clear=True):
+            local_env = local.runtime_env('token', 'key')
+        self.assertNotIn('HERMES_ALLOW_ROOT_GATEWAY', local_env)
+        self.assertNotIn('HERMES_ALLOW_ROOT_GATEWAY', local_env['HERMES_ENV_OVERRIDE_KEYS'].split(','))
+
+    def test_root_gateway_flag_is_never_set_outside_the_colab_launcher(self):
+        # Render, Docker and the local launcher keep upstream's root-gateway guard.
+        locations = ['Dockerfile', 'run-local.py', 'run-local.sh', 'render.yaml', '.env.example',
+                     'env', 'scripts', 'skills', 'dashboard-plugins', '.github']
+        for location in locations:
+            path = ROOT / location
+            files = [path] if path.is_file() else [p for p in path.rglob('*') if p.is_file()]
+            for file in files:
+                if '__pycache__' in file.parts or file.suffix == '.pyc':
+                    continue
+                with self.subTest(file=str(file.relative_to(ROOT))):
+                    self.assertNotIn('HERMES_ALLOW_ROOT_GATEWAY', file.read_text(errors='ignore'))
+
+    def test_colab_restart_sets_root_opt_in_before_popen(self):
+        source = (ROOT / 'update-chat-ui.py').read_text()
+        restart = source.index('HERMES_COLAB.process = subprocess.Popen(')
+        self.assertLess(source.index("HERMES_COLAB.env['HERMES_ALLOW_ROOT_GATEWAY'] = '1'"), restart)
+        override = next(line for line in source.splitlines()
+                        if "HERMES_COLAB.env['HERMES_ENV_OVERRIDE_KEYS'] =" in line)
+        self.assertIn("'HERMES_ALLOW_ROOT_GATEWAY'", override)
+        self.assertLess(source.index(override), restart)
+        self.assertIn('env=HERMES_COLAB.env', source[restart:restart + 200])
+
+
 if __name__ == '__main__':
     unittest.main()

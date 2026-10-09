@@ -81,6 +81,13 @@ namespace = runpy.run_path(str(launcher_path), run_name='hermes_launcher_update'
 HERMES_COLAB.__class__ = namespace['ColabAgent']
 print('Saving the updated UI and your data before restarting…')
 HERMES_COLAB.stop()  # Includes a confirmed backup; failure leaves it running.
+# The restart reuses the env captured at launch, which may predate the Colab-only
+# root-gateway opt-in (run-colab.py runtime_env). Set it before the Popen below and
+# list it as launcher-owned, so a saved .env value cannot replace it at boot.
+HERMES_COLAB.env['HERMES_ALLOW_ROOT_GATEWAY'] = '1'
+overrides = [name for name in HERMES_COLAB.env.get('HERMES_ENV_OVERRIDE_KEYS', '').split(',')
+             if name and name != 'HERMES_ALLOW_ROOT_GATEWAY']
+HERMES_COLAB.env['HERMES_ENV_OVERRIDE_KEYS'] = ','.join(overrides + ['HERMES_ALLOW_ROOT_GATEWAY'])
 import subprocess
 import time
 log = Path('/content/hermes-colab.log')

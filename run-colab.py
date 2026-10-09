@@ -86,6 +86,11 @@ def runtime_env(token, key):
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
         "MALLOC_ARENA_MAX": "1", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+        # Colab only: the hermes account is uid 0 on an ephemeral VM, so no later
+        # non-root run can be broken by root-owned files, which is the risk the
+        # upstream "refusing to run the gateway as root" guard protects against.
+        # Render and Docker never set this; see run-local.py and the Dockerfile.
+        "HERMES_ALLOW_ROOT_GATEWAY": "1",
     }
     values["HERMES_ENV_OVERRIDE_KEYS"] = ",".join([*values, "PATH", "HERMES_ENV_OVERRIDE_KEYS"])
     values["PATH"] = str(INSTALL / ".venv/bin") + ":/usr/local/bin:" + os.environ.get("PATH", "")
