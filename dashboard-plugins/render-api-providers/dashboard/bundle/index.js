@@ -87,11 +87,17 @@
     var initial = props.initial || null; // existing entry when editing
     var editing = !!initial;
 
+    // Multi-key support: track apiKeys as a list
+    var initialKeys = (initial && initial.api_keys) ? initial.api_keys.slice() : [];
+    var initialApiKey = (initial && initial.api_key) ? initial.api_key : "";
+    // Use api_keys list if present, otherwise fall back to single api_key
+    var effectiveInitialKeys = initialKeys.length > 0 ? initialKeys : [initialApiKey].filter(Boolean);
+
     var state = useState({
       name: initial ? initial.name : "",
       baseUrl: initial ? initial.base_url : "",
-      apiKey: "",
-      clearApiKey: false,
+      apiKeys: effectiveInitialKeys.slice(),
+      clearApiKeys: false,
       keyEnv: initial ? initial.key_env : "",
       apiMode: initial ? initial.api_mode : "",
       model: initial ? initial.model : "",
@@ -114,6 +120,36 @@
       [setForm],
     );
 
+    var addKey = useCallback(function () {
+      setForm(function (prev) {
+        var next = {};
+        for (var k in prev) next[k] = prev[k];
+        next.apiKeys = prev.apiKeys.slice();
+        next.apiKeys.push("");
+        return next;
+      });
+    }, [setForm]);
+
+    var removeKey = useCallback(function (index) {
+      setForm(function (prev) {
+        var next = {};
+        for (var k in prev) next[k] = prev[k];
+        next.apiKeys = prev.apiKeys.slice();
+        next.apiKeys.splice(index, 1);
+        return next;
+      });
+    }, [setForm]);
+
+    var updateKey = useCallback(function (index, value) {
+      setForm(function (prev) {
+        var next = {};
+        for (var k in prev) next[k] = prev[k];
+        next.apiKeys = prev.apiKeys.slice();
+        next.apiKeys[index] = value;
+        return next;
+      });
+    }, [setForm]);
+
     var validate = function () {
       if (!editing && !form.name.trim()) return "Name is required";
       var parsedUrl;
@@ -128,6 +164,11 @@
       if (form.keyEnv.trim() && !/^[A-Za-z_][A-Za-z0-9_]{0,127}$/.test(form.keyEnv.trim())) {
         return "Key env var must be a valid environment variable name";
       }
+      // Validate multi-keys: at most 10 non-empty keys
+      var nonEmptyKeys = form.apiKeys.filter(function (k) { return k.trim() !== ""; });
+      if (nonEmptyKeys.length > 10) {
+        return "At most 10 API keys are allowed";
+      }
       return null;
     };
 
@@ -138,16 +179,26 @@
         set({ error: problem });
         return;
       }
+      // Build payload: use api_keys list if multiple keys, otherwise single api_key
       var payload = {
         name: form.name.trim(),
         base_url: form.baseUrl.trim().replace(/\/+$/, ""),
         api_mode: form.apiMode,
         key_env: form.keyEnv.trim(),
         model: form.model.trim(),
-        clear_api_key: form.clearApiKey,
+        clear_api_key: form.clearApiKeys,
       };
-      if (form.apiKey) payload.api_key = form.apiKey.trim();
-      // Blank key on edit = keep the stored key (backend preserves it).
+      // Filter to non-empty keys for the payload
+      var nonEmptyKeys = form.apiKeys.filter(function (k) { return k.trim() !== ""; });
+      if (nonEmptyKeys.length > 0) {
+        if (nonEmptyKeys.length === 1) {
+          // Single key — use legacy api_key field for backwards compat
+          payload.api_key = nonEmptyKeys[0].trim();
+        } else {
+          // Multiple keys — use new api_keys list
+          payload.api_keys = nonEmptyKeys.map(function (k) { return k.trim(); });
+        }
+      }
 
       set({ busy: true, error: null });
       try {
@@ -209,28 +260,54 @@
       ),
       h(
         "div",
-        { className: "rapi-field" },
-        h(Label, { htmlFor: "rapi-key" }, "API key"),
-        h(Input, {
-          id: "rapi-key",
-          type: "password",
-          value: form.apiKey,
-          placeholder: editing
-            ? "Leave blank to keep the current key"
-            : "Optional — leave blank for keyless endpoints or a key env var",
-          autoComplete: "off",
-          onChange: function (e) { set({ apiKey: e.target.value, clearApiKey: false }); },
-        }),
-        editing && initial.has_api_key && !form.clearApiKey
+        { className: "rapi-field", style: { gridColumn: "1 / -1" } },
+        h(Label, { htmlFor: "rapi-keys-label" }, "API keys"),
+        h("p", { className: "rapi-hint", style: { marginBottom: "8px" } },
+          "Add multiple keys for rate-limit rotation. If one key hits its limit, another is used. Up to 10 keys supported.",
+        ),
+        h("div", { className: "rapi-keys-list" },
+          form.apiKeys.map(function (key, index) {
+            return h(
+              "div",
+              { className: "rapi-key-row", style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" } },
+              h(Input, {
+                id: "rapi-key-" + index,
+                type: "password",
+                value: key,
+                placeholder: "API key " + (index + 1),
+                autoComplete: "off",
+                onChange: function (e) { updateKey(index, e.target.value); },
+                style: { flex: "1" },
+              }),
+              h(Button, {
+                type: "button",
+                size: "sm",
+                variant: "ghost",
+                onClick: function () { removeKey(index); },
+                disabled: form.apiKeys.length <= 1,
+                title: "Remove this key",
+                style: { flexShrink: 0 },
+              }, "×"),
+            );
+          }),
+          h(Button, {
+            type: "button",
+            size: "sm",
+            variant: "outline",
+            onClick: addKey,
+            disabled: form.apiKeys.length >= 10,
+          }, "+ Add another key"),
+        ),
+        editing && initial.has_api_key && !form.clearApiKeys
           ? h(Button, {
               type: "button",
               size: "sm",
               outlined: true,
-              onClick: function () { set({ clearApiKey: true, apiKey: "" }); },
-            }, "Clear saved key")
+              onClick: function () { set({ clearApiKeys: true }); },
+            }, "Clear all saved keys")
           : null,
-        editing && form.clearApiKey
-          ? h("span", { className: "rapi-status rapi-status-err" }, "Saved key will be removed when you save.")
+        editing && form.clearApiKeys
+          ? h("span", { className: "rapi-status rapi-status-err" }, "All saved keys will be removed when you save.")
           : null,
       ),
       h(
@@ -415,7 +492,9 @@
     };
 
     var keyBadge = entry.has_api_key
-      ? "key in config"
+      ? (entry.api_key_count && entry.api_key_count > 1
+          ? entry.api_key_count + " keys (rotation)"
+          : "key in config")
       : entry.key_env
         ? "env " + entry.key_env
         : "no key";

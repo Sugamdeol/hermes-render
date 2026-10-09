@@ -54,6 +54,7 @@ router = APIRouter()
 
 MAX_NAME_LEN = 64
 MAX_KEY_LEN = 64
+MAX_API_KEYS = 10
 ENV_VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 API_MODES = ("", "chat_completions", "anthropic_messages")
 MODEL_FETCH_TIMEOUT = 5.0
@@ -144,11 +145,46 @@ def _environment_value(name: str) -> str:
 
 
 def _provider_api_key(raw: dict) -> str:
-    """Resolve an inline key or key_env value for a raw config entry."""
+    """Resolve an inline key or key_env value for a raw config entry.
+
+    Supports both a single ``api_key`` field (legacy) and an ``api_keys``
+    list (multi-key).  When multiple keys are present, returns the first
+    non-empty one so callers that need a single key still work.
+    """
+    # Multi-key list takes precedence when present
+    api_keys = raw.get("api_keys")
+    if isinstance(api_keys, list):
+        for key in api_keys:
+            if isinstance(key, str) and key.strip():
+                return key.strip()
     inline = _first_str(raw, "api_key", "key")
     if inline:
         return inline
     return _environment_value(_first_str(raw, "key_env", "api_key_env"))
+
+
+def _provider_api_keys(raw: dict) -> list[str]:
+    """Return all configured API keys for a provider (empty list if none).
+
+    Supports both a single ``api_key`` field (legacy, returned as a
+    single-element list) and an ``api_keys`` list.  When both are present,
+    the ``api_keys`` list takes precedence and the legacy key is ignored.
+    Environment-variable keys are not expanded here — the caller resolves
+    those separately.
+    """
+    result: list[str] = []
+    # Multi-key list takes precedence when present
+    api_keys = raw.get("api_keys")
+    if isinstance(api_keys, list):
+        for key in api_keys:
+            if isinstance(key, str) and key.strip():
+                result.append(key.strip())
+        return result
+    # Legacy single key (only when no api_keys list)
+    inline = _first_str(raw, "api_key", "key")
+    if inline:
+        result.append(inline)
+    return result
 
 
 def _configured_model_ids(raw: dict) -> list[str]:
@@ -231,13 +267,18 @@ def fetch_custom_provider_models(
     compatible and Anthropic Messages authentication are supported.  The
     request is made server-side so provider keys never enter browser requests
     (and so endpoints that do not enable CORS work normally).
+
+    When multiple API keys are configured (``api_keys`` list), each key is
+    tried in order until one succeeds.  A 401/Unauthorized response causes
+    the next key to be tried immediately; other errors are retried on the
+    next URL candidate with the same key.  This allows rate-limited or
+    invalid keys to be skipped automatically during model discovery.
     """
     if not isinstance(raw, dict):
         return None
     base_url = _first_str(raw, "base_url", "url", "api")
     if not base_url:
         return None
-    api_key = _provider_api_key(raw)
     api_mode = _first_str(raw, "api_mode", "transport").lower()
     parsed = urlparse(base_url)
     hostname = (parsed.hostname or "").lower()
@@ -247,19 +288,67 @@ def fetch_custom_provider_models(
     ):
         api_mode = "anthropic_messages"
 
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "hermes-render-provider-discovery/1",
-    }
-    if api_key and api_mode == "anthropic_messages":
-        headers["x-api-key"] = api_key
-        headers["anthropic-version"] = "2023-06-01"
-    elif api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    # Collect all keys to try: inline keys first, then env var if present
+    keys_to_try = _provider_api_keys(raw)
+    key_env = _first_str(raw, "key_env", "api_key_env")
+    if key_env:
+        env_value = _environment_value(key_env)
+        if env_value and env_value not in keys_to_try:
+            keys_to_try.append(env_value)
 
-    for url in _model_url_candidates(base_url):
+    urls = _model_url_candidates(base_url)
+    if not urls:
+        return None
+
+    # Try each key against URL candidates until one succeeds
+    for api_key in keys_to_try:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "hermes-render-provider-discovery/1",
+        }
+        if api_key and api_mode == "anthropic_messages":
+            headers["x-api-key"] = api_key
+            headers["anthropic-version"] = "2023-06-01"
+        elif api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        key_exhausted = False
+        for url in urls:
+            try:
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    raw_payload = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
+                    if len(raw_payload) > MAX_PROVIDER_RESPONSE_BYTES:
+                        return None
+                    payload = json.loads(raw_payload.decode("utf-8"))
+                return _model_ids_from_response(payload)
+            except urllib.error.HTTPError as exc:
+                # 401/Unauthorized means this key is invalid — try the next key
+                if exc.code == 401:
+                    key_exhausted = True
+                    break
+                # Other HTTP errors: retry on next URL with same key
+                continue
+            except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+                # Network/transport errors: retry on next URL with same key
+                continue
+            except Exception:
+                # A provider implementation should not make the Models page fail
+                # for every other provider. Treat unexpected response/transport
+                # errors as an unavailable discovery endpoint too.
+                continue
+
+        # If this key got a 401, move to the next key
+        if key_exhausted:
+            continue
+
+    # No key succeeded — try without auth as a last resort (keyless endpoints)
+    for url in urls:
         try:
-            request = urllib.request.Request(url, headers=headers)
+            request = urllib.request.Request(url, headers={
+                "Accept": "application/json",
+                "User-Agent": "hermes-render-provider-discovery/1",
+            })
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 raw_payload = response.read(MAX_PROVIDER_RESPONSE_BYTES + 1)
                 if len(raw_payload) > MAX_PROVIDER_RESPONSE_BYTES:
@@ -269,10 +358,8 @@ def fetch_custom_provider_models(
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError, OSError):
             continue
         except Exception:
-            # A provider implementation should not make the Models page fail
-            # for every other provider. Treat unexpected response/transport
-            # errors as an unavailable discovery endpoint too.
             continue
+
     return None
 
 
@@ -285,6 +372,9 @@ def _normalize_entry(raw: dict, *, key: str = "", source: str) -> dict | None:
     if not name:
         return None
     entry_key = key or provider_key_from_name(name)
+    inline_keys = _provider_api_keys(raw)
+    has_inline_key = bool(inline_keys)
+    key_env = _first_str(raw, "key_env", "api_key_env")
     return {
         "key": entry_key,
         "name": name,
@@ -292,8 +382,9 @@ def _normalize_entry(raw: dict, *, key: str = "", source: str) -> dict | None:
         "api_mode": _first_str(raw, "api_mode", "transport"),
         "model": _first_str(raw, "model", "default_model"),
         "models": _configured_model_ids(raw),
-        "key_env": _first_str(raw, "key_env", "api_key_env"),
-        "has_api_key": bool(_first_str(raw, "api_key", "key")),
+        "key_env": key_env,
+        "has_api_key": has_inline_key or bool(key_env),
+        "api_key_count": len(inline_keys),
         "source": source,
     }
 
@@ -402,11 +493,19 @@ def _upsert_legacy_entry(config: dict, name: str, key: str, fields: dict) -> Non
         if not _legacy_entry_matches(entry, name, key):
             continue
         entry["base_url"] = fields["base_url"]
-        if fields.get("clear_api_key"):
+        # Handle multi-key api_keys list for legacy entries too
+        api_keys = fields.get("api_keys")
+        if isinstance(api_keys, list):
+            entry["api_keys"] = [str(k).strip() for k in api_keys if str(k).strip()]
             entry.pop("api_key", None)
             entry.pop("key", None)
+        elif fields.get("clear_api_key"):
+            entry.pop("api_key", None)
+            entry.pop("key", None)
+            entry.pop("api_keys", None)
         elif fields.get("api_key"):
             entry["api_key"] = fields["api_key"]
+            entry.pop("api_keys", None)
         if fields.get("key_env"):
             entry["key_env"] = fields["key_env"]
         else:
@@ -426,8 +525,8 @@ def _upsert_legacy_entry(config: dict, name: str, key: str, fields: dict) -> Non
 def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
     """Insert or update a custom provider; returns its provider key.
 
-    ``fields`` must contain: name, base_url; optional: api_key, key_env,
-    api_mode, model, key (derived by the caller when empty).
+    ``fields`` must contain: name, base_url; optional: api_key, api_keys,
+    key_env, api_mode, model, key (derived by the caller when empty).
     Raises ValueError for input problems and LookupError when the key
     already belongs to a different provider name.
     """
@@ -457,22 +556,58 @@ def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
 
     entry["name"] = name
     entry["base_url"] = fields["base_url"]
-    # A blank api_key on update means "keep the current key" (the form
-    # cannot represent "clear" without a dedicated affordance).
-    if fields.get("clear_api_key"):
+
+    # Handle multi-key API keys list
+    api_keys = fields.get("api_keys")
+    clear_keys = fields.get("clear_api_key")
+    if isinstance(api_keys, list):
+        # Empty list with clear flag means remove all keys
+        if not api_keys and clear_keys:
+            entry.pop("api_keys", None)
+            entry.pop("api_key", None)
+            entry.pop("key", None)
+        else:
+            # Filter to non-empty strings, cap at MAX_API_KEYS
+            cleaned = [str(k).strip() for k in api_keys if str(k).strip()]
+            if cleaned:
+                # Single key uses legacy field for backwards compatibility
+                if len(cleaned) == 1:
+                    entry["api_key"] = cleaned[0]
+                    entry.pop("api_keys", None)
+                    entry.pop("key", None)
+                else:
+                    entry["api_keys"] = cleaned[:MAX_API_KEYS]
+                    entry.pop("api_key", None)
+                    entry.pop("key", None)
+            elif clear_keys:
+                entry.pop("api_keys", None)
+                entry.pop("api_key", None)
+                entry.pop("key", None)
+    elif clear_keys:
         entry.pop("api_key", None)
         entry.pop("key", None)
+        entry.pop("api_keys", None)
     elif fields.get("api_key"):
         entry["api_key"] = fields["api_key"]
+        entry.pop("api_keys", None)
+
     if fields.get("key_env"):
         entry["key_env"] = fields["key_env"]
+        entry.pop("api_key_env", None)
+    else:
+        entry.pop("key_env", None)
         entry.pop("api_key_env", None)
     if fields.get("api_mode"):
         entry["api_mode"] = fields["api_mode"]
         entry.pop("transport", None)
+    else:
+        entry.pop("api_mode", None)
     if fields.get("model"):
         entry["default_model"] = fields["model"]
         entry.pop("model", None)
+    else:
+        entry.pop("model", None)
+        entry.pop("default_model", None)
     providers[key] = entry
 
     _upsert_legacy_entry(config, name, key, fields)
@@ -599,10 +734,18 @@ def _parse_upsert_body(body: dict) -> dict:
     if not isinstance(body, dict):
         raise ValueError("request body must be a JSON object")
     name = str(body.get("name", "") or "").strip()
+    # Support both single api_key (legacy) and api_keys list (multi-key)
+    raw_api_keys = body.get("api_keys")
+    api_keys: list[str] | None = None
+    if isinstance(raw_api_keys, list):
+        api_keys = [str(k).strip() for k in raw_api_keys if str(k).strip()]
+        if len(api_keys) > MAX_API_KEYS:
+            raise ValueError(f"at most {MAX_API_KEYS} API keys are allowed")
     fields = {
         "name": name,
         "base_url": normalize_base_url(body.get("base_url", "")),
         "api_key": str(body.get("api_key", "") or "").strip(),
+        "api_keys": api_keys,
         "clear_api_key": body.get("clear_api_key") is True,
         "key_env": normalize_key_env(body.get("key_env", "")),
         "api_mode": normalize_api_mode(body.get("api_mode", "")),

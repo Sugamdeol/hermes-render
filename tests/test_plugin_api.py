@@ -267,6 +267,30 @@ class ModelDiscoveryTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(sizes, [self.mod.MAX_PROVIDER_RESPONSE_BYTES + 1])
 
+    def test_multi_key_rotation_on_401(self):
+        """When the first key gets a 401, try the next key."""
+        calls = []
+
+        def urlopen(request, timeout):
+            calls.append(request.get_header("Authorization"))
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+            return _FakeURLResponse({"data": [{"id": "model-with-second-key"}]})
+
+        with patch.object(self.mod.urllib.request, "urlopen", side_effect=urlopen):
+            models = self.mod.fetch_custom_provider_models(
+                {
+                    "base_url": "https://api.example.com/v1",
+                    "api_keys": ["failing-key", "working-key"],
+                }
+            )
+
+        self.assertEqual(models, ["model-with-second-key"])
+        # Both keys should have been tried
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Bearer failing-key", calls)
+        self.assertIn("Bearer working-key", calls)
+
 
 class ListEntriesTests(unittest.TestCase):
     def setUp(self):
@@ -296,7 +320,9 @@ class ListEntriesTests(unittest.TestCase):
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["key"], "bynara")
         self.assertEqual(entries[0]["source"], "providers")
-        self.assertFalse(entries[0]["has_api_key"])
+        # has_api_key is True because key_env is set (key is in env var)
+        self.assertTrue(entries[0]["has_api_key"])
+        self.assertEqual(entries[0]["key_env"], "BYNARA_API_KEY")
 
     def test_legacy_entry_normalizes_aliases(self):
         config = {
@@ -432,6 +458,130 @@ class UpsertTests(unittest.TestCase):
         self.assertEqual(len(legacy), 1)
         self.assertEqual(legacy[0]["base_url"], "http://127.0.0.1:8080/v1")
         self.assertEqual(legacy[0]["model"], "qwen3.5:27b")
+
+    def test_add_with_multiple_api_keys(self):
+        config: dict = {}
+        key = self.mod.upsert_custom_provider_entry(
+            config,
+            {
+                "name": "Multi Key Provider",
+                "base_url": "https://api.example.com/v1",
+                "api_keys": ["key-1", "key-2", "key-3"],
+                "key_env": "",
+                "api_mode": "chat_completions",
+                "model": "model-1",
+                "key": "",
+            },
+        )
+        self.assertEqual(key, "multi-key-provider")
+        entry = config["providers"]["multi-key-provider"]
+        self.assertEqual(entry["name"], "Multi Key Provider")
+        self.assertEqual(entry["base_url"], "https://api.example.com/v1")
+        self.assertIn("api_keys", entry)
+        self.assertEqual(entry["api_keys"], ["key-1", "key-2", "key-3"])
+        self.assertNotIn("api_key", entry)
+        self.assertEqual(entry["api_mode"], "chat_completions")
+        self.assertEqual(entry["default_model"], "model-1")
+
+    def test_single_key_uses_legacy_field(self):
+        """A single API key should use the legacy api_key field for backwards compat."""
+        config: dict = {}
+        key = self.mod.upsert_custom_provider_entry(
+            config,
+            {
+                "name": "Single Key",
+                "base_url": "https://api.example.com/v1",
+                "api_keys": ["only-key"],
+                "key_env": "",
+                "api_mode": "",
+                "model": "",
+                "key": "",
+            },
+        )
+        entry = config["providers"]["single-key"]
+        # Single key should use legacy api_key field
+        self.assertEqual(entry["api_key"], "only-key")
+        self.assertNotIn("api_keys", entry)
+
+    def test_multi_key_list_trims_and_caps(self):
+        config: dict = {}
+        # Send more than MAX_API_KEYS (10) keys with empty strings
+        keys = ["key-" + str(i) for i in range(15)] + [""]
+        key = self.mod.upsert_custom_provider_entry(
+            config,
+            {
+                "name": "Cap Test",
+                "base_url": "https://api.example.com/v1",
+                "api_keys": keys,
+                "key_env": "",
+                "api_mode": "",
+                "model": "",
+                "key": "",
+            },
+        )
+        entry = config["providers"]["cap-test"]
+        # Should be capped at MAX_API_KEYS (10)
+        self.assertEqual(len(entry["api_keys"]), 10)
+        self.assertEqual(entry["api_keys"], ["key-" + str(i) for i in range(10)])
+
+    def test_clear_api_keys_removes_multi_key_list(self):
+        config = {
+            "providers": {
+                "multikey": {
+                    "name": "Multi",
+                    "base_url": "https://x.example/v1",
+                    "api_keys": ["k1", "k2"],
+                }
+            }
+        }
+        fields = {
+            "name": "Multi",
+            "base_url": "https://x.example/v1",
+            "api_keys": [],
+            "clear_api_key": True,
+            "key_env": "",
+            "api_mode": "",
+            "model": "",
+            "key": "multikey",
+        }
+        self.mod.upsert_custom_provider_entry(config, fields)
+        entry = config["providers"]["multikey"]
+        self.assertNotIn("api_keys", entry)
+        self.assertNotIn("api_key", entry)
+
+    def test_provider_api_keys_helper(self):
+        """Test the _provider_api_keys helper returns keys correctly."""
+        # Single legacy key
+        raw = {"api_key": "sk-legacy"}
+        self.assertEqual(self.mod._provider_api_keys(raw), ["sk-legacy"])
+
+        # Multi-key list
+        raw = {"api_keys": ["k1", "k2", ""]}
+        self.assertEqual(self.mod._provider_api_keys(raw), ["k1", "k2"])
+
+        # Both present — list takes precedence
+        raw = {"api_key": "legacy", "api_keys": ["new1", "new2"]}
+        self.assertEqual(self.mod._provider_api_keys(raw), ["new1", "new2"])
+
+        # Empty
+        raw = {}
+        self.assertEqual(self.mod._provider_api_keys(raw), [])
+
+    def test_provider_entry_shows_key_count(self):
+        """Test that list entries include api_key_count for multi-key providers."""
+        config = {
+            "providers": {
+                "multikey": {
+                    "name": "Multi",
+                    "base_url": "https://x.example/v1",
+                    "api_keys": ["k1", "k2", "k3"],
+                }
+            }
+        }
+        entries = self.mod.list_custom_provider_entries(config)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["api_key_count"], 3)
+        self.assertTrue(entries[0]["has_api_key"])
 
 
 class RemoveTests(unittest.TestCase):
