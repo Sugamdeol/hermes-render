@@ -25,6 +25,10 @@ Future runtimes reuse those account secrets;
 no source copying, Drive mount, model setup or Telegram setup is required.
 Missing secrets use hidden prompts. The notebook downloads a fixed launcher
 version with a matching checksum, so saved notebooks survive later updates.
+In Colab the launched agent runs as root, like notebook cells themselves:
+system installs such as `!apt-get install -y libatk1.0-0 …` and other
+downloads from the agent's own tools work without sudo. The Render and
+Docker profiles keep the unprivileged `hermes` user.
 Stop your other host before pressing Run.
 Colab may ask you to connect/approve execution; the launcher cannot skip that.
 
@@ -44,7 +48,10 @@ confirm. Run only one copy against this bot and snapshot repository. Both new
 launchers use Telegram polling instead of the saved Render webhook.
 
 **Colab:** paste the entire `run-colab.py` file into one code cell and run it.
-Use a normal current Linux Python runtime; no GPU or Docker is needed. The first
+Use a normal current Linux Python runtime; no GPU or Docker is needed. The
+agent runs as root inside the runtime, the same as notebook cells, so its
+shell can install system libraries (`apt-get install libatk1.0-0 …`, browser
+packages and the like) without sudo. The first
 install builds the native web UI and can take several minutes. Open the printed
 dashboard link through Colab's browser proxy. Username is `hermes`; the saved
 password is shown with the dashboard link after startup. Keep the notebook private.

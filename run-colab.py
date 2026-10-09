@@ -3,6 +3,8 @@
 
 It installs the same patched Hermes used on Render, restores the private
 Sugamdeol/hermes-storage@state repository and starts Telegram in polling mode.
+In Colab the agent runs as root, like notebook cells do, so `!apt-get
+install ...` and other system downloads from the agent's own tools work.
 Only GIT_STATE_TOKEN and the existing STORAGE_ENCRYPTION_KEY are needed.
 Stop the Render/local copy after its successful backup before starting here.
 
@@ -189,18 +191,60 @@ def install_node():
             link.symlink_to(Path("/usr/local/lib/node_modules/npm/bin") / entry)
 
 
+def root_account_plan(existing_uid):
+    """Commands that make the Colab hermes account uid 0.
+
+    Real Colab cells run as root, and so should the agent they launch:
+    `!apt-get install ...` from the agent has to work exactly like it does
+    in a notebook cell. `gosu hermes` keeps uid 0 when hermes is uid 0, so
+    bootstrap.sh and the upstream entrypoint need no special casing and
+    every runtime file has one consistent owner. Render and Docker keep
+    their unprivileged hermes user; this account exists only on the Colab VM.
+    """
+    if existing_uid == 0:
+        return []
+    if existing_uid is None:
+        return [["groupadd", "-f", "hermes"],
+                ["useradd", "-m", "-o", "-u", "0", "-g", "hermes", "-s", "/bin/bash", "hermes"]]
+    return [["usermod", "-o", "-u", "0", "hermes"]]
+
+
+def keep_root_entrypoint(text):
+    """Skip the upstream gosu drop when the hermes account is already root.
+
+    The stock entrypoint re-execs itself through `gosu hermes`; when hermes
+    is uid 0 that would loop forever, so the drop must be conditional on it
+    actually changing the uid. Idempotent, and it fails closed if upstream
+    ever rewrites the privilege-drop block.
+    """
+    old = 'if [ "$(id -u)" = "0" ]; then'
+    new = 'if [ "$(id -u)" = "0" ] && [ "$(id -u hermes)" != "0" ]; then'
+    if new in text:
+        return text
+    if old not in text:
+        raise RuntimeError("upstream entrypoint changed; root privilege-drop patch no longer matches")
+    return text.replace(old, new, 1)
+
+
+def ensure_root_entrypoint():
+    entrypoint = INSTALL / "docker/entrypoint.sh"
+    entrypoint.write_text(keep_root_entrypoint(entrypoint.read_text()))
+    entrypoint.chmod(0o755)
+
+
 def install():
     run(["apt-get", "update", "-qq"])
     run(["apt-get", "install", "-y", "--no-install-recommends", "git", "curl",
          "ca-certificates", "bash", "gosu", "tini", "nginx-light", "age", "ripgrep", "openssh-client"])
     try:
-        pwd.getpwnam("hermes")
+        existing_uid = pwd.getpwnam("hermes").pw_uid
     except KeyError:
-        run(["groupadd", "-f", "hermes"])
-        run(["useradd", "-m", "-g", "hermes", "-s", "/bin/bash", "hermes"])
+        existing_uid = None
+    for command in root_account_plan(existing_uid):
+        run(command)
     cache = Path("/content/hermes-git-cache")
     cache.mkdir(parents=True, exist_ok=True)
-    run(["chown", "hermes:hermes", cache])
+    run(["chown", "-R", "hermes:hermes", cache])
     cache.chmod(0o700)
     git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if not SOURCE.exists():
@@ -216,6 +260,9 @@ def install():
                    capture_output=True, text=True).stdout.strip()
     marker = INSTALL / ".colab-launcher-revision"
     if marker.exists() and marker.read_text().strip() == revision:
+        # Cached install: still enforce the root fix so an old runtime gains
+        # it on relaunch (update-chat-ui.py restarts through this path).
+        ensure_root_entrypoint()
         print("Using the installed Hermes version.")
         return
     if INSTALL.exists() and not marker.exists() and not (INSTALL / ".git").exists():
@@ -262,7 +309,7 @@ def install():
     for path in TOOLS.glob("*"):
         if path.suffix in (".py", ".sh"):
             path.chmod(0o755)
-    (INSTALL / "docker/entrypoint.sh").chmod(0o755)
+    ensure_root_entrypoint()
     for name in ("ui-tui/packages/hermes-ink/dist/ink-bundle.js", "ui-tui/dist/entry.js"):
         target = INSTALL / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -430,13 +477,13 @@ class ColabAgent:
 def main(confirm_switch=False):
     if sys.version_info < (3, 11):
         raise RuntimeError("Use a current Colab Python runtime (Python 3.11 or newer)")
-    if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        raise RuntimeError("This installer needs the root Linux runtime provided by Colab")
     previous = globals().get("HERMES_COLAB")
     if previous and previous.process.poll() is None:
         print("Already running. Use HERMES_COLAB.status() or HERMES_COLAB.stop().")
         ColabAgent.dashboard(previous)
         return previous
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise RuntimeError("This installer needs the root Linux runtime provided by Colab")
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", 10000)) == 0:
             raise RuntimeError("Port 10000 is already occupied; stop the old launcher first")
