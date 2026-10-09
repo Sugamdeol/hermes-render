@@ -29,6 +29,10 @@ In Colab the launched agent runs as root, like notebook cells themselves:
 system installs such as `!apt-get install -y libatk1.0-0 …` and other
 downloads from the agent's own tools work without sudo. The Render and
 Docker profiles keep the unprivileged `hermes` user.
+Colab also sets `HERMES_ALLOW_ROOT_GATEWAY=1`, a Colab-only opt-in that lets the
+gateway and the dashboard's gateway restart run as that root account. Upstream
+refuses both by default; the Colab VM is ephemeral, so that guard is accepted
+there. Render, Docker and `run-local.py` never set the flag.
 Stop your other host before pressing Run.
 Colab may ask you to connect/approve execution; the launcher cannot skip that.
 
@@ -60,6 +64,13 @@ In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
 `HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses
 to shut down on a failed backup. Colab can end a runtime without warning, so it
 is temporary hosting: work not uploaded before termination can be lost.
+
+If a runtime started from an older copy of the notebook reports `Refusing to run
+the Hermes gateway as root` and the dashboard cannot restart it, add the opt-in
+without the dashboard: in a new cell run `with open('/opt/data/.env', 'a') as f:
+f.write('\nHERMES_ALLOW_ROOT_GATEWAY=1\n')`, then `HERMES_COLAB.backup()`,
+`HERMES_COLAB.stop()`, and press ▶ again. Startup loads saved `.env` settings
+before the gateway starts. If backup fails, read the reason it prints first.
 
 Free Colab runs for **at most 12 hours**, and can end earlier due to idle timeouts,
 usage and availability. Pro+ supports up to **24 hours** of continuous execution
