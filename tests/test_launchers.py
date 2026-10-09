@@ -96,6 +96,26 @@ class LauncherTests(unittest.TestCase):
         with patch('builtins.input', side_effect=AssertionError('must not prompt')), patch.object(module, 'install', side_effect=AssertionError('must not reinstall')), patch.object(module.ColabAgent, 'start_tunnel', return_value=None):
             self.assertIs(module.main(confirm_switch=True), agent)
 
+    def test_colab_agent_account_runs_as_root_like_notebook_cells(self):
+        module = load('run-colab')
+        self.assertEqual(module.root_account_plan(0), [])
+        self.assertEqual(module.root_account_plan(1001), [['usermod', '-o', '-u', '0', 'hermes']])
+        self.assertEqual(module.root_account_plan(None),
+                         [['groupadd', '-f', 'hermes'],
+                          ['useradd', '-m', '-o', '-u', '0', '-g', 'hermes', '-s', '/bin/bash', 'hermes']])
+
+    def test_colab_entrypoint_skips_gosu_drop_when_hermes_is_root(self):
+        module = load('run-colab')
+        stock = ('#!/bin/bash\nset -e\nif [ "$(id -u)" = "0" ]; then\n'
+                 '    echo "Dropping root privileges"\n    exec gosu hermes "$0" "$@"\nfi\n')
+        patched = module.keep_root_entrypoint(stock)
+        self.assertIn('if [ "$(id -u)" = "0" ] && [ "$(id -u hermes)" != "0" ]; then', patched)
+        self.assertEqual(patched.count('gosu hermes'), 1)
+        # Idempotent: a cached install may patch the same file again.
+        self.assertEqual(module.keep_root_entrypoint(patched), patched)
+        with self.assertRaisesRegex(RuntimeError, 'privilege-drop patch'):
+            module.keep_root_entrypoint('#!/bin/bash\n# unrelated script\n')
+
     def test_colab_notebook_has_one_executable_cell_and_verified_launcher(self):
         import hashlib, json
         notebook = json.loads((ROOT/'Hermes.ipynb').read_text())
