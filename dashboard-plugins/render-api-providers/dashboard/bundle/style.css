@@ -142,3 +142,19 @@
   color: var(--color-muted-foreground, inherit);
   opacity: 0.8;
 }
+
+.rapi-keys-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rapi-key-row input {
+  min-width: 200px;
+}
+
+.rapi-key-row button {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
