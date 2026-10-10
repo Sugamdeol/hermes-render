@@ -1035,6 +1035,37 @@
 
   // ── message ─────────────────────────────────────────────────────────
 
+  // Adapted from OpenIntelligentUI; MIT attribution in third-party/OpenIntelligentUI.
+/** Reveal each Markdown block once, whether it arrived live or offscreen. */
+function observeAnswerBlocks(root) {
+  if (typeof IntersectionObserver === "undefined") return () => {};
+  const tracked = new Set();
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      entry.target.setAttribute("data-answer-reveal", "visible");
+      observer.unobserve(entry.target);
+    }
+  }, { threshold: 0, rootMargin: "0px 0px -24px 0px" });
+  const observe = () => {
+    for (const block of root.children) {
+      if (tracked.has(block)) continue;
+      tracked.add(block);
+      block.setAttribute("data-answer-reveal", "pending");
+      observer.observe(block);
+    }
+  };
+  observe();
+  const mutations = new MutationObserver(observe);
+  mutations.observe(root, { childList: true });
+  return () => {
+    observer.disconnect();
+    mutations.disconnect();
+    for (const block of tracked) block.removeAttribute("data-answer-reveal");
+  };
+}
+
+
   function MessageViewBase({ msg, index, active, onAction, showTime, showUsage }) {
     const bodyRef = useRef(null);
     const [reasoningOpen, setReasoningOpen] = useState(null); // null = auto
@@ -1047,6 +1078,10 @@
       if (msg.streaming) setReasoningOpen((v) => (v === null ? true : v));
       else setReasoningOpen((v) => (v === null ? false : v));
     }, [msg.streaming]);
+    useEffect(() => {
+      if (msg.role !== "assistant" || active || msg.streaming || !bodyRef.current) return;
+      return observeAnswerBlocks(bodyRef.current);
+    }, [msg.id, msg.content, msg.streaming, active]);
     const isHermes = msg.role === "assistant";
     const isUser = msg.role === "user";
     const isTool = msg.role === "tool";
@@ -1093,7 +1128,7 @@
               )
             : isSystem && !compactRaw
               ? h("div", { className: "hcd-markdown hcd-system-note", dangerouslySetInnerHTML: { __html: bodyContent } })
-              : h("div", { ref: bodyRef, className: "hcd-markdown", dangerouslySetInnerHTML: { __html: bodyContent } }),
+              : h("div", { ref: bodyRef, className: "hcd-markdown answer-markdown", dangerouslySetInnerHTML: { __html: bodyContent } }),
         hasStreamedThought
           ? h(
               "details",
@@ -2085,6 +2120,7 @@
     const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1100);
     const [focusMode, setFocusMode] = useState(false);
     const [showJump, setShowJump] = useState(false);
+    const [followReply, setFollowReply] = useState(false);
     const [modal, setModal] = useState(null);        // {kind, ...}
     const [paletteOpen, setPaletteOpen] = useState(false);
     const [shares, setShares] = useState(null);
@@ -3485,13 +3521,13 @@
 
     useEffect(() => {
       const el = scrollRef.current;
-      if (!el || !settings || settings.autoScroll === false || !stickBottom.current) return;
+      if (!el || !followReply || !settings || settings.autoScroll === false || !stickBottom.current) return;
       el.scrollTop = el.scrollHeight;
       const frame = requestAnimationFrame(() => {
         if (stickBottom.current) el.scrollTop = el.scrollHeight;
       });
       return () => cancelAnimationFrame(frame);
-    }, [messages, toolRows]);
+    }, [messages, toolRows, followReply, settings && settings.autoScroll]);
 
     // A completion event can be lost during a transient socket failure.
     // Check only the active submitted turn, after a quiet interval; never replay it.
@@ -3686,6 +3722,7 @@
             generating
               ? h("button", { className: "hcd-stop", onClick: interrupt, "aria-label": "Stop generating" }, "■ Stop")
               : null,
+            h("button", { className: "hcd-ctl-btn", onClick: () => { setFollowReply(v => !v); stickBottom.current = true; }, "aria-pressed": followReply, title: "Follow the reply as it arrives, or keep your reading position" }, followReply ? "Following reply" : "Follow reply"),
             h("button", { className: "hcd-ctl-btn", onClick: () => setFocusMode(v => !v), "aria-pressed": focusMode, title: "Give the conversation more space" }, focusMode ? "Exit focus" : "Focus"),
             h(ContextMeter, { usage, contextWindow, onCompact: requestCompact, disabled: !selected }),
             h("button", { className: "hcd-ctl-btn", onClick: () => setPaletteOpen(true), title: "Command palette (⌘K)" }, "⌘K"),
@@ -3699,7 +3736,7 @@
           { className: `hcd-chat ${panel ? "with-panel" : ""}` },
           h(
             "div",
-            { className: "hcd-scroll", ref: scrollRef, onScroll },
+            { className: "hcd-scroll reader-scroll-view", ref: scrollRef, onScroll, role: "region", "aria-label": "Conversation", tabIndex: 0 },
             openingHistory ? h("p", {className: "hcd-history-loading", role: "status"}, "Loading conversation…") : null,
             historyError ? h("p", { className: "hcd-history-error", role: "alert" }, historyError) : null,
             olderOffset > 0
@@ -3860,9 +3897,9 @@
       "div",
       { className: "hcd-welcome" },
       h("div", { className: "hcd-welcome-hero" },
-        h("div", { className: "hcd-welcome-logo" }, "H"),
-        h("h2", null, "What shall we work on?"),
-        h("p", null, "A place to think, research and build. Pick a starting point or write your own.")),
+        h("div", { className: "hcd-welcome-logo", "aria-hidden": true }, "H"),
+        h("h2", null, "What would you like to explore?"),
+        h("p", null, "Ask Hermes to explain, compare or build something. Your existing chats and tools are here.")),
       modes && modes.length
         ? h("div", { className: "hcd-mode-grid" },
             modes.slice(0, 8).map((m) =>

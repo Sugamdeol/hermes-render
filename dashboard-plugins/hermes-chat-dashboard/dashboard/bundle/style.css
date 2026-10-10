@@ -2028,3 +2028,48 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
 
 /* Live replies must paint immediately rather than use an offscreen height estimate. */
 .hcd .hcd-message.hcd-live { content-visibility: visible; contain-intrinsic-size: none; }
+
+/* OpenIntelligentUI layout adaptation. Copyright (c) Atai Barkai, MIT.
+ * Original sources and license: third-party/OpenIntelligentUI. */
+.hcd .hcd-main { border-radius: 12px; box-shadow: none; }
+.hcd .hcd-topbar { min-height: 76px; padding: 16px 24px; gap: 20px; border-bottom: 1px solid var(--hcd-border); }
+.hcd .hcd-topbar-right { flex-wrap: wrap; gap: 8px; }
+.hcd .hcd-topbar-right button { font-size: 12px; min-height: 36px; }
+.hcd .hcd-chat { width: min(100%, 1040px); min-height: 0; margin: 0 auto; }
+.hcd .reader-scroll-view { overflow-y: auto; overflow-x: hidden; overflow-anchor: none; overscroll-behavior: contain; padding: 24px clamp(12px, 3vw, 32px) 12px; }
+.hcd .hcd-message { scroll-margin-top: 24px; }
+.hcd .hcd-assistant .hcd-bubble { background: transparent; border: 0; box-shadow: none; }
+.hcd .hcd-markdown { font-size: 16px; line-height: 1.8; overflow-wrap: anywhere; }
+.hcd .hcd-markdown table { font-size: 14px; border-collapse: collapse; }
+.hcd .hcd-markdown :is(th,td) { text-align: left; vertical-align: top; padding: 12px 16px; }
+.hcd .hcd-markdown th { background: var(--hcd-panel); }
+.hcd .hcd-actions { opacity: 0; pointer-events: none; transition: opacity 150ms ease; }
+.hcd .hcd-message:hover .hcd-actions,
+.hcd .hcd-message:focus-within .hcd-actions { opacity: 1; pointer-events: auto; }
+.hcd .hcd-actions button { min-height: 36px; }
+.hcd .hcd-welcome { max-width: 700px; margin: clamp(24px, 8vh, 96px) auto 24px; }
+.hcd .hcd-welcome-hero h2 { font-weight: 500; font-size: clamp(26px, 4vw, 38px); letter-spacing: -1px; }
+.hcd .hcd-welcome-hero p { max-width: 500px; margin-inline: auto; }
+.hcd .hcd-welcome-logo { display: none; }
+.hcd .hcd-example { background: transparent; border-radius: 12px; padding: 18px; }
+.hcd .hcd-mode-grid { margin-block: 24px; }
+.hcd .hcd-composer { border-radius: 18px; margin: 12px clamp(10px, 3vw, 32px) 20px; padding: 14px 18px; }
+.hcd .hcd-composer textarea { font-size: 16px; }
+.hcd .answer-markdown [data-answer-reveal="pending"] { opacity: 0; transform: translateY(6px); }
+.hcd .answer-markdown [data-answer-reveal="visible"] { opacity: 1; transform: translateY(0); transition: opacity 320ms ease, transform 320ms ease; }
+.hcd .hcd-live .answer-markdown { opacity: 1; transform: none; }
+@media (hover: none) {
+  .hcd .hcd-actions { opacity: 1; pointer-events: auto; }
+  .hcd .hcd-actions button { min-height: 44px; }
+}
+@container (max-width: 640px) {
+  .hcd .hcd-topbar { min-height: 64px; padding: 10px 12px; gap: 8px; align-items: flex-start; }
+  .hcd .hcd-topbar-right { gap: 4px; }
+  .hcd .hcd-topbar-right button { min-height: 44px; }
+  .hcd .hcd-scroll { padding: 16px 12px 8px; }
+  .hcd .hcd-composer { padding: 12px; margin: 8px 10px max(10px, env(safe-area-inset-bottom)); }
+  .hcd .hcd-welcome { margin-top: 24px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .hcd .answer-markdown [data-answer-reveal] { opacity: 1; transform: none; transition: none; }
+}
