@@ -45,6 +45,33 @@ def supervise_storage():
             stop.wait(10)
 
 storage_thread = None
+def supervise_dependencies():
+    spec = importlib.util.spec_from_file_location('runtime_dependencies', Path(__file__).with_name('runtime-dependencies.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    home = Path(os.environ.get('HERMES_HOME','/opt/data'))
+    flag = Path('/tmp/hermes-dependencies-restoring')
+    flag.touch(mode=0o600)
+    try:
+        module.atomic(home/'.runtime-dependencies-status.json',{'ready':False,'phase':'restoring'})
+        errors = module.restore(home)
+        print('[dependencies] '+('Extra apps restored.' if not errors else 'Some apps need attention; see dependency status.'),flush=True)
+        if not errors:
+            module.atomic(home/'.runtime-dependencies-status.json',{'ready':True,'phase':'ready'})
+    except Exception as error:
+        module.atomic(home/'.runtime-dependencies-status.json',{'ready':False,'phase':'failed','errors':[type(error).__name__]})
+        print(f'[dependencies] Restore failed ({type(error).__name__}); existing recipe preserved.',flush=True)
+        return
+    finally:
+        flag.unlink(missing_ok=True)
+    while not stop.is_set():
+        try:module.capture(home)
+        except Exception as error:print(f'[dependencies] Capture failed ({type(error).__name__}); keeping previous recipe.',flush=True)
+        stop.wait(300)
+
+if os.environ.get('HERMES_RUNTIME_DEPS_AUTORESTORE') == '1' and os.geteuid() == 0 and os.environ.get('HERMES_COLAB_SYSTEM_PYTHON'):
+    threading.Thread(target=supervise_dependencies,daemon=True).start()
+
 if os.environ.get('HERMES_GIT_SYNC_IN_PROCESS') == '1':
     storage_thread = threading.Thread(target=supervise_storage, daemon=True)
     storage_thread.start()

@@ -153,6 +153,11 @@ def runtime_env(token, key):
         # upstream "refusing to run the gateway as root" guard protects against.
         # Render and Docker never set this; see run-local.py and the Dockerfile.
         "HERMES_ALLOW_ROOT_GATEWAY": "1",
+        "HERMES_RUNTIME_DEPS_AUTORESTORE": "1",
+        "HERMES_COLAB_SYSTEM_PYTHON": sys.executable,
+        "HERMES_RUNTIME_CACHE_DIR": str(cache_directory()),
+        "UV_CACHE_DIR": str(cache_directory()/'uv'),
+        "npm_config_cache": str(cache_directory()/'npm'),
     }
     values["HERMES_ENV_OVERRIDE_KEYS"] = ",".join([*values, "PATH", "HERMES_ENV_OVERRIDE_KEYS"])
     values["PATH"] = str(INSTALL / ".venv/bin") + ":/usr/local/bin:" + os.environ.get("PATH", "")
@@ -299,10 +304,91 @@ def ensure_root_entrypoint():
     entrypoint.chmod(0o755)
 
 
+CORE_PACKAGES = ('git','curl','ca-certificates','bash','gosu','tini','nginx-light','age','ripgrep','openssh-client')
+UI_CACHE_PATHS = ('hermes_cli/web_dist', 'ui-tui/dist', 'ui-tui/packages/hermes-ink/dist', 'ui-tui/node_modules')
+
+
+def cache_directory():
+    explicit = os.environ.get('HERMES_COLAB_CACHE_DIR')
+    drive = Path('/content/drive/MyDrive')
+    cache = Path(explicit) if explicit else (drive/'HermesRuntimeCache' if drive.is_dir() else Path('/content/hermes-runtime-cache'))
+    cache.mkdir(parents=True, exist_ok=True)
+    return cache
+
+
+def prepare_cache():
+    if os.environ.get('HERMES_COLAB_USE_DRIVE_CACHE') == '1':
+        try:
+            from google.colab import drive
+            print('Connecting Drive cache. Only public builds and package downloads are cached here.')
+            drive.mount('/content/drive')
+        except (ImportError, OSError, ValueError):
+            print('Drive cache unavailable; using this VM cache instead.')
+    return cache_directory()
+
+
+def runtime_key(upstream):
+    # Code/plugin/docs changes do not invalidate the Python or Node install.
+    recipe = [2, upstream, os.uname().machine, 'python3.12', 'node24',
+              '.[web,mcp,pty,cli]', 'python-telegram-bot[webhooks]>=22.6,<23',
+              'aiohttp>=3.13.3,<4', 'cryptography']
+    return hashlib.sha256(json.dumps(recipe).encode()).hexdigest()
+
+
+def restore_ui_cache(cache, key):
+    archive = cache / (key+'.ui.tar.gz')
+    digest = archive.with_suffix('.sha256')
+    if not archive.exists() or not digest.exists():
+        return False
+    try:
+        with archive.open('rb') as f:
+            if hashlib.file_digest(f,'sha256').hexdigest() != digest.read_text().strip():
+                return False
+        with tarfile.open(archive) as package:
+            # Keep archive members inside the four public build directories.
+            for member in package.getmembers():
+                if not any(member.name == p or member.name.startswith(p+'/') for p in UI_CACHE_PATHS):
+                    return False
+                target = (INSTALL/member.name).resolve()
+                roots = [(INSTALL/p).resolve() for p in UI_CACHE_PATHS]
+                if not any(target.is_relative_to(p) for p in roots):return False
+                if member.issym() or member.islnk():
+                    link = ((target.parent/member.linkname) if member.issym() else (INSTALL/member.linkname)).resolve()
+                    if not any(link.is_relative_to(p) for p in roots):return False
+            package.extractall(INSTALL, filter='data')
+        return (INSTALL/'hermes_cli/web_dist/index.html').is_file() and (INSTALL/'ui-tui/dist/entry.js').is_file()
+    except (OSError, tarfile.TarError, ValueError):
+        print('UI cache could not be read; rebuilding it.')
+        return False
+
+
+def save_ui_cache(cache, key):
+    # Cache only public build output and npm dependencies, never /opt/data,
+    # environment files, credentials, or chat histories.
+    archive = cache / (key+'.ui.tar.gz')
+    fd, temporary = tempfile.mkstemp(dir=cache,prefix='.ui-cache-')
+    os.close(fd)
+    try:
+        with tarfile.open(temporary,'w:gz',compresslevel=1) as package:
+            for name in UI_CACHE_PATHS:
+                if (INSTALL/name).exists():package.add(INSTALL/name,arcname=name)
+        with open(temporary,'rb') as f:
+            digest = hashlib.file_digest(f,'sha256').hexdigest()
+        os.replace(temporary,archive)
+        archive.with_suffix('.sha256').write_text(digest+'\n')
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
 def install():
-    run(["apt-get", "update", "-qq"])
-    run(["apt-get", "install", "-y", "--no-install-recommends", "git", "curl",
-         "ca-certificates", "bash", "gosu", "tini", "nginx-light", "age", "ripgrep", "openssh-client"])
+    # dpkg status is local: do not hit apt repositories on every relaunch.
+    missing = []
+    for package in CORE_PACKAGES:
+        result = subprocess.run(['dpkg-query','-W','-f=${Status}',package],capture_output=True,text=True)
+        if result.returncode or result.stdout.strip() != 'install ok installed':missing.append(package)
+    if missing:
+        run(["apt-get", "update", "-qq"])
+        run(["apt-get", "install", "-y", "--no-install-recommends", *missing])
     try:
         existing_uid = pwd.getpwnam("hermes").pw_uid
     except KeyError:
@@ -326,7 +412,8 @@ def install():
     revision = run(["git", "rev-parse", "HEAD"], cwd=SOURCE,
                    capture_output=True, text=True).stdout.strip()
     marker = INSTALL / ".colab-launcher-revision"
-    if marker.exists() and marker.read_text().strip() == revision:
+    core_ready = (INSTALL/".venv/bin/python").exists() and all(p.exists() and p.stat().st_size > 0 for p in (INSTALL/"hermes_cli/web_dist/index.html", INSTALL/"ui-tui/dist/entry.js"))
+    if core_ready and marker.exists() and marker.read_text().strip() == revision:
         # Cached install: still enforce the root fix so an old runtime gains
         # it on relaunch (update-chat-ui.py restarts through this path).
         ensure_root_entrypoint()
@@ -339,6 +426,15 @@ def install():
     if not match:
         raise RuntimeError("The Dockerfile has no pinned Hermes revision")
     upstream = match.group(1)
+    cache = cache_directory()
+    key = runtime_key(upstream)
+    runtime_marker = INSTALL / '.colab-runtime-key'
+    ready = core_ready
+    reuse = ready and runtime_marker.exists() and runtime_marker.read_text().strip() == key
+    # Adopt a healthy pre-cache installation without reinstalling it once.
+    if ready and marker.exists() and not runtime_marker.exists() and (INSTALL/'.git').exists():
+        installed_ref = subprocess.run(['git','-c',f'safe.directory={INSTALL}','rev-parse','HEAD'],cwd=INSTALL,capture_output=True,text=True)
+        reuse = installed_ref.returncode == 0 and installed_ref.stdout.strip() == upstream
     INSTALL.mkdir(parents=True, exist_ok=True)
     # Runtime files belong to hermes; the root installer still needs to
     # update this one known checkout on subsequent runs.
@@ -350,22 +446,38 @@ def install():
                  capture_output=True, text=True).stdout.strip()
     if origin != "https://github.com/NousResearch/hermes-agent.git":
         raise RuntimeError("Refusing to replace an unrelated /opt/hermes checkout")
-    run([*git, "fetch", "--depth", "1", "origin", upstream], cwd=INSTALL, env=git_env)
-    run([*git, "checkout", "--force", "--detach", "FETCH_HEAD"], cwd=INSTALL)
+    exists = subprocess.run([*git,'cat-file','-e',upstream+'^{commit}'],cwd=INSTALL,capture_output=True).returncode == 0
+    if not exists:
+        run([*git, "fetch", "--depth", "1", "origin", upstream], cwd=INSTALL, env=git_env)
+    run([*git, "checkout", "--force", "--detach", upstream], cwd=INSTALL)
     install_node()
-    run([sys.executable, "-m", "pip", "install", "--quiet", "uv"])
+    if importlib.util.find_spec('uv') is None:
+        run([sys.executable, "-m", "pip", "install", "--quiet", "uv"])
     uv = [sys.executable, "-m", "uv"]
-    uv_env = dict(os.environ, UV_PYTHON_INSTALL_DIR="/opt/hermes-python", UV_LINK_MODE="copy")
-    run([*uv, "python", "install", "3.12"], env=uv_env)
-    if not (INSTALL / ".venv/bin/python").exists():
-        run([*uv, "venv", "--python", "3.12", INSTALL / ".venv"], env=uv_env)
+    uv_env = dict(os.environ, UV_PYTHON_INSTALL_DIR="/opt/hermes-python", UV_LINK_MODE="copy", UV_CACHE_DIR=str(cache/'uv'))
+    if not reuse:
+        run([*uv, "python", "install", "3.12"], env=uv_env)
+        if not (INSTALL / ".venv/bin/python").exists():
+            run([*uv, "venv", "--python", "3.12", INSTALL / ".venv"], env=uv_env)
     python = INSTALL / ".venv/bin/python"
-    run([*uv, "pip", "install", "--python", python, "-e", ".[web,mcp,pty,cli]",
-         "python-telegram-bot[webhooks]>=22.6,<23", "aiohttp>=3.13.3,<4", "cryptography"], cwd=INSTALL, env=uv_env)
-    for directory, command in (("web", ["npm", "ci", "--no-audit", "--no-fund"]),
-                               ("ui-tui", ["npm", "install", "--no-audit", "--no-fund"])):
-        run(command, cwd=INSTALL / directory)
-        run(["npm", "run", "build"], cwd=INSTALL / directory)
+    if not reuse:
+        run([*uv, "pip", "install", "--python", python, "-e", ".[web,mcp,pty,cli]",
+             "python-telegram-bot[webhooks]>=22.6,<23", "aiohttp>=3.13.3,<4", "cryptography"], cwd=INSTALL, env=uv_env)
+    if reuse:
+        print('Reusing Python dependencies and built dashboards; refreshing code only.')
+        if not (cache/(key+'.ui.tar.gz')).exists():
+            try:save_ui_cache(cache,key)
+            except (OSError,tarfile.TarError):print('UI cache could not be saved; this install remains usable.')
+    elif restore_ui_cache(cache,key):
+        print('Restored built dashboards from cache; skipping npm installs and builds.')
+    else:
+        npm_env = dict(os.environ,npm_config_cache=str(cache/'npm'))
+        for directory, command in (("web", ["npm", "ci", "--no-audit", "--no-fund"]),
+                                   ("ui-tui", ["npm", "install", "--no-audit", "--no-fund"])):
+            run(command, cwd=INSTALL / directory,env=npm_env)
+            run(["npm", "run", "build"], cwd=INSTALL / directory,env=npm_env)
+        try:save_ui_cache(cache,key)
+        except (OSError,tarfile.TarError):print('UI cache could not be saved; this install remains usable.')
     TOOLS.mkdir(parents=True, exist_ok=True)
     shutil.copytree(SOURCE / "scripts", TOOLS, dirs_exist_ok=True)
     for name, destination in (("env", "env"), ("skills", "skills-local"),
@@ -384,6 +496,7 @@ def install():
     DATA.mkdir(parents=True, exist_ok=True)
     run(["chown", "-R", "hermes:hermes", INSTALL, TOOLS, DATA, "/opt/hermes-python"])
     marker.write_text(revision + "\n")
+    runtime_marker.write_text(key+'\n')
 
 
 def descendants(parent):
@@ -509,6 +622,10 @@ class ColabAgent:
             values.update(json.loads(saved.read_text()).get("variables", {}))
         print("Username: hermes\nPassword:", values.get("HERMES_GATEWAY_TOKEN", "Password is not ready yet"))
 
+    def dependencies(self):
+        path = DATA/'.runtime-dependencies-status.json'
+        return json.loads(path.read_text()) if path.exists() else {'ready':False,'phase':'not recorded yet'}
+
     def backup(self):
         """Save now and wait until the storage daemon confirms GitHub has the state.
 
@@ -517,6 +634,11 @@ class ColabAgent:
         """
         if self.process.poll() is not None:
             raise RuntimeError("Agent is not running; keep this runtime's files for recovery")
+        recipe = TOOLS/'runtime-dependencies.py'
+        if recipe.exists() and not Path('/tmp/hermes-dependencies-restoring').exists():
+            try:run([str(INSTALL/'.venv/bin/python'),recipe,'capture',DATA],env=self.env)
+            except subprocess.CalledProcessError:
+                print('Package inventory could not refresh; keeping its existing recipe and saving chat state.')
         offset = log_offset()
         result = subprocess.run(["gosu", "hermes", INSTALL / ".venv/bin/python", "-c", CHECKPOINT],
                                 env=self.env, capture_output=True, text=True)
@@ -587,6 +709,7 @@ def main(confirm_switch=False):
         raise RuntimeError("No changes made")
     token = get_bootstrap_secret("GIT_STATE_TOKEN", "GitHub storage token: ")
     key = get_bootstrap_secret("STORAGE_ENCRYPTION_KEY", "Existing storage encryption key: ")
+    prepare_cache()
     env = runtime_env(token, key)
     install()
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
