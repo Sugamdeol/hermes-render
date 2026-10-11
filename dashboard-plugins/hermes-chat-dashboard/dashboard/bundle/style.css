@@ -2073,3 +2073,53 @@ button.link{background:none;border:0;color:var(--hcd-accent,#7fa4ff);cursor:poin
 @media (prefers-reduced-motion: reduce) {
   .hcd .answer-markdown [data-answer-reveal] { opacity: 1; transform: none; transition: none; }
 }
+
+
+/* ── isolated OpenIntelligentUI-style answer artifacts ─────────────── */
+.hcd-interactive {
+  margin: 16px 0;
+  overflow: hidden;
+  border: 1px solid var(--hcd-border-strong);
+  border-radius: var(--hcd-radius-lg);
+  background: var(--hcd-surface);
+}
+.hcd-interactive-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--hcd-border);
+}
+.hcd-interactive-head > div { display: grid; gap: 2px; }
+.hcd-interactive-head small { color: var(--hcd-muted); font-size: 12px; }
+.hcd-interactive-run {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 6px 13px;
+  border: 1px solid var(--hcd-border-strong);
+  border-radius: 999px;
+  background: var(--hcd-accent-soft);
+  color: var(--hcd-fg);
+  cursor: pointer;
+}
+.hcd-interactive-run:hover { border-color: var(--hcd-accent); }
+.hcd-interactive-run:focus-visible { outline: 2px solid var(--hcd-accent); outline-offset: 2px; }
+.hcd-interactive-stage { min-width: 0; }
+.hcd-interactive-frame {
+  display: block;
+  width: 100%;
+  min-height: 360px;
+  height: 460px;
+  border: 0;
+  background: #fff;
+  resize: vertical;
+}
+.hcd-interactive-source { border-top: 1px solid var(--hcd-border); }
+.hcd-interactive-source summary { padding: 10px 14px; color: var(--hcd-muted); cursor: pointer; }
+.hcd-interactive-source pre { max-height: 340px; margin: 0; overflow: auto; padding: 14px; }
+.hcd-interactive-limit { margin: 10px 0; padding: 10px 12px; border: 1px solid var(--hcd-warn); border-radius: var(--hcd-radius); color: var(--hcd-warn); }
+@media (max-width: 640px) {
+  .hcd-interactive-head { align-items: flex-start; }
+  .hcd-interactive-frame { height: 400px; min-height: 280px; }
+}

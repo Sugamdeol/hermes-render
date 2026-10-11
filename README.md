@@ -114,6 +114,14 @@ steering, history and exports stay in the same plugin. Submission locks prevent
 rapid duplicate sends; IME typing, read-only sessions and pending uploads are
 handled before submission. No extra agent process is added.
 
+The **Interactive** mode adapts OpenIntelligentUI's interactive-answer idea to
+Hermes's native chat. When useful, Hermes can return a self-contained HTML
+artifact for charts, comparisons, calculators, diagrams, simple 3D views, or
+map-like illustrations. It runs only after you click **Run preview**, inside an
+isolated iframe. The preview is offline: external scripts, styles, images,
+network requests, and nested frames are blocked. Artifacts should use inline
+data and include a readable fallback; ordinary answers stay as normal chat.
+
 For an already running Colab notebook, run `update-chat-ui.py` in that notebook.
 It verifies downloaded plugin files, updates the frontend and paged history
 backend, then saves through the existing daemon before restarting the Colab

@@ -11,6 +11,7 @@ jobs:
           python-version: '3.12'
       - run: pip install pyyaml cryptography fastapi httpx websockets
       - run: python -m unittest discover -s tests -q
+      - run: node --check dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js
       - run: docker build -t hermes-lite .
       - name: Boot native dashboard under 512 MB without swap
         run: |
