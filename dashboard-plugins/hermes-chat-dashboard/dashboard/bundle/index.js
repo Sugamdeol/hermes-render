@@ -378,6 +378,17 @@
       const safeLang = esc(blk.lang);
       const safeCode = esc(blk.code);
       const hl = highlightCode(blk.code, blk.lang);
+      const placeholder = `\u0000CODE${idx}\u0000`;
+      if (["interactive-ui", "openintelligent-ui"].includes(String(blk.lang).toLowerCase())) {
+        if (blk.code.length > 40000) {
+          html = html.replace(placeholder,
+            `<div class="hcd-interactive-limit" role="note">Preview omitted: interactive source is over 40 KB.</div><div class="hcd-code"><div class="hcd-code-head"><span>${safeLang}</span><button type="button" class="hcd-copy-code" data-copy='${safeCode.replace(/'/g, "&#39;")}'>Copy</button></div><pre><code>${hl || safeCode}</code></pre></div>`);
+          return;
+        }
+        html = html.replace(placeholder,
+          `<section class="hcd-interactive" data-source="${safeCode}"><div class="hcd-interactive-head"><div><strong>Interactive answer</strong><small>Isolated preview · offline</small></div><button type="button" class="hcd-interactive-run" aria-expanded="false" title="Run this code in an isolated offline frame">Run preview</button></div><div class="hcd-interactive-stage"></div><details class="hcd-interactive-source"><summary>View source</summary><pre><code>${hl || safeCode}</code></pre></details></section>`);
+        return;
+      }
       html = html.replace(
         `\u0000CODE${idx}\u0000`,
         `<div class="hcd-code"><div class="hcd-code-head"><span>${safeLang}</span><button type="button" class="hcd-copy-code" data-copy='${safeCode.replace(/'/g, "&#39;")}'>Copy</button></div><pre><code>${hl || safeCode}</code></pre></div>`,
@@ -398,6 +409,51 @@
           btn.textContent = "Copied ✓";
           setTimeout(() => (btn.textContent = prev), 1200);
         });
+      });
+    });
+  }
+
+  // Generated artifacts stay inert until the user starts the preview. The
+  // iframe has an opaque origin and a restrictive CSP: no network, parent
+  // access, forms, popups, external scripts/styles, or nested frames.
+  function bindInteractiveUiButtons(root) {
+    if (!root) return;
+    root.querySelectorAll("button.hcd-interactive-run").forEach((button) => {
+      if (button.dataset.bound) return;
+      button.dataset.bound = "1";
+      button.addEventListener("click", () => {
+        const card = button.closest(".hcd-interactive");
+        const stage = card && card.querySelector(".hcd-interactive-stage");
+        if (!card || !stage) return;
+        const previous = stage.querySelector("iframe");
+        if (previous) {
+          previous.remove();
+          button.textContent = "Run preview";
+          button.setAttribute("aria-expanded", "false");
+          return;
+        }
+        const source = card.dataset.source || "";
+        if (!source || source.length > 40000) return;
+        try {
+          const doc = new DOMParser().parseFromString(source, "text/html");
+          const policy = doc.createElement("meta");
+          policy.httpEquiv = "Content-Security-Policy";
+          policy.content = "default-src 'none'; img-src data: blob:; media-src data: blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src data:; connect-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'";
+          doc.head.prepend(policy);
+          const frame = document.createElement("iframe");
+          frame.className = "hcd-interactive-frame";
+          frame.setAttribute("sandbox", "allow-scripts");
+          frame.setAttribute("referrerpolicy", "no-referrer");
+          frame.setAttribute("loading", "lazy");
+          frame.setAttribute("title", "Isolated interactive answer preview");
+          frame.srcdoc = "<!doctype html>" + doc.documentElement.outerHTML;
+          stage.replaceChildren(frame);
+          button.textContent = "Close preview";
+          button.setAttribute("aria-expanded", "true");
+        } catch (error) {
+          button.textContent = "Preview unavailable";
+          button.disabled = true;
+        }
       });
     });
   }
@@ -1071,6 +1127,7 @@ function observeAnswerBlocks(root) {
     const [reasoningOpen, setReasoningOpen] = useState(null); // null = auto
     useEffect(() => {
       bindCopyButtons(bodyRef.current);
+      bindInteractiveUiButtons(bodyRef.current);
     }, [msg.content, msg.streaming]);
     useEffect(() => {
       // auto: expanded while streaming, collapsed once the turn lands — the
@@ -3657,8 +3714,13 @@ function observeAnswerBlocks(root) {
           gwRef.current.request("config.set", { key: "yolo", value: "on", session_id: sid }, 30000).catch(() => {});
         }
       }
-      if (mode && mode.strategy && mode.strategy.prompt && !text.trim()) {
-        setText(`${str(mode.strategy.prompt)}\n\n`);
+      if (mode && mode.strategy && mode.strategy.prompt) {
+        const instruction = str(mode.strategy.prompt);
+        if (mode.id === "interactive") {
+          setText(current => current.startsWith(instruction) ? current : `${instruction}\n\n${current}`);
+        } else if (!text.trim()) {
+          setText(`${instruction}\n\n`);
+        }
       }
     }, [modes, patchSettings, toast, text]);
 
