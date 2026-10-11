@@ -127,6 +127,17 @@ def _configured_modes(cfg: dict) -> list[dict]:
     return []
 
 
+INTERACTIVE_MODE = {
+    "id": "interactive",
+    "emoji": "✨",
+    "label": "Interactive",
+    "description": "Build a working visual answer with controls.",
+    "strategy": {
+        "prompt": "When a visual answer would help, include one self-contained HTML document in a fenced `interactive-ui` code block after a concise explanation. Use inline CSS and JavaScript only; do not use external scripts, styles, fonts, images, or network requests. Make controls work locally, keep the layout responsive and accessible, and include a visible text fallback. You can build charts, comparisons, calculators, diagrams, simple 3D views, and map-like illustrations. Do not emit an artifact for an ordinary text question."
+    },
+}
+
+
 def _default_modes(toolsets: list[dict]) -> list[dict]:
     names = {str(t.get("name", "")).lower() for t in toolsets}
     has_web = any(n in names for n in ("web", "browser", "search"))
@@ -135,6 +146,7 @@ def _default_modes(toolsets: list[dict]) -> list[dict]:
         {"id": "fast", "emoji": "⚡", "label": "Fast", "description": "Quick answers with concise tool use.", "strategy": {"fast": True, "prompt": "Answer quickly and directly. Use tools only when they materially improve the answer."}},
         {"id": "reasoning", "emoji": "🧠", "label": "Reasoning", "description": "Deeper reasoning and verification.", "strategy": {"fast": False, "prompt": "Think carefully, verify assumptions, and present only a concise safe summary of your reasoning."}},
         {"id": "research", "emoji": "🔎", "label": "Research", "description": "Gather sources and cite evidence.", "recommended_tools": ["web", "browser"] if has_web else [], "strategy": {"prompt": "Use Hermes research capabilities and cite sources when available. Prefer current evidence over memory for factual claims."}},
+        dict(INTERACTIVE_MODE),
         {"id": "coding", "emoji": "💻", "label": "Coding", "description": "Programming, debugging and repository work.", "recommended_tools": ["terminal", "code", "files"] if has_code else [], "strategy": {"prompt": "Act as a careful coding agent. Inspect before editing, run focused checks, and explain the changed files."}},
         {"id": "agent", "emoji": "🤖", "label": "Agent", "description": "Plan and execute multi-step tasks.", "strategy": {"prompt": "Plan the task, execute step by step using Hermes agents/tools, and report progress at high level."}},
         {"id": "autonomous", "emoji": "🛠️", "label": "Autonomous", "description": "Let Hermes use tools, plugins and agents with minimal interaction.", "strategy": {"yolo": True, "prompt": "Proceed autonomously when safe. Ask only for genuinely risky, destructive, or credential-sensitive actions."}},
@@ -204,6 +216,8 @@ def capabilities(request: Request):
     ]
 
     modes = _configured_modes(cfg) or _default_modes(toolsets)
+    if not any(isinstance(mode, dict) and mode.get("id") == "interactive" for mode in modes):
+        modes.append(dict(INTERACTIVE_MODE))
     return {
         "modes": modes,
         "models": models,
@@ -212,6 +226,7 @@ def capabilities(request: Request):
         "agents": agents,
         "features": {
             "streaming": True,
+            "interactive_ui": True,
             "files": True,
             "images": True,
             "voice": True,
