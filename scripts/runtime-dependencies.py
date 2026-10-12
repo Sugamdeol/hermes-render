@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.+-]{0,150}$')
 VERSION = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.+!-]{0,100}$')
@@ -65,7 +66,7 @@ def _capture(home):
     if manual.returncode==0:
         # Colab supplies kernels, CUDA, GPU drivers and base libraries itself.
         packages=[n for n in manual.stdout.splitlines() if NAME.fullmatch(n) and
-                  not n.startswith(('linux-','cuda-','nvidia-','lib','python'))]
+                  not n.startswith(('linux-','cuda-','nvidia-'))]
         result['apt']=sorted(set(result['apt'])|set(packages))
     try:
         npm=command(['npm','list','--global','--depth=0','--json'])
@@ -100,6 +101,10 @@ def missing_python(desired,current,exact=True):
 
 def restore(home):
     home=Path(home);recipe=read(home/'.runtime-dependencies.json')
+    if os.environ.get('HERMES_RUNTIME_DEPS_AUTORESTORE') == '1':
+        # Chrome is a Colab startup requirement, even for older saved recipes.
+        recipe = dict(recipe or {'version':1})
+        recipe['apt'] = sorted(set(recipe.get('apt',[])) | {'google-chrome-stable'})
     if not recipe:return []
     if recipe.get('version')!=1:raise RuntimeError('Unsupported dependency recipe version')
     errors=[]
@@ -110,9 +115,21 @@ def restore(home):
         except (OSError,subprocess.TimeoutExpired):errors.append('Installer unavailable or timed out: '+args[0])
     missing=[]
     for n in recipe.get('apt',[]):
-        if not isinstance(n,str) or not NAME.fullmatch(n) or n.startswith(('linux-','cuda-','nvidia-','lib','python')):continue
+        if not isinstance(n,str) or not NAME.fullmatch(n) or n.startswith(('linux-','cuda-','nvidia-')):continue
         result=command(['dpkg-query','-W','-f=${Status}',n])
         if result.returncode or result.stdout.strip()!='install ok installed':missing.append(n)
+    if 'google-chrome-stable' in missing:
+        # Chrome's downloaded .deb is not necessarily registered in apt sources.
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                deb = Path(temporary) / 'google-chrome-stable.deb'
+                urllib.request.urlretrieve('https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb', deb)
+                install(['apt-get','update','-qq'])
+                install(['apt-get','install','-y','--no-install-recommends',str(deb)])
+            missing.remove('google-chrome-stable')
+        except OSError:
+            errors.append('Chrome download failed')
+            missing.remove('google-chrome-stable')
     if missing:
         install(['apt-get','update','-qq'])
         install(['apt-get','install','-y','--no-install-recommends',*missing])
