@@ -397,7 +397,9 @@ fi
 if [ "${HERMES_RUNTIME_DEPS_AUTORESTORE:-0}" = "1" ] && [ "$(id -u)" = "0" ] \
    && [ -n "${HERMES_COLAB_SYSTEM_PYTHON:-}" ]; then
   echo "[dependencies] Restoring saved apps and libraries before gateway startup"
-  /opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"
+  if ! /opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"; then
+    echo "[dependencies] Some extra apps could not restore; starting Hermes with failure details in dependency status" >&2
+  fi
   export HERMES_RUNTIME_DEPS_RESTORED=1
 fi
 

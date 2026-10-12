@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
 import sys
 import tempfile
 import time
@@ -143,7 +144,15 @@ def restore(home):
         if requirements:
             # Colab's Python/GPU baseline is left alone; restore its missing extras.
             env_python=os.environ.get('HERMES_COLAB_SYSTEM_PYTHON',sys.executable)
-            install([env_python,'-m','uv','pip','install','--python',python,*requirements])
+            uv = shutil.which('uv')
+            if uv:
+                install([uv,'pip','install','--python',python,*requirements])
+            else:
+                probe = command([env_python,'-m','uv','--version'])
+                if probe.returncode == 0:
+                    install([env_python,'-m','uv','pip','install','--python',python,*requirements])
+                else:
+                    install([python,'-m','pip','install',*requirements])
     try:
         current=json.loads(command(['npm','list','-g','--depth=0','--json']).stdout or '{}').get('dependencies',{})
         packages=[n+'@'+v for n,v in recipe.get('npm',{}).items() if isinstance(n,str) and isinstance(v,str)
