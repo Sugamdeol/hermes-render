@@ -139,7 +139,7 @@ def restore(home):
     for kind,desired in recipe.get('python',{}).items():
         if kind not in targets or not isinstance(desired,dict):continue
         python=targets[kind]
-        try:requirements=missing_python(desired,python_packages(python),exact=kind=='agent')
+        try:requirements=missing_python(desired,python_packages(python),exact=kind=='agent' and os.environ.get('HERMES_RUNTIME_PROFILE') != 'colab-full')
         except (OSError,RuntimeError):errors.append('Python environment unavailable: '+kind);continue
         if requirements:
             # Colab's Python/GPU baseline is left alone; restore its missing extras.
