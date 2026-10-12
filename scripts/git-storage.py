@@ -442,6 +442,7 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "user.name=hermes-state",
         "-c", "user.email=hermes-state@localhost",
         "-c", "core.autocrlf=false",
+        "-c", "core.compression=1",
         "-c", "gc.auto=0",
         "-c", "pack.threads=1",
         "-c", "pack.windowMemory=4m",
@@ -1938,6 +1939,45 @@ def reject_destructive_shrink(previous_files: int, current_files: int) -> None:
         )
 
 
+
+def stage_snapshot(workdir: Path, config: GitConfig) -> None:
+    """Stage bounded batches so one large first backup cannot time out as a whole."""
+    deleted = run_git(["ls-files", "--deleted", "-z"], cwd=workdir, config=config)
+    paths = [Path(value) for value in deleted.stdout.split("\0") if value]
+    paths += [path.relative_to(workdir) for path in (workdir / DATA_SUBDIR).rglob("*") if path.is_file()]
+    if (workdir / MANIFEST_NAME).exists():
+        paths.append(Path(MANIFEST_NAME))
+    paths = sorted(set(paths), key=lambda path: path.as_posix())
+    batch, size, staged = [], 0, 0
+
+    def submit():
+        nonlocal batch, size, staged
+        fd, name = tempfile.mkstemp(dir=workdir / ".git", prefix="hermes-stage-")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                for path in batch:
+                    handle.write(os.fsencode(path.as_posix()) + b"\0")
+            run_git(["--literal-pathspecs", "add", "-A", "--pathspec-from-file=" + name,
+                     "--pathspec-file-nul"], cwd=workdir, config=config)
+            staged += len(batch)
+            LOG.info("staging backup: %d/%d paths", staged, len(paths))
+        finally:
+            Path(name).unlink(missing_ok=True)
+        batch, size = [], 0
+
+    for path in paths:
+        try:
+            length = (workdir / path).stat().st_size
+        except FileNotFoundError:
+            length = 0
+        if batch and (len(batch) >= 2000 or size + length > 64 * 1024 * 1024):
+            submit()
+        batch.append(path)
+        size += length
+    if batch:
+        submit()
+
+
 def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
@@ -1984,7 +2024,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     manifest = build_worktree(data_dir, workdir, config)
     reject_destructive_shrink(previous_files, int(manifest["files"]))
 
-    run_git(["add", "-A"], cwd=workdir, config=config)
+    stage_snapshot(workdir, config)
     # Only real state changes are worth a commit. The manifest carries a
     # timestamp and generation counter that differ on every run, so asking
     # about the whole tree would push a pointless commit every interval --
