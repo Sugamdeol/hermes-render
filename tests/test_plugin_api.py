@@ -81,6 +81,7 @@ def _install_stubs(
     fastapi_stub.APIRouter = _FakeRouter
     fastapi_stub.HTTPException = _FakeHTTPException
     fastapi_stub.Request = object
+    fastapi_stub.Response = object
     sys.modules["fastapi"] = fastapi_stub
 
     hermes_cli = types.ModuleType("hermes_cli")
@@ -632,6 +633,58 @@ class RouteTests(unittest.TestCase):
 
     def _routes(self):
         return self.mod.router.routes
+
+    def test_edit_returns_inline_keys_only_after_auth_and_is_not_cached(self):
+        self.env["config_state"] = {"providers": {"local": {
+            "name": "Local", "base_url": "https://x.example/v1",
+            "api_keys": ["test-key-one", "test-key-two"], "models": {"manual": {}}}}}
+        self.mod = load_plugin_api(self.env)
+        handler = self._routes()[("POST", "/custom-providers/{key}/edit")]
+        response = types.SimpleNamespace(headers={})
+        result = call_route(handler, self.request, "local", response)
+        self.assertEqual(result["api_keys"], ["test-key-one", "test-key-two"])
+        self.assertEqual(result["models"], ["manual"])
+        self.assertIn("no-store", response.headers["Cache-Control"])
+        listing = call_route(self._routes()[("GET", "/custom-providers")], self.request)
+        self.assertNotIn("test-key-one", json.dumps(listing))
+        _install_stubs(self.env, token_ok=False)
+        with self.assertRaises(_FakeHTTPException) as caught:
+            call_route(handler, self.request, "local", response)
+        self.assertEqual(caught.exception.status_code, 401)
+
+    def test_explicit_model_ids_survive_discovery_and_update_metadata(self):
+        self.env["config_state"] = {"providers": {"local": {
+            "name": "Local", "base_url": "https://x.example/v1", "api_key": "fake",
+            "models": {"manual": {"context_length": 123}, "remove": {}}}}}
+        self.mod = load_plugin_api(self.env)
+        call_route(self._routes()[("POST", "/custom-providers")], self.request,
+                   {"name": "Local", "base_url": "https://x.example/v1",
+                    "models": ["manual", "new", "manual"], "api_keys": ["fake", "other"]})
+        stored = self.env["saved"][-1]["providers"]["local"]
+        self.assertEqual(stored["models"], {"manual": {"context_length": 123}, "new": {}})
+        async def inline_thread(function, *args):
+            return function(*args)
+        with patch.object(self.mod, "fetch_custom_provider_models", return_value=["advertised"]), \
+             patch.object(self.mod.asyncio, "to_thread", inline_thread):
+            result = call_route(self._routes()[("GET", "/custom-providers/{key}/models")], self.request, "local")
+        self.assertEqual(result["models"], ["manual", "new", "advertised"])
+        self.assertEqual(stored["api_keys"], ["fake", "other"])
+
+    def test_empty_explicit_key_list_removes_keys_in_both_schemas(self):
+        self.env["config_state"] = {
+            "providers": {"local": {"name": "Local", "base_url": "https://x.example/v1", "api_keys": ["one", "two"]}},
+            "custom_providers": [{"name": "Local", "base_url": "https://x.example/v1", "api_keys": ["one", "two"]}]}
+        self.mod = load_plugin_api(self.env)
+        call_route(self._routes()[("POST", "/custom-providers")], self.request,
+                   {"name": "Local", "base_url": "https://x.example/v1", "api_keys": []})
+        saved = self.env["saved"][-1]
+        self.assertNotIn("api_keys", saved["providers"]["local"])
+        self.assertNotIn("api_keys", saved["custom_providers"][0])
+
+    def test_manual_model_ids_validate_type_and_size(self):
+        for models in ("bad", [{}], ["x" * 201], [str(i) for i in range(501)]):
+            with self.assertRaises(ValueError):
+                self.mod._parse_upsert_body({"name": "Local", "base_url": "https://x.example/v1", "models": models})
 
     def test_list_requires_token(self):
         _install_stubs(self.env, token_ok=False)
