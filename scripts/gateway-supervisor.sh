@@ -21,7 +21,11 @@ stop_supervisor() {
 trap 'stop_supervisor' INT TERM
 
 while [ "$stopping" -eq 0 ]; do
-  setsid "$PYTHON" "$AGENT_BUDGET" run gateway "$HERMES_BIN" gateway run &
+  if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+    setsid "$HERMES_BIN" gateway run &
+  else
+    setsid "$PYTHON" "$AGENT_BUDGET" run gateway "$HERMES_BIN" gateway run &
+  fi
   worker_pid=$!
   wait "$worker_pid"
   status=$?
