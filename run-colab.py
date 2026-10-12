@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Paste this whole file into ONE Colab code cell and run it.
 
-It installs the same patched Hermes used on Render, restores the private
+It installs the reviewed current upstream Hermes with the full Colab profile, restores the private
 Sugamdeol/hermes-storage@state repository and starts Telegram in polling mode.
 In Colab the agent runs as root, like notebook cells do, so `!apt-get
 install ...` and other system downloads from the agent's own tools work.
@@ -129,7 +129,7 @@ def run(args, **kwargs):
     return subprocess.run([str(a) for a in args], check=True, **kwargs)
 
 
-def runtime_env(token, key):
+def runtime_env(token, key, dashboard_password=None):
     values = {
         "GIT_STATE_REPO": os.environ.get("GIT_STATE_REPO", "Sugamdeol/hermes-storage"),
         "GIT_STATE_BRANCH": os.environ.get("GIT_STATE_BRANCH", "state"),
@@ -147,7 +147,7 @@ def runtime_env(token, key):
         "PYTHONUNBUFFERED": "1", "HERMES_DASHBOARD_TUI": "1",
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
-        "MALLOC_ARENA_MAX": "1", "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+        "HERMES_RUNTIME_PROFILE": "colab-full",
         # Colab only: the hermes account is uid 0 on an ephemeral VM, so no later
         # non-root run can be broken by root-owned files, which is the risk the
         # upstream "refusing to run the gateway as root" guard protects against.
@@ -159,6 +159,8 @@ def runtime_env(token, key):
         "UV_CACHE_DIR": str(cache_directory()/'uv'),
         "npm_config_cache": str(cache_directory()/'npm'),
     }
+    if dashboard_password:
+        values["HERMES_GATEWAY_TOKEN"] = dashboard_password
     values["HERMES_ENV_OVERRIDE_KEYS"] = ",".join([*values, "PATH", "HERMES_ENV_OVERRIDE_KEYS"])
     values["PATH"] = str(INSTALL / ".venv/bin") + ":/usr/local/bin:" + os.environ.get("PATH", "")
     if not token or not key:
@@ -304,7 +306,7 @@ def ensure_root_entrypoint():
     entrypoint.chmod(0o755)
 
 
-CORE_PACKAGES = ('git','curl','ca-certificates','bash','gosu','tini','nginx-light','age','ripgrep','openssh-client')
+CORE_PACKAGES = ('git','curl','ca-certificates','bash','gosu','tini','nginx-light','age','ripgrep','openssh-client','build-essential','pkg-config')
 UI_CACHE_PATHS = ('hermes_cli/web_dist', 'ui-tui/dist', 'ui-tui/packages/hermes-ink/dist', 'ui-tui/node_modules')
 
 
@@ -329,8 +331,8 @@ def prepare_cache():
 
 def runtime_key(upstream):
     # Code/plugin/docs changes do not invalidate the Python or Node install.
-    recipe = [2, upstream, os.uname().machine, 'python3.12', 'node24',
-              '.[web,mcp,pty,cli]', 'python-telegram-bot[webhooks]>=22.6,<23',
+    recipe = [3, upstream, os.uname().machine, 'python3.14', 'node24',
+              '.[all,telegram]', 'python-telegram-bot[webhooks]>=22.6,<23',
               'aiohttp>=3.13.3,<4', 'cryptography']
     return hashlib.sha256(json.dumps(recipe).encode()).hexdigest()
 
@@ -416,16 +418,17 @@ def install():
     if core_ready and marker.exists() and marker.read_text().strip() == revision:
         # Cached install: still enforce the root fix so an old runtime gains
         # it on relaunch (update-chat-ui.py restarts through this path).
-        ensure_root_entrypoint()
+        # Native Colab startup does not use the Docker entrypoint.
         print("Using the installed Hermes version.")
         return
     if INSTALL.exists() and not marker.exists() and not (INSTALL / ".git").exists():
         raise RuntimeError("An unrelated /opt/hermes installation exists; use a fresh Colab runtime")
-    dockerfile = (SOURCE / "Dockerfile").read_text()
-    match = re.search(r"^ARG HERMES_REF=([0-9a-f]{40})$", dockerfile, re.M)
-    if not match:
-        raise RuntimeError("The Dockerfile has no pinned Hermes revision")
-    upstream = match.group(1)
+    upstream = (SOURCE / "colab-upstream.txt").read_text().strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", upstream):
+        raise RuntimeError("Invalid reviewed Colab upstream revision")
+    # A completed native update owns this checkout; never roll it back to the bootstrap pin.
+    if (INSTALL / '.colab-native-updater').exists():
+        upstream = run(['git','-c',f'safe.directory={INSTALL}','rev-parse','HEAD'],cwd=INSTALL,capture_output=True,text=True).stdout.strip()
     cache = cache_directory()
     key = runtime_key(upstream)
     runtime_marker = INSTALL / '.colab-runtime-key'
@@ -449,20 +452,19 @@ def install():
     exists = subprocess.run([*git,'cat-file','-e',upstream+'^{commit}'],cwd=INSTALL,capture_output=True).returncode == 0
     if not exists:
         run([*git, "fetch", "--depth", "1", "origin", upstream], cwd=INSTALL, env=git_env)
-    run([*git, "checkout", "--force", "--detach", upstream], cwd=INSTALL)
+    run([*git, "checkout", "--force", "-B", "main", upstream], cwd=INSTALL)
     install_node()
     if importlib.util.find_spec('uv') is None:
         run([sys.executable, "-m", "pip", "install", "--quiet", "uv"])
     uv = [sys.executable, "-m", "uv"]
     uv_env = dict(os.environ, UV_PYTHON_INSTALL_DIR="/opt/hermes-python", UV_LINK_MODE="copy", UV_CACHE_DIR=str(cache/'uv'))
     if not reuse:
-        run([*uv, "python", "install", "3.12"], env=uv_env)
-        if not (INSTALL / ".venv/bin/python").exists():
-            run([*uv, "venv", "--python", "3.12", INSTALL / ".venv"], env=uv_env)
+        run([*uv, "python", "install", "3.14"], env=uv_env)
+        # Recreate the runtime after an upstream/Python recipe change.
+        run([*uv, "venv", "--python", "3.14", "--clear", INSTALL / ".venv"], env=uv_env)
     python = INSTALL / ".venv/bin/python"
     if not reuse:
-        run([*uv, "pip", "install", "--python", python, "-e", ".[web,mcp,pty,cli]",
-             "python-telegram-bot[webhooks]>=22.6,<23", "aiohttp>=3.13.3,<4", "cryptography"], cwd=INSTALL, env=uv_env)
+        run([*uv, "pip", "install", "--python", python, "-e", ".[all,telegram]", "cryptography", "PyYAML"], cwd=INSTALL, env=uv_env)
     if reuse:
         print('Reusing Python dependencies and built dashboards; refreshing code only.')
         if not (cache/(key+'.ui.tar.gz')).exists():
@@ -471,11 +473,11 @@ def install():
     elif restore_ui_cache(cache,key):
         print('Restored built dashboards from cache; skipping npm installs and builds.')
     else:
-        npm_env = dict(os.environ,npm_config_cache=str(cache/'npm'))
-        for directory, command in (("web", ["npm", "ci", "--no-audit", "--no-fund"]),
-                                   ("ui-tui", ["npm", "install", "--no-audit", "--no-fund"])):
-            run(command, cwd=INSTALL / directory,env=npm_env)
-            run(["npm", "run", "build"], cwd=INSTALL / directory,env=npm_env)
+        npm_env = dict(os.environ,npm_config_cache=str(cache/'npm'),HERMES_PYTHON=str(python))
+        run(["npm", "ci", "--no-audit", "--no-fund"], cwd=INSTALL, env=npm_env)
+        run(["node", "scripts/generate-icons.mjs"], cwd=INSTALL, env=npm_env)
+        for directory in ("web", "ui-tui"):
+            run(["npm", "run", "build"], cwd=INSTALL / directory, env=npm_env)
         try:save_ui_cache(cache,key)
         except (OSError,tarfile.TarError):print('UI cache could not be saved; this install remains usable.')
     TOOLS.mkdir(parents=True, exist_ok=True)
@@ -483,12 +485,10 @@ def install():
     for name, destination in (("env", "env"), ("skills", "skills-local"),
                               ("dashboard-plugins", "dashboard-plugins")):
         shutil.copytree(SOURCE / name, TOOLS / destination, dirs_exist_ok=True)
-    run([python, TOOLS / "patch-lite.py", INSTALL])
-    run([python, TOOLS / "patch-model-discovery.py", INSTALL / "hermes_cli/model_switch.py"])
+    run([python, TOOLS / "patch-colab-full.py", INSTALL])
     for path in TOOLS.glob("*"):
         if path.suffix in (".py", ".sh"):
             path.chmod(0o755)
-    ensure_root_entrypoint()
     for name in ("ui-tui/packages/hermes-ink/dist/ink-bundle.js", "ui-tui/dist/entry.js"):
         target = INSTALL / name
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -496,6 +496,7 @@ def install():
     DATA.mkdir(parents=True, exist_ok=True)
     run(["chown", "-R", "hermes:hermes", INSTALL, TOOLS, DATA, "/opt/hermes-python"])
     marker.write_text(revision + "\n")
+    (INSTALL / '.colab-native-updater').touch()
     runtime_marker.write_text(key+'\n')
 
 
@@ -710,7 +711,8 @@ def main(confirm_switch=False):
     token = get_bootstrap_secret("GIT_STATE_TOKEN", "GitHub storage token: ")
     key = get_bootstrap_secret("STORAGE_ENCRYPTION_KEY", "Existing storage encryption key: ")
     prepare_cache()
-    env = runtime_env(token, key)
+    password = get_bootstrap_secret("HERMES_DASHBOARD_PASSWORD", "Dashboard password: ")
+    env = runtime_env(token, key, password)
     install()
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as logfile:
