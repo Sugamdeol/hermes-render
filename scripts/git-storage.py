@@ -1404,6 +1404,80 @@ def _warn_plaintext_env(names: "list[str]", config: GitConfig) -> None:
     )
 
 
+
+GIT_BLOB_CHUNK_BYTES = 40 * 1024 * 1024
+CHUNK_DIRECTORY = ".hermes-backup-chunks"
+
+
+def split_large_blobs(target: Path) -> dict:
+    """Split repository representations, including encrypted DBs, below GitHub limits."""
+    reserved = target / CHUNK_DIRECTORY
+    if reserved.exists():
+        raise GitStateError("Reserved backup chunk directory conflicts with saved data")
+    records = {}
+    for source in sorted(target.rglob("*")):
+        if not source.is_file() or source.stat().st_size <= GIT_BLOB_CHUNK_BYTES:
+            continue
+        relative = source.relative_to(target).as_posix()
+        identity = hashlib.sha256(relative.encode()).hexdigest()
+        directory = reserved / identity
+        directory.mkdir(parents=True)
+        digest, parts, total = hashlib.sha256(), [], 0
+        with source.open("rb") as handle:
+            while payload := handle.read(GIT_BLOB_CHUNK_BYTES):
+                name = f"{CHUNK_DIRECTORY}/{identity}/{len(parts):06d}"
+                (target / name).write_bytes(payload)
+                digest.update(payload)
+                total += len(payload)
+                parts.append(name)
+        records[relative] = {"parts": parts, "size": total,
+                             "sha256": digest.hexdigest(), "mode": source.stat().st_mode & 0o777}
+        source.unlink()
+    return records
+
+
+def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
+    records = read_manifest(workdir).get("large_files", {})
+    if not records:
+        return _materialize_tree(workdir, data_dir, config)
+    if not isinstance(records, dict):
+        raise GitStateError("Invalid large-file backup manifest")
+    root = workdir / DATA_SUBDIR
+    with tempfile.TemporaryDirectory(prefix="hermes-restore-") as temporary:
+        assembled = Path(temporary) / DATA_SUBDIR
+        # Hard links preserve modes without copying ordinary files into RAM or disk twice.
+        shutil.copytree(root, assembled, copy_function=os.link,
+                        ignore=lambda directory, names: [CHUNK_DIRECTORY] if Path(directory) == root else [])
+        for relative, record in records.items():
+            if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in PurePosixPath(relative).parts or PurePosixPath(relative).parts[0] == CHUNK_DIRECTORY:
+                raise GitStateError("Unsafe large-file restore path")
+            destination = assembled / relative
+            if destination.exists() or not isinstance(record, dict):
+                raise GitStateError("Conflicting large-file restore entry")
+            parts = record.get("parts")
+            if not isinstance(parts, list) or not parts:
+                raise GitStateError("Missing backup chunks")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            digest, total = hashlib.sha256(), 0
+            with destination.open("wb") as output:
+                for name in parts:
+                    if not isinstance(name, str) or not name.startswith(CHUNK_DIRECTORY + "/") or ".." in PurePosixPath(name).parts:
+                        raise GitStateError("Unsafe backup chunk path")
+                    part = root / name
+                    if part.is_symlink() or not part.is_file() or part.stat().st_size > GIT_BLOB_CHUNK_BYTES:
+                        raise GitStateError("Missing or invalid backup chunk")
+                    with part.open("rb") as handle:
+                        while payload := handle.read(1024 * 1024):
+                            output.write(payload)
+                            digest.update(payload)
+                            total += len(payload)
+            if total != record.get("size") or digest.hexdigest() != record.get("sha256"):
+                raise GitStateError("Backup chunk integrity verification failed")
+            os.chmod(destination, int(record.get("mode", 0o644)) & 0o777)
+        # Verify all chunks before touching live state, then use the existing decryption path.
+        return _materialize_tree(workdir, data_dir, config, source_root=assembled)
+
+
 def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     """Rebuild <workdir>/data from data_dir. Returns a manifest dict.
 
@@ -1533,7 +1607,9 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     if previous_target.exists():
         shutil.rmtree(previous_target, ignore_errors=True)
 
+    large_files = split_large_blobs(target)
     manifest = {
+        "large_files": large_files,
         "instance": config.instance_id,
         "updated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "files": copied,
@@ -1557,13 +1633,13 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     return manifest
 
 
-def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
+def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
     Existing local files are overwritten, but local files absent from the repo
     are left alone: a restore should not delete state after a partial fetch.
     """
-    source_root = workdir / DATA_SUBDIR
+    source_root = source_root or workdir / DATA_SUBDIR
     if not source_root.is_dir():
         LOG.info("no data/ in the state repo yet; nothing to restore")
         return 0
