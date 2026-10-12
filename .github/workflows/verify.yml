@@ -12,6 +12,7 @@ jobs:
       - run: pip install pyyaml cryptography fastapi httpx websockets
       - run: python -m unittest discover -s tests -q
       - run: node --check dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js
+      - run: node --check dashboard-plugins/render-api-providers/dashboard/bundle/index.js
       - run: docker build -t hermes-lite .
       - name: Boot native dashboard under 512 MB without swap
         run: |
@@ -22,6 +23,10 @@ jobs:
           docker exec -d -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py gateway
           docker exec -d -e STORAGE_ENCRYPTION_KEY=ci-only-key -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py storage
           python tests/container_smoke.py
+      - name: Verify native provider key failover and custom model IDs
+        run: |
+          docker cp tests/provider_keys_probe.py hermes-lite:/tmp/provider_keys_probe.py
+          docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/provider_keys_probe.py
       - name: Verify native gateway starts without artificial allocation caps
         run: |
           docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python -c 'import resource; before=resource.getrlimit(resource.RLIMIT_DATA); from gateway.run import GatewayRunner; runner=GatewayRunner(); assert resource.getrlimit(resource.RLIMIT_DATA)==before; print("Native gateway starts without artificial allocation caps")'
