@@ -257,3 +257,7 @@ path.write_text(text.replace(old, new, 1))
 # Preserve dashboard key lists and seed every key into native request failover.
 provider_keys_patch = runpy.run_path(str(Path(__file__).with_name("patch-provider-keys.py")))
 provider_keys_patch["patch"](root)
+
+# Keep model picker callbacks isolated across Telegram topics.
+topic_models_patch = runpy.run_path(str(Path(__file__).with_name("patch-topic-models.py")))
+topic_models_patch["patch"](root)
