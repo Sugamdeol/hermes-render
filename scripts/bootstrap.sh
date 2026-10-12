@@ -393,6 +393,14 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
   echo "[render-tools] started git state sync inside diagnostics (delta uploads on change)"
 fi
 
+# Colab restores system apps before accepting Telegram requests.
+if [ "${HERMES_RUNTIME_DEPS_AUTORESTORE:-0}" = "1" ] && [ "$(id -u)" = "0" ] \
+   && [ -n "${HERMES_COLAB_SYSTEM_PYTHON:-}" ]; then
+  echo "[dependencies] Restoring saved apps and libraries before gateway startup"
+  /opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"
+  export HERMES_RUNTIME_DEPS_RESTORED=1
+fi
+
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 # Own the dashboard restart loop here; suppress upstream's one-shot process.
