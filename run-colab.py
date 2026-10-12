@@ -415,7 +415,7 @@ def install():
                    capture_output=True, text=True).stdout.strip()
     marker = INSTALL / ".colab-launcher-revision"
     core_ready = (INSTALL/".venv/bin/python").exists() and all(p.exists() and p.stat().st_size > 0 for p in (INSTALL/"hermes_cli/web_dist/index.html", INSTALL/"ui-tui/dist/entry.js"))
-    if core_ready and marker.exists() and marker.read_text().strip() == revision:
+    if core_ready and (INSTALL / ".colab-native-updater").exists() and marker.exists() and marker.read_text().strip() == revision:
         # Cached install: still enforce the root fix so an old runtime gains
         # it on relaunch (update-chat-ui.py restarts through this path).
         # Native Colab startup does not use the Docker entrypoint.
