@@ -24,7 +24,8 @@ def supervise_budget():
             print(f'[agent-budget] monitor failed ({type(error).__name__}: {error}); restarting in 1s', flush=True)
             time.sleep(1)
 
-threading.Thread(target=supervise_budget, daemon=True).start()
+if os.environ.get("HERMES_RUNTIME_PROFILE") != "colab-full":
+    threading.Thread(target=supervise_budget, daemon=True).start()
 
 # Share the interpreter with Git sync instead of retaining a second Python
 # process. Its existing delta watcher, encryption and restore guards remain.
