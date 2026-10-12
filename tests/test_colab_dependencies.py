@@ -111,7 +111,7 @@ class StartupCacheTests(unittest.TestCase):
     def test_existing_core_skips_apt_pip_and_npm_on_code_update(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td);source=root/'source';install=root/'install';tools=root/'tools';data=root/'data';cache=root/'cache'
-            source.mkdir();(source/'Dockerfile').write_text('ARG HERMES_REF='+'a'*40+'\n')
+            source.mkdir();(source/'colab-upstream.txt').write_text('a'*40+'\n')
             for name in ('scripts','env','skills','dashboard-plugins'):(source/name).mkdir()
             for name in ('.venv/bin/python','hermes_cli/web_dist/index.html','ui-tui/dist/entry.js','docker/entrypoint.sh'):
                 p=install/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_text('if [ "$(id -u)" = "0" ]; then\n')
@@ -126,4 +126,4 @@ class StartupCacheTests(unittest.TestCase):
             with patch.multiple(colab,SOURCE=source,INSTALL=install,TOOLS=tools,DATA=data),patch.object(colab,'cache_directory',return_value=cache),patch.object(colab,'run',run),patch.object(colab,'install_node'),patch.object(colab.pwd,'getpwnam',return_value=type('User',(),{'pw_uid':0})()),patch.object(colab.importlib.util,'find_spec',return_value=True),patch.object(colab.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'install ok installed','')):
                 colab.install()
             self.assertFalse(any(c[0] in ('apt-get','npm') or 'pip' in c for c in calls))
-            self.assertTrue(any('patch-lite.py' in ' '.join(c) for c in calls))
+            self.assertTrue(any('patch-colab-full.py' in ' '.join(c) for c in calls))
