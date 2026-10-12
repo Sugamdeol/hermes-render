@@ -267,6 +267,13 @@ else
   echo "[render-tools] saved environment could not load; refusing incomplete startup" >&2
   exit 1
 fi
+# Migrate only the Colab runtime away from the Render Free profile.
+if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+  /opt/hermes/.venv/bin/python /opt/render-tools/colab-profile.py "${DATA_DIR}" /opt/hermes
+  unset MALLOC_ARENA_MAX OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS TOKENIZERS_PARALLELISM \
+    HERMES_AGENT_CACHE_MAX_SIZE HERMES_AGENT_CACHE_IDLE_TTL_SECONDS HERMES_API_MAX_RETRIES \
+    HERMES_MAX_CONCURRENT_SESSIONS HERMES_CRON_MAX_PARALLEL HERMES_TUI_RPC_POOL_WORKERS NODE_OPTIONS
+fi
 # These internal addresses are part of the nginx routing contract, not
 # portable user settings. A restored public dashboard port can collide with
 # the holding listener and leave the new gateway running without health checks.
@@ -293,7 +300,7 @@ fi
 # Patch config.yaml. We never fail the boot on a patch error — the agent
 # can still run without the Render MCP server registered, and the user
 # can always add it manually from the dashboard.
-if [ -x "${PATCHER}" ]; then
+if [ -x "${PATCHER}" ] && [ "${HERMES_RUNTIME_PROFILE:-}" != "colab-full" ]; then
   if ! RENDER_TOOLS_APPLY_FREE_DEFAULTS="${APPLY_FREE_DEFAULTS}" \
       gosu hermes "${PATCHER}" "${DATA_DIR}/config.yaml"; then
     echo "[render-tools] warning: config patch failed; continuing with unmodified config" >&2
@@ -427,6 +434,12 @@ if [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
   # doubled their baseline memory. sleep/infinity is the common Render command;
   # Telegram still gets one supervised gateway in that setup.
   echo "[render-tools] starting one foreground, restartable Telegram gateway"
+  if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+    exec /opt/render-tools/gateway-supervisor.sh
+  fi
   exec /opt/hermes/docker/entrypoint.sh /opt/render-tools/gateway-supervisor.sh
+fi
+if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+  exec "$@"
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"
