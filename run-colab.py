@@ -51,7 +51,7 @@ nonce=secrets.token_hex(16)
 fd,n=tempfile.mkstemp(dir=p.parent,prefix='.launcher-checkpoint-')
 with os.fdopen(fd,'w') as f: json.dump({'nonce':nonce},f)
 os.replace(n,p)
-deadline=time.monotonic()+300
+deadline=time.monotonic()+1200
 while time.monotonic()<deadline:
     try:
         result=json.loads(ack.read_text())
@@ -80,7 +80,7 @@ BACKUP_REASONS = (
      "The storage daemon could not save this state. Fix the reason in the log line above, "
      "then retry backup()."),
 )
-NO_REPLY = ("The storage daemon did not confirm a save within 5 minutes and logged no reason. It may be "
+NO_REPLY = ("The storage daemon did not confirm a save within 20 minutes and logged no reason. It may be "
             "stuck on a slow GitHub upload, or it may have stopped. Retry backup() once. If it stays silent, "
             "HERMES_COLAB.stop(force=True) stops without saving, and anything not yet pushed is lost.")
 NO_REASON = ("The save failed and the storage log has no reason for it. Check the output above and the "
