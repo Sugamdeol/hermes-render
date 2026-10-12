@@ -253,3 +253,7 @@ old = '                elif entry.resume_pending:\n'
 new = '                elif entry.resume_pending or __import__("hermes_cli.render_recovery", fromlist=["pending_match"]).pending_match(entry):\n'
 assert old in text, 'unfinished lane expiry patch no longer matches'
 path.write_text(text.replace(old, new, 1))
+
+# Preserve dashboard key lists and seed every key into native request failover.
+provider_keys_patch = runpy.run_path(str(Path(__file__).with_name("patch-provider-keys.py")))
+provider_keys_patch["patch"](root)

@@ -96,11 +96,15 @@
     var state = useState({
       name: initial ? initial.name : "",
       baseUrl: initial ? initial.base_url : "",
-      apiKeys: effectiveInitialKeys.slice(),
+      apiKeys: effectiveInitialKeys.length ? effectiveInitialKeys.slice() : [""],
       clearApiKeys: false,
       keyEnv: initial ? initial.key_env : "",
       apiMode: initial ? initial.api_mode : "",
       model: initial ? initial.model : "",
+      customModels: initial ? (initial.models || []).join("\n") : "",
+      showKeys: false,
+      loadingKeys: editing,
+      keysLoadFailed: false,
       setAsMain: false,
       busy: false,
       error: null,
@@ -119,6 +123,20 @@
       },
       [setForm],
     );
+
+    useEffect(function () {
+      if (!initial) return;
+      var cancelled = false;
+      fetchJSON(API_BASE + "/" + encodeURIComponent(initial.key) + "/edit", {
+        method: "POST", cache: "no-store",
+      }).then(function (saved) {
+        if (!cancelled) set({apiKeys: saved.api_keys.length ? saved.api_keys : [""],
+          customModels: (saved.models || []).join("\n"), loadingKeys: false});
+      }).catch(function (error) {
+        if (!cancelled) set({loadingKeys: false, keysLoadFailed: true, error: apiErrorMessage(error)});
+      });
+      return function () { cancelled = true; };
+    }, [initial && initial.key]);
 
     var addKey = useCallback(function () {
       setForm(function (prev) {
@@ -146,11 +164,13 @@
         for (var k in prev) next[k] = prev[k];
         next.apiKeys = prev.apiKeys.slice();
         next.apiKeys[index] = value;
+        next.clearApiKeys = false;
         return next;
       });
     }, [setForm]);
 
     var validate = function () {
+      if (form.loadingKeys || form.keysLoadFailed) return "Reload the editor before saving keys";
       if (!editing && !form.name.trim()) return "Name is required";
       var parsedUrl;
       try {
@@ -182,23 +202,17 @@
       // Build payload: use api_keys list if multiple keys, otherwise single api_key
       var payload = {
         name: form.name.trim(),
+        key: editing ? initial.key : "",
         base_url: form.baseUrl.trim().replace(/\/+$/, ""),
         api_mode: form.apiMode,
         key_env: form.keyEnv.trim(),
         model: form.model.trim(),
         clear_api_key: form.clearApiKeys,
+        models: form.customModels.split(/[\n,]+/).map(function (m) { return m.trim(); }).filter(Boolean),
       };
-      // Filter to non-empty keys for the payload
-      var nonEmptyKeys = form.apiKeys.filter(function (k) { return k.trim() !== ""; });
-      if (nonEmptyKeys.length > 0) {
-        if (nonEmptyKeys.length === 1) {
-          // Single key — use legacy api_key field for backwards compat
-          payload.api_key = nonEmptyKeys[0].trim();
-        } else {
-          // Multiple keys — use new api_keys list
-          payload.api_keys = nonEmptyKeys.map(function (k) { return k.trim(); });
-        }
-      }
+      payload.api_keys = form.clearApiKeys ? [] : form.apiKeys.filter(function (k) {
+        return k.trim() !== "";
+      }).map(function (k) { return k.trim(); });
 
       set({ busy: true, error: null });
       try {
@@ -265,6 +279,8 @@
         h("p", { className: "rapi-hint", style: { marginBottom: "8px" } },
           "Add multiple keys for rate-limit rotation. If one key hits its limit, another is used. Up to 10 keys supported.",
         ),
+        h(Button, {type: "button", size: "sm", variant: "ghost",
+          onClick: function () { set({showKeys: !form.showKeys}); }}, form.showKeys ? "Hide keys" : "Show keys"),
         h("div", { className: "rapi-keys-list" },
           form.apiKeys.map(function (key, index) {
             return h(
@@ -272,8 +288,9 @@
               { className: "rapi-key-row", style: { display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" } },
               h(Input, {
                 id: "rapi-key-" + index,
-                type: "password",
+                type: form.showKeys ? "text" : "password",
                 value: key,
+                disabled: form.loadingKeys,
                 placeholder: "API key " + (index + 1),
                 autoComplete: "off",
                 onChange: function (e) { updateKey(index, e.target.value); },
@@ -284,7 +301,7 @@
                 size: "sm",
                 variant: "ghost",
                 onClick: function () { removeKey(index); },
-                disabled: form.apiKeys.length <= 1,
+                disabled: form.loadingKeys || form.apiKeys.length <= 1,
                 title: "Remove this key",
                 style: { flexShrink: 0 },
               }, "×"),
@@ -295,7 +312,7 @@
             size: "sm",
             variant: "outline",
             onClick: addKey,
-            disabled: form.apiKeys.length >= 10,
+            disabled: form.loadingKeys || form.apiKeys.length >= 10,
           }, "+ Add another key"),
         ),
         editing && initial.has_api_key && !form.clearApiKeys
@@ -303,7 +320,7 @@
               type: "button",
               size: "sm",
               outlined: true,
-              onClick: function () { set({ clearApiKeys: true }); },
+              onClick: function () { set({ clearApiKeys: true, apiKeys: [""] }); },
             }, "Clear all saved keys")
           : null,
         editing && form.clearApiKeys
@@ -350,6 +367,13 @@
           onChange: function (e) { set({ model: e.target.value }); },
         }),
       ),
+      h("div", {className: "rapi-field", style: {gridColumn: "1 / -1"}},
+        h(Label, {htmlFor: "rapi-custom-models"}, "Custom model IDs"),
+        h("textarea", {id: "rapi-custom-models", rows: 4, value: form.customModels,
+          placeholder: "One model ID per line, or separate with commas", maxLength: 100000,
+          style: {width: "100%", padding: "10px", color: "inherit", background: "transparent", border: "1px solid currentColor", borderRadius: "6px"},
+          onChange: function (e) { set({customModels: e.target.value}); }}),
+        h("span", {className: "rapi-hint"}, "These IDs stay available even when model discovery omits them.")),
       !editing
         ? h(
             "div",
@@ -383,9 +407,9 @@
           {
             type: "submit",
             size: "sm",
-            disabled: form.busy,
+            disabled: form.busy || form.loadingKeys || form.keysLoadFailed,
           },
-          form.busy
+          form.loadingKeys ? "Loading saved keys…" : form.busy
             ? "Saving…"
             : editing
               ? "Save changes"

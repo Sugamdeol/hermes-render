@@ -8,6 +8,7 @@ The dashboard process imports this file at startup (see the ``api`` field in
 Endpoints
   GET    /custom-providers             list configured providers without network probes
   GET    /custom-providers/{key}/models refresh one provider's model IDs
+  POST   /custom-providers/{key}/edit   authenticated inline-key editor (no cache)
   GET    /storage-status               authenticated state-backup health
   GET    /recovery-status              pending interrupted-task counts
   POST   /custom-providers             add (or update) a custom provider
@@ -48,7 +49,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 router = APIRouter()
 
@@ -401,7 +402,7 @@ def _decorate_with_discovered_models(entry: dict, raw: dict, *, fetch_models: bo
         return entry
     live_models = fetch_custom_provider_models(raw)
     if live_models is not None:
-        entry["models"] = live_models
+        entry["models"] = list(dict.fromkeys(_configured_model_ids(raw) + live_models))
         entry["models_fetched"] = True
     else:
         entry["models_fetched"] = False
@@ -495,17 +496,19 @@ def _upsert_legacy_entry(config: dict, name: str, key: str, fields: dict) -> Non
         entry["base_url"] = fields["base_url"]
         # Handle multi-key api_keys list for legacy entries too
         api_keys = fields.get("api_keys")
-        if isinstance(api_keys, list):
+        if isinstance(api_keys, list) and api_keys:
             entry["api_keys"] = [str(k).strip() for k in api_keys if str(k).strip()]
             entry.pop("api_key", None)
             entry.pop("key", None)
-        elif fields.get("clear_api_key"):
+        elif fields.get("clear_api_key") or api_keys == []:
             entry.pop("api_key", None)
             entry.pop("key", None)
             entry.pop("api_keys", None)
         elif fields.get("api_key"):
             entry["api_key"] = fields["api_key"]
             entry.pop("api_keys", None)
+        if "models" in fields:
+            entry["models"] = dict(config["providers"][key].get("models", {}))
         if fields.get("key_env"):
             entry["key_env"] = fields["key_env"]
         else:
@@ -562,7 +565,7 @@ def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
     clear_keys = fields.get("clear_api_key")
     if isinstance(api_keys, list):
         # Empty list with clear flag means remove all keys
-        if not api_keys and clear_keys:
+        if not api_keys:
             entry.pop("api_keys", None)
             entry.pop("api_key", None)
             entry.pop("key", None)
@@ -608,6 +611,10 @@ def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
     else:
         entry.pop("model", None)
         entry.pop("default_model", None)
+    if "models" in fields:
+        previous_models = entry.get("models")
+        previous_models = previous_models if isinstance(previous_models, dict) else {}
+        entry["models"] = {m: previous_models.get(m, {}) for m in fields["models"]}
     providers[key] = entry
 
     _upsert_legacy_entry(config, name, key, fields)
@@ -738,7 +745,9 @@ def _parse_upsert_body(body: dict) -> dict:
     raw_api_keys = body.get("api_keys")
     api_keys: list[str] | None = None
     if isinstance(raw_api_keys, list):
-        api_keys = [str(k).strip() for k in raw_api_keys if str(k).strip()]
+        if any(not isinstance(k, str) for k in raw_api_keys):
+            raise ValueError("API keys must be strings")
+        api_keys = list(dict.fromkeys(k.strip() for k in raw_api_keys if k.strip()))
         if len(api_keys) > MAX_API_KEYS:
             raise ValueError(f"at most {MAX_API_KEYS} API keys are allowed")
     fields = {
@@ -750,8 +759,18 @@ def _parse_upsert_body(body: dict) -> dict:
         "key_env": normalize_key_env(body.get("key_env", "")),
         "api_mode": normalize_api_mode(body.get("api_mode", "")),
         "model": str(body.get("model", "") or "").strip(),
-        "key": "",
+        "key": str(body.get("key", "") or "").strip(),
     }
+    if fields["key"] and not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", fields["key"]):
+        raise ValueError("invalid provider key")
+    if "models" in body:
+        models = body["models"]
+        if not isinstance(models, list) or any(not isinstance(m, str) for m in models):
+            raise ValueError("models must be a list of model ID strings")
+        models = list(dict.fromkeys(m.strip() for m in models if m.strip()))
+        if len(models) > MAX_DISCOVERED_MODELS or any(len(m) > 200 for m in models):
+            raise ValueError("at most 500 model IDs of up to 200 characters are allowed")
+        fields["models"] = models
     if fields["model"] and len(fields["model"]) > 200:
         raise ValueError("model must be at most 200 characters")
     return fields
@@ -814,6 +833,19 @@ async def recovery_status(request: Request):
     return read_recovery_status()
 
 
+@router.post("/custom-providers/{key}/edit")
+async def edit_custom_provider(request: Request, key: str, response: Response):
+    """Return saved inline keys only to an authenticated, uncached editor."""
+    _require_session(request)
+    response.headers["Cache-Control"] = "no-store, private"
+    load_config, _ = _config_backend()
+    config = load_config()
+    raw = _raw_entry_for_key(config, key)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="provider not found")
+    return {"api_keys": _provider_api_keys(raw), "models": _configured_model_ids(raw)}
+
+
 @router.get("/custom-providers/{key}/models")
 async def list_custom_provider_models(request: Request, key: str):
     """Refresh one provider's model list without exposing its credentials."""
@@ -839,7 +871,7 @@ async def list_custom_provider_models(request: Request, key: str):
                 "an unsupported response."
             ),
         }
-    return {"provider": str(key), "models": models, "fetched": True}
+    return {"provider": str(key), "models": list(dict.fromkeys(_configured_model_ids(raw) + models)), "fetched": True}
 
 
 @router.post("/custom-providers")
@@ -847,7 +879,7 @@ async def upsert_custom_provider(request: Request, body: dict):
     _require_session(request)
     try:
         fields = _parse_upsert_body(body)
-        key = provider_key_from_name(fields["name"])
+        key = fields["key"] or provider_key_from_name(fields["name"])
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     fields["key"] = key

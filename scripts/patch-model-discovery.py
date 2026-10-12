@@ -32,6 +32,8 @@ _SECTION3_KEY_OLD = '''            api_key = str(ep_cfg.get("api_key", "") or ""
 
 _SECTION3_KEY_NEW = '''            api_key = str(ep_cfg.get("api_key", "") or "").strip()
             if not api_key:
+                api_key = next((k.strip() for k in ep_cfg.get("api_keys", []) if isinstance(k, str) and k.strip()), "")
+            if not api_key:
                 key_env = str(
                     ep_cfg.get("key_env", "") or ep_cfg.get("api_key_env", "") or ""
                 ).strip()
@@ -52,15 +54,18 @@ _SECTION3_NEW = '''            # Discover from every custom endpoint, including 
                 ep_cfg.get("api_mode", "") or ep_cfg.get("transport", "") or ""
             ).strip().lower()
             if api_url and discover:
-                try:
-                    from hermes_cli.models import fetch_api_models
-                    live_models = fetch_api_models(
-                        api_key, api_url, api_mode=api_mode or None
-                    )
-                    if live_models:
-                        models_list = live_models
-                except Exception:
-                    pass
+                discovery_keys = ep_cfg.get("api_keys") or [api_key]
+                for discovery_key in discovery_keys:
+                    try:
+                        from hermes_cli.models import fetch_api_models
+                        live_models = fetch_api_models(
+                            discovery_key, api_url, api_mode=api_mode or None
+                        )
+                        if live_models:
+                            models_list = list(dict.fromkeys(models_list + live_models))
+                            break
+                    except Exception:
+                        continue
 '''
 
 _SECTION4_KEY_OLD = '''            api_key = (entry.get("api_key") or "").strip()
@@ -72,6 +77,8 @@ _SECTION4_KEY_NEW = '''            # Resolve key_env as well as inline keys.  A 
             # intentional for many local OpenAI-compatible servers, so it
             # must not prevent a /models probe.
             raw_api_key = (entry.get("api_key") or "").strip()
+            if not raw_api_key:
+                raw_api_key = next((k.strip() for k in entry.get("api_keys", []) if isinstance(k, str) and k.strip()), "")
             key_env = str(
                 entry.get("key_env", "") or entry.get("api_key_env", "") or ""
             ).strip()
@@ -101,6 +108,7 @@ _GROUP_NEW = '''                    "api_url": api_url,
                     "models": [],
                     "api_mode": api_mode,
                     "discover": discover,
+                    "api_keys": entry.get("api_keys") or [api_key],
                 }
 '''
 
@@ -117,19 +125,20 @@ _SECTION4_FETCH_OLD = '''            if api_url and api_key:
 '''
 
 _SECTION4_FETCH_NEW = '''            if api_url and grp.get("discover", True):
-                try:
-                    from hermes_cli.models import fetch_api_models
-
-                    live_models = fetch_api_models(
-                        api_key,
-                        api_url,
-                        api_mode=grp.get("api_mode") or None,
-                    )
-                    if live_models:
-                        grp["models"] = live_models
-                        grp["total_models"] = len(live_models)
-                except Exception:
-                    pass
+                for discovery_key in grp.get("api_keys") or [api_key]:
+                    try:
+                        from hermes_cli.models import fetch_api_models
+                        live_models = fetch_api_models(
+                            discovery_key,
+                            api_url,
+                            api_mode=grp.get("api_mode") or None,
+                        )
+                        if live_models:
+                            grp["models"] = list(dict.fromkeys(grp["models"] + live_models))
+                            grp["total_models"] = len(grp["models"])
+                            break
+                    except Exception:
+                        continue
 '''
 
 
