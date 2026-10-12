@@ -96,7 +96,7 @@
     var state = useState({
       name: initial ? initial.name : "",
       baseUrl: initial ? initial.base_url : "",
-      apiKeys: effectiveInitialKeys.slice(),
+      apiKeys: effectiveInitialKeys.length ? effectiveInitialKeys.slice() : [""],
       clearApiKeys: false,
       keyEnv: initial ? initial.key_env : "",
       apiMode: initial ? initial.api_mode : "",
