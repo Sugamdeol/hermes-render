@@ -306,7 +306,7 @@ def ensure_root_entrypoint():
     entrypoint.chmod(0o755)
 
 
-CORE_PACKAGES = ('git','curl','ca-certificates','bash','gosu','tini','nginx-light','age','ripgrep','openssh-client','build-essential','pkg-config')
+CORE_PACKAGES = ('git','curl','ca-certificates','bash','gosu','tini','nginx-light','age','ripgrep','openssh-client','build-essential','pkg-config','openssl')
 UI_CACHE_PATHS = ('hermes_cli/web_dist', 'ui-tui/dist', 'ui-tui/packages/hermes-ink/dist', 'ui-tui/node_modules')
 
 
