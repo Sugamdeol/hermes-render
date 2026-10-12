@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 
 PATCH = runpy.run_path(str(Path(__file__).resolve().parents[1] / "scripts/patch-topic-models.py"))["patch"]
 
+@unittest.skipUnless(os.environ.get("HERMES_AGENT_ROOT"), "Set HERMES_AGENT_ROOT to the pinned upstream checkout")
 class TopicPickerTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         source = (Path(os.environ["HERMES_AGENT_ROOT"]) / "gateway/platforms/telegram.py").read_text()
