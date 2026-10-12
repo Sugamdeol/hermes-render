@@ -148,6 +148,7 @@ def runtime_env(token, key, dashboard_password=None):
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
         "HERMES_RUNTIME_PROFILE": "colab-full",
+        "HERMES_WEB_BUILD_MAX_OLD_SPACE_SIZE": "4096",
         # Colab only: the hermes account is uid 0 on an ephemeral VM, so no later
         # non-root run can be broken by root-owned files, which is the risk the
         # upstream "refusing to run the gateway as root" guard protects against.
