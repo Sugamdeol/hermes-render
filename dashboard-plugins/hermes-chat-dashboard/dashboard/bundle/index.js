@@ -2097,6 +2097,7 @@ function observeAnswerBlocks(root) {
     const [sessionsOffset, setSessionsOffset] = useState(0);
     const [sessionSource, setSessionSource] = useState("");
     const sessionListRequest = useRef(0);
+    const sessionListBusy = useRef(false);
     const [query, setQuery] = useState("");
     const [meta, setMeta] = useState({});
     const [folders, setFolders] = useState([]);
@@ -2245,22 +2246,30 @@ function observeAnswerBlocks(root) {
       } catch { setFolders([]); }
     }, []);
 
-    const refreshSessions = useCallback(async ({ offset = 0, q = query, source = sessionSource } = {}) => {
+    const refreshSessions = useCallback(async ({ offset = 0, q = query, source = sessionSource, silent = false } = {}) => {
+      if (silent && sessionListBusy.current) return;
+      sessionListBusy.current = true;
       const request = ++sessionListRequest.current;
-      setSessionsLoading(true);
-      setSessionsError("");
+      if (!silent) { setSessionsLoading(true); setSessionsError(""); }
       try {
         const res = await fetchJSON(`${BASE}/sessions?limit=120&offset=${offset}&q=${encodeURIComponent(q || "")}&source=${encodeURIComponent(source || "")}`);
         if (request !== sessionListRequest.current) return;
         const rows = res.sessions || [];
-        setSessions((prev) => (offset ? [...prev, ...rows.filter(row => !prev.some(old => old.id === row.id))] : rows));
-        setSessionsOffset(num(res.next_offset) || offset + 120);
-        setHasMoreSessions(!!res.has_more);
+        setSessions((prev) => (offset
+          ? [...prev, ...rows.filter(row => !prev.some(old => old.id === row.id))]
+          : silent ? [...rows, ...prev.slice(120).filter(row => !rows.some(fresh => fresh.id === row.id))] : rows));
+        if (!silent) {
+          setSessionsOffset(num(res.next_offset) || offset + 120);
+          setHasMoreSessions(!!res.has_more);
+        }
       } catch (e) {
         if (request !== sessionListRequest.current) return;
-        setSessionsError(`History unavailable (${str(e.message || e)})`);
+        if (!silent) setSessionsError(`History unavailable (${str(e.message || e)})`);
       } finally {
-        if (request === sessionListRequest.current) setSessionsLoading(false);
+        if (request === sessionListRequest.current) {
+          sessionListBusy.current = false;
+          if (!silent) setSessionsLoading(false);
+        }
       }
     }, [query, sessionSource]);
 
@@ -2288,6 +2297,20 @@ function observeAnswerBlocks(root) {
     useEffect(() => {
       if (gwStatus === "open") loadCommandCatalog();
     }, [gwStatus]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+      const refresh = () => {
+        if (document.visibilityState !== "hidden") refreshSessions({ silent: true });
+      };
+      const timer = setInterval(refresh, 2000);
+      window.addEventListener("focus", refresh);
+      document.addEventListener("visibilitychange", refresh);
+      return () => {
+        clearInterval(timer);
+        window.removeEventListener("focus", refresh);
+        document.removeEventListener("visibilitychange", refresh);
+      };
+    }, [refreshSessions]);
 
     // server-side search, debounced
     useEffect(() => {
