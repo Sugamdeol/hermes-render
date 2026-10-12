@@ -21,3 +21,8 @@ class ChatUI(unittest.TestCase):
     def test_missing_start_event(self):
         subprocess.run(['node', str(ROOT / 'tests/chat_stream_probe.cjs'),
                         str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node is needed for the refresh probe')
+    def test_live_session_refresh(self):
+        subprocess.run(['node', str(ROOT / 'tests/chat_session_refresh_probe.cjs'),
+                        str(ROOT / 'dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js')], check=True)
