@@ -48,6 +48,17 @@ def patch(root):
         text=text[:start]+new+text[end:]
     compile(text,str(path),'exec');path.write_text(text)
 
+    path = root / "scripts/build/web.mjs"
+    text = path.read_text()
+    recovery = "// Hermes Colab build heap recovery\n{\n  const { getHeapStatistics } = await import('node:v8');\n  if (getHeapStatistics().heap_size_limit < 1024 * 1024 * 1024) {\n    if (process.env.HERMES_COLAB_HEAP_REEXEC === '1') {\n      throw new Error('Colab Node heap remained below 1 GB after restart');\n    }\n    const { spawnSync } = await import('node:child_process');\n    const options = (process.env.NODE_OPTIONS || '')\n      .replace(/--max[-_]old[-_]space[-_]size(?:=|\\s+)\\d+/g, '').trim();\n    const env = { ...process.env,\n      NODE_OPTIONS: (options + ' --max-old-space-size=4096').trim(),\n      HERMES_COLAB_HEAP_REEXEC: '1' };\n    // Drop an inherited command-line heap cap as well as NODE_OPTIONS.\n    const args = process.execArgv.filter(arg => !arg.startsWith('--max-old-space-size='));\n    const result = spawnSync(process.execPath, [...args, ...process.argv.slice(1)],\n      { env, stdio: 'inherit' });\n    if (result.error) throw result.error;\n    process.exit(result.status ?? 1);\n  }\n}\n"
+    if "// Hermes Colab build heap recovery" not in text:
+        if text.startswith("#!"):
+            first, rest = text.split("\n", 1)
+            text = first + "\n" + recovery + rest
+        else:
+            text = recovery + text
+        path.write_text(text)
+
 
 if __name__ == '__main__':
     patch(sys.argv[1])
