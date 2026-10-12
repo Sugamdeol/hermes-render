@@ -34,7 +34,7 @@ class DependencyTests(unittest.TestCase):
             with patch.object(deps,'command',command),patch.dict(os.environ,{'HERMES_PYTHON':__import__('sys').executable}):
                 deps.capture(home)
             text=(home/'.runtime-dependencies.json').read_text();recipe=json.loads(text)
-            self.assertEqual(recipe['apt'],['ffmpeg'])
+            self.assertEqual(recipe['apt'],['ffmpeg','libc6'])
             self.assertEqual(recipe['npm'],{'tool':'2.0'})
             self.assertNotIn('must-not-copy',text)
             self.assertEqual((home/'.runtime-dependencies.json').stat().st_mode&0o777,0o600)
@@ -62,6 +62,31 @@ class DependencyTests(unittest.TestCase):
             self.assertFalse(json.loads((Path(td)/'.runtime-dependencies-status.json').read_text())['ready'])
             self.assertTrue(any('extra==1.0' in c for c in calls))
             self.assertFalse(any('requests==2.0' in c or '--bad' in c for c in calls))
+
+
+class ChromeRestoreTests(unittest.TestCase):
+    def test_chrome_deb_and_libraries_restore_before_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            deps.atomic(Path(td)/'.runtime-dependencies.json', {'version':1,'apt':['google-chrome-stable','libnss3','libasound2'],'python':{},'npm':{}})
+            calls=[]
+            def command(args,timeout=60):
+                calls.append(args)
+                if args[0]=='dpkg-query':return subprocess.CompletedProcess(args,1,'','')
+                return subprocess.CompletedProcess(args,0,'{}' if args[0]=='npm' else '','')
+            with patch.object(deps,'command',command),patch.object(deps.urllib.request,'urlretrieve') as download:
+                self.assertEqual(deps.restore(td),[])
+            download.assert_called_once()
+            self.assertTrue(any(any(x.endswith('.deb') for x in c) for c in calls))
+            self.assertTrue(any('libnss3' in c and 'libasound2' in c for c in calls))
+
+    def test_installed_chrome_is_not_downloaded_again(self):
+        with tempfile.TemporaryDirectory() as td:
+            deps.atomic(Path(td)/'.runtime-dependencies.json', {'version':1,'apt':['google-chrome-stable','libnss3'],'python':{},'npm':{}})
+            def command(args,timeout=60):
+                return subprocess.CompletedProcess(args,0,'install ok installed' if args[0]=='dpkg-query' else '{}','')
+            with patch.object(deps,'command',command),patch.object(deps.urllib.request,'urlretrieve') as download:
+                self.assertEqual(deps.restore(td),[])
+            download.assert_not_called()
 
 
 class StartupCacheTests(unittest.TestCase):
