@@ -44,7 +44,7 @@ def patch(root):
         '            source = "config:" + name + ":" + hashlib.sha256(key.encode()).hexdigest()[:16]',
         '            seed.upsert(source, {"auth_type":AUTH_TYPE_API_KEY,"access_token":key,',
         '                "base_url":_norm_url(cp_config.get("base_url")),"label":name})', '', ''])
-    if '# Sugam custom provider key list compatibility' not in old:
+    if '# Sugam custom provider key list compatibility' not in text:
         text=text[:start]+new+text[end:]
     compile(text,str(path),'exec');path.write_text(text)
 
