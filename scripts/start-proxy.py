@@ -3,7 +3,6 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
-import crypt
 import sys
 
 if "--holding" in sys.argv:
@@ -20,7 +19,8 @@ password = os.environ.get("HERMES_GATEWAY_TOKEN", "")
 if not password:
     raise SystemExit("HERMES_GATEWAY_TOKEN is required for dashboard access")
 port = int(os.environ.get("PORT", "10000"))
-Path("/etc/nginx/hermes.htpasswd").write_text("hermes:" + crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512)) + "\n")
+password_hash = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=password + "\n", capture_output=True, text=True, check=True).stdout.strip()
+Path("/etc/nginx/hermes.htpasswd").write_text("hermes:" + password_hash + "\n")
 Path("/etc/nginx/hermes.htpasswd").chmod(0o640)
 subprocess.run(["chown", "root:www-data", "/etc/nginx/hermes.htpasswd"], check=True)
 Path("/etc/nginx/nginx.conf").write_text('''user www-data;
