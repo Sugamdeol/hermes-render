@@ -167,6 +167,23 @@ sleep can be delayed while the container restores its private state. Free Render
 is not an always-on service. Stop other instances using the same bot/state repo
 before starting this one.
 
+### Provider keys and custom model IDs
+
+Each custom provider supports up to 10 inline API keys. The authenticated
+editor loads saved keys masked by default; **Show keys** reveals them for
+editing. Removing every key clears the inline credentials. The general
+provider list does not return secret values.
+
+Keys now seed Hermes's native credential pool, so chat requests can fail over
+on authentication, rate-limit and quota errors. Key changes apply to new
+sessions. **Custom model IDs** accepts one ID per line or comma-separated IDs;
+these remain available alongside discovered models and keep their provider's
+endpoint and credentials.
+
+This runtime compatibility fix requires a fresh Colab installation or a rebuilt
+Render image after updating the source. Existing backups and provider settings
+are retained.
+
 ## GitHub storage
 
 Startup shallow-clones the private repository, restores `data/`, then starts
