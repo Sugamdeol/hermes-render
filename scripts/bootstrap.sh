@@ -347,6 +347,11 @@ if [ -d "${PLUGINS_SRC}" ]; then
   fi
 fi
 
+# Re-enable existing dashboard features using upstream's native activation rules.
+if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+  gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/restore-colab-features.py "${DATA_DIR}"
+fi
+
 # Repair recognized generated plugin mistakes after restore, before backup.
 if [ -f /opt/render-tools/repair-dashboard-plugins.py ]; then
   gosu hermes /opt/hermes/.venv/bin/python /opt/render-tools/repair-dashboard-plugins.py "${PLUGINS_DST}"

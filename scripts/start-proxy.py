@@ -23,7 +23,7 @@ password_hash = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=pass
 Path("/etc/nginx/hermes.htpasswd").write_text("hermes:" + password_hash + "\n")
 Path("/etc/nginx/hermes.htpasswd").chmod(0o640)
 subprocess.run(["chown", "root:www-data", "/etc/nginx/hermes.htpasswd"], check=True)
-Path("/etc/nginx/nginx.conf").write_text('''user www-data;
+Path("/etc/nginx/nginx.conf").write_text(r'''user www-data;
 worker_processes 1;
 pid /run/nginx.pid;
 events { worker_connections 128; }
@@ -33,6 +33,12 @@ http {
   access_log off;
   error_log /dev/stderr warn;
   map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+  # Preserve same-origin checks across the authenticated loopback proxy.
+  map "$http_origin|$http_host" $hermes_origin {
+    default "https://invalid-origin.invalid";
+    ~^\| "";
+    ~*^https?://([^/]+)\|\1$ "http://127.0.0.1:9119";
+  }
   server {
     listen PORT_VALUE;
     client_max_body_size 20m;
@@ -50,6 +56,7 @@ http {
       proxy_pass http://127.0.0.1:9119;
       proxy_http_version 1.1;
       proxy_set_header Host "127.0.0.1:9119";
+      proxy_set_header Origin $hermes_origin;
       proxy_set_header Authorization "";
       proxy_set_header X-Forwarded-For "";
       proxy_set_header Upgrade $http_upgrade;
