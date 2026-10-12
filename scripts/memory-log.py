@@ -54,7 +54,7 @@ def supervise_dependencies():
     flag.touch(mode=0o600)
     try:
         module.atomic(home/'.runtime-dependencies-status.json',{'ready':False,'phase':'restoring'})
-        errors = module.restore(home)
+        errors = [] if os.environ.get('HERMES_RUNTIME_DEPS_RESTORED') == '1' else module.restore(home)
         print('[dependencies] '+('Extra apps restored.' if not errors else 'Some apps need attention; see dependency status.'),flush=True)
         if not errors:
             module.atomic(home/'.runtime-dependencies-status.json',{'ready':True,'phase':'ready'})
@@ -67,7 +67,7 @@ def supervise_dependencies():
     while not stop.is_set():
         try:module.capture(home)
         except Exception as error:print(f'[dependencies] Capture failed ({type(error).__name__}); keeping previous recipe.',flush=True)
-        stop.wait(300)
+        stop.wait(60)
 
 if os.environ.get('HERMES_RUNTIME_DEPS_AUTORESTORE') == '1' and os.geteuid() == 0 and os.environ.get('HERMES_COLAB_SYSTEM_PYTHON'):
     threading.Thread(target=supervise_dependencies,daemon=True).start()
