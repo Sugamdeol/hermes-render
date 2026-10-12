@@ -443,6 +443,7 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "user.email=hermes-state@localhost",
         "-c", "core.autocrlf=false",
         "-c", "core.compression=1",
+        "-c", "core.trustctime=false",
         "-c", "gc.auto=0",
         "-c", "pack.threads=1",
         "-c", "pack.windowMemory=4m",
@@ -1410,12 +1411,12 @@ GIT_BLOB_CHUNK_BYTES = 40 * 1024 * 1024
 CHUNK_DIRECTORY = ".hermes-backup-chunks"
 
 
-def split_large_blobs(target: Path) -> dict:
+def split_large_blobs(target: Path, reused: dict | None = None) -> dict:
     """Split repository representations, including encrypted DBs, below GitHub limits."""
     reserved = target / CHUNK_DIRECTORY
-    if reserved.exists():
+    if reserved.exists() and not reused:
         raise GitStateError("Reserved backup chunk directory conflicts with saved data")
-    records = {}
+    records = dict(reused or {})
     for source in sorted(target.rglob("*")):
         if not source.is_file() or source.stat().st_size <= GIT_BLOB_CHUNK_BYTES:
             continue
@@ -1435,6 +1436,24 @@ def split_large_blobs(target: Path) -> dict:
                              "sha256": digest.hexdigest(), "mode": source.stat().st_mode & 0o777}
         source.unlink()
     return records
+
+
+
+def reuse_chunks(previous: Path, target: Path, record: dict) -> bool:
+    parts = record.get("parts")
+    if not isinstance(parts, list) or not parts:
+        return False
+    for part in parts:
+        if not isinstance(part, str) or not part.startswith(CHUNK_DIRECTORY + "/") or ".." in PurePosixPath(part).parts:
+            return False
+        path = previous / part
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(previous.resolve()):
+            return False
+    for part in parts:
+        destination = target / part
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.link(previous / part, destination)
+    return True
 
 
 def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
@@ -1489,9 +1508,21 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     # Read the previous generation before the manifest is overwritten. The
     # clone is shallow, so "git rev-list --count" cannot tell us how long the
     # remote history is; we carry the count in the manifest instead.
+    previous_manifest = read_manifest(workdir)
+    previous_large = previous_manifest.get("large_files", {})
+    if not isinstance(previous_large, dict):
+        previous_large = {}
     generation = read_generation(workdir) + 1
     target = workdir / DATA_SUBDIR
     cache_root = workdir / ".git" if (workdir / ".git").is_dir() else workdir
+    signatures_path = cache_root / "hermes-source-signatures.json"
+    try:
+        signatures = json.loads(signatures_path.read_text())
+        if not isinstance(signatures, dict): signatures = {}
+    except (OSError, ValueError):
+        signatures = {}
+    next_signatures, reused_large = {}, {}
+    reused_files = 0
     previous_target = cache_root / "hermes-state-data-previous"
     if previous_target.exists():
         shutil.rmtree(previous_target, ignore_errors=True)
@@ -1563,9 +1594,14 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
                 sealed_path = destination.with_name(destination.name + ENCRYPTED_SUFFIX)
                 try:
                     prior_cipher = previous_target / (relative + ENCRYPTED_SUFFIX)
+                    record = previous_large.get(relative + ENCRYPTED_SUFFIX)
                     if (previous_sqlite_hashes.get(relative) == sqlite_digest
                             and prior_cipher.is_file()):
-                        shutil.copyfile(prior_cipher, sealed_path)
+                        os.link(prior_cipher, sealed_path)
+                    elif (previous_sqlite_hashes.get(relative) == sqlite_digest
+                          and isinstance(record, dict)
+                          and reuse_chunks(previous_target, target, record)):
+                        reused_large[relative + ENCRYPTED_SUFFIX] = record
                     else:
                         encrypt_stream_file(snapshot_path, sealed_path, config)
                 finally:
@@ -1576,7 +1612,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
                 os.replace(snapshot_path, destination)
             try:
                 mode = source.stat().st_mode & 0o777
-                os.chmod(destination, mode)
+                if destination.exists(): os.chmod(destination, mode)
             except OSError:
                 mode = 0o644
             if mode not in (0o644, 0o755):
@@ -1588,14 +1624,29 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         # Stream ordinary files: workspace artifacts can exceed the entire
         # Render memory budget. Encryption is needed only for small settings.
         try:
-            shutil.copyfile(source, destination)
+            info = source.stat()
+            mode = info.st_mode & 0o777
+            signature = [info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                         mode, info.st_dev, info.st_ino]
+            prior = previous_target / relative
+            record = previous_large.get(relative)
+            matches = signatures.get(relative) == signature
+            if prior.is_file() and (matches or (prior.stat().st_size == info.st_size
+                    and _hash_file(source) == _hash_file(prior))):
+                # Preserve Git's cached inode/mtime for unchanged files.
+                os.link(prior, destination)
+                if (prior.stat().st_mode & 0o777) != mode:
+                    destination.unlink()
+                    shutil.copy2(source, destination)
+                reused_files += 1
+            elif isinstance(record, dict) and (matches or _hash_file(source) == record.get("sha256")) and reuse_chunks(previous_target, target, record):
+                reused_large[relative] = {**record, "mode": mode}
+                reused_files += 1
+            else:
+                shutil.copy2(source, destination)
+            next_signatures[relative] = signature
         except OSError:
             continue
-        try:
-            mode = source.stat().st_mode & 0o777
-            os.chmod(destination, mode)
-        except OSError:
-            mode = 0o644
         if mode not in (0o644, 0o755):
             # git records only the executable bit, so every other mode has to
             # travel in the manifest -- otherwise a 0600 key comes back from a
@@ -1608,7 +1659,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     if previous_target.exists():
         shutil.rmtree(previous_target, ignore_errors=True)
 
-    large_files = split_large_blobs(target)
+    large_files = split_large_blobs(target, reused_large)
+    LOG.info("snapshot ready: %d files, %d unchanged files reused", copied, reused_files)
     manifest = {
         "large_files": large_files,
         "instance": config.instance_id,
@@ -1631,6 +1683,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     (workdir / MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    signatures_path.write_text(json.dumps(next_signatures, separators=(",", ":")))
     return manifest
 
 
@@ -1942,11 +1995,9 @@ def reject_destructive_shrink(previous_files: int, current_files: int) -> None:
 
 def stage_snapshot(workdir: Path, config: GitConfig) -> None:
     """Stage bounded batches so one large first backup cannot time out as a whole."""
-    deleted = run_git(["ls-files", "--deleted", "-z"], cwd=workdir, config=config)
-    paths = [Path(value) for value in deleted.stdout.split("\0") if value]
-    paths += [path.relative_to(workdir) for path in (workdir / DATA_SUBDIR).rglob("*") if path.is_file()]
-    if (workdir / MANIFEST_NAME).exists():
-        paths.append(Path(MANIFEST_NAME))
+    changed = run_git(["diff", "--name-only", "-z"], cwd=workdir, config=config)
+    untracked = run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd=workdir, config=config)
+    paths = [Path(value) for value in (changed.stdout + untracked.stdout).split("\0") if value]
     paths = sorted(set(paths), key=lambda path: path.as_posix())
     batch, size, staged = [], 0, 0
 
