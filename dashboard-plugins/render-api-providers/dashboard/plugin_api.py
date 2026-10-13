@@ -205,7 +205,9 @@ def _configured_model_ids(raw: dict) -> list[str]:
     for value in values:
         if isinstance(value, dict):
             value = _first_str(value, "id", "name", "model")
-        if isinstance(value, str) and value.strip() and value.strip() not in model_ids:
+        if (isinstance(value, str) and value.strip()
+                and value not in ("__explicit_model_allowlist__", "__discovered_model_catalog__")
+                and value.strip() not in model_ids):
             model_ids.append(value.strip())
     return model_ids
 
@@ -509,6 +511,7 @@ def _upsert_legacy_entry(config: dict, name: str, key: str, fields: dict) -> Non
             entry.pop("api_keys", None)
         if "models" in fields:
             entry["models"] = dict(config["providers"][key].get("models", {}))
+            entry.pop("models_discovered", None)
         if fields.get("key_env"):
             entry["key_env"] = fields["key_env"]
         else:
@@ -615,6 +618,8 @@ def upsert_custom_provider_entry(config: dict, fields: dict) -> str:
         previous_models = entry.get("models")
         previous_models = previous_models if isinstance(previous_models, dict) else {}
         entry["models"] = {m: previous_models.get(m, {}) for m in fields["models"]}
+        # Explicit edits are user-managed; discovery must not overwrite them.
+        entry.pop("models_discovered", None)
     providers[key] = entry
 
     _upsert_legacy_entry(config, name, key, fields)
@@ -921,3 +926,4 @@ async def delete_custom_provider(request: Request, key: str):
         raise HTTPException(status_code=404, detail=f"provider '{key}' not found")
     save_config(config)
     return {"ok": True}
+

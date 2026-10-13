@@ -94,3 +94,11 @@ The auto-updating launcher reconnects the same named tunnel on every start and d
 Tunnel tokens are read directly from Colab Secrets (or the launcher process environment), passed via a private 0600 temporary file, and removed when the tunnel is stopped. They do not enter Hermes' agent environment or private GitHub backup. The account/domain settings persist outside temporary Colab runtimes. Existing dashboard authentication remains active.
 
 With neither setting configured, the existing temporary Quick Tunnel remains available. Partial or invalid fixed-URL settings display a configuration error rather than switching silently to a random URL. A fixed hostname cannot preserve the previously assigned temporary `trycloudflare.com` address.
+
+## Manual models in native pickers
+
+Colab applies `patch-custom-models.py` during installation and on every startup, including a cached install after a native Hermes update. The patch targets the current split `hermes_cli/model_switch_providers.py` module used by web/TUI and Telegram pickers. Manual IDs are kept first and merged with live/cached discovery results in both canonical and legacy custom-provider rows. An empty or failed discovery cannot hide a manually registered ID. Removed auto-discovered IDs remain removable rather than accumulating forever.
+
+Saving a manual list clears the old `models_discovered` ownership flag in both schemas, preserving per-model metadata and preventing automatic refreshes from replacing that list. Internal legacy catalog markers are omitted from the provider editor. The chat workspace can list up to all 500 IDs accepted by the provider editor, instead of stopping at 100.
+
+After applying this update through the launcher, re-save any custom IDs already lost to a prior discovery refresh. Provider endpoints and keys are retained. Showing a custom ID does not guarantee the API account supports it.
