@@ -195,8 +195,16 @@ def is_excluded(relative: str, excludes: "tuple[str, ...]" = DEFAULT_EXCLUDES) -
     without pulling in a dependency.
     """
     parts = [part for part in relative.replace("\\", "/").split("/") if part not in ("", ".")]
-    for part in parts:
+    bundled_npm = (len(parts) >= 4 and parts[0] == 'tools'
+                   and re.fullmatch(r'node-v?\d+\.\d+\.\d+-linux-(?:x64|arm64)', parts[1])
+                   and parts[2:4] == ['lib', 'node_modules']
+                   and (len(parts) == 4 or parts[4] in ('npm', 'corepack')))
+    for index, part in enumerate(parts):
         for pattern in excludes:
+            # Node ships npm (including its dependencies) inside node_modules.
+            # Ordinary project dependencies stay excluded.
+            if pattern == 'node_modules' and bundled_npm and index >= 3:
+                continue
             if fnmatch.fnmatch(part, pattern):
                 return True
     return False

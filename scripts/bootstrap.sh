@@ -418,6 +418,10 @@ if [ "${HERMES_RUNTIME_DEPS_AUTORESTORE:-0}" = "1" ] && [ "$(id -u)" = "0" ] \
   export HERMES_RUNTIME_DEPS_RESTORED=1
 fi
 
+if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
+  /opt/hermes/.venv/bin/python /opt/render-tools/repair-node-npm.py
+fi
+
 # Hand off to the upstream entrypoint. The upstream script handles
 # privilege drop, dashboard backgrounding, and the actual gateway exec.
 # Own the dashboard restart loop here; suppress upstream's one-shot process.
