@@ -36,6 +36,7 @@ import tarfile
 import tempfile
 import time
 import urllib.request
+from urllib.parse import urlsplit
 
 CODE_URL = "https://github.com/Sugamdeol/hermes-render.git"
 SOURCE = Path("/content/hermes-render-source")
@@ -204,6 +205,32 @@ def get_bootstrap_secret(name, prompt):
         if value:
             return value
     return getpass.getpass(prompt)
+
+
+def optional_colab_setting(name):
+    value = os.environ.get(name, '').strip()
+    if value:
+        return value
+    try:
+        from google.colab import userdata
+        return str(userdata.get(name) or '').strip()
+    except Exception:
+        return ''
+
+
+def dashboard_tunnel_settings():
+    token = optional_colab_setting('CLOUDFLARE_TUNNEL_TOKEN')
+    url = optional_colab_setting('HERMES_DASHBOARD_URL')
+    if not token and not url:
+        return '', ''
+    if not token or not url:
+        raise RuntimeError('For a fixed dashboard URL, set both CLOUDFLARE_TUNNEL_TOKEN and HERMES_DASHBOARD_URL in Colab Secrets with notebook access enabled.')
+    parsed = urlsplit(url)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
+            or parsed.port not in (None, 443) or parsed.path not in ('', '/')
+            or parsed.query or parsed.fragment or parsed.hostname.endswith('.trycloudflare.com')):
+        raise ValueError('HERMES_DASHBOARD_URL must be your named tunnel HTTPS hostname, such as https://hermes.example.com')
+    return token, url.rstrip('/')
 
 
 def install_cloudflared():
@@ -558,6 +585,10 @@ class ColabAgent:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=5)
+        token_file = getattr(self, 'tunnel_token_file', None)
+        if token_file:
+            Path(token_file).unlink(missing_ok=True)
+        self.tunnel_token_file = None
         self.tunnel_process = None
         self.tunnel_url = None
 
@@ -566,15 +597,30 @@ class ColabAgent:
         if existing and existing.poll() is None and getattr(self, "tunnel_url", None):
             return self.tunnel_url
         ColabAgent.stop_tunnel(self)
-        print("Starting Cloudflare tunnel…")
+        token, fixed_url = dashboard_tunnel_settings()
+        print("Starting fixed Cloudflare dashboard tunnel…" if fixed_url else "Starting Cloudflare tunnel…")
         binary = install_cloudflared()
         home = Path("/content/hermes-cloudflare")
         home.mkdir(mode=0o700, exist_ok=True)
         log = home / "tunnel.log"
+        ready_url = None
+        command = [binary, 'tunnel', '--no-autoupdate', '--protocol', 'http2']
+        if fixed_url:
+            fd, token_path = tempfile.mkstemp(dir=home, prefix='named-', suffix='.token')
+            with os.fdopen(fd, 'w') as handle:
+                handle.write(token)
+            self.tunnel_token_file = token_path
+            with socket.socket() as reservation:
+                reservation.bind(('127.0.0.1', 0))
+                metrics_port = reservation.getsockname()[1]
+            command += ['--metrics', f'127.0.0.1:{metrics_port}', 'run', '--token-file', token_path]
+            ready_url = f'http://127.0.0.1:{metrics_port}/ready'
+        else:
+            command += ['--url', 'http://127.0.0.1:10000']
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as logfile:
             self.tunnel_process = subprocess.Popen(
-                [binary, "tunnel", "--url", "http://127.0.0.1:10000", "--no-autoupdate", "--protocol", "http2"],
+                command,
                 env={**{key: os.environ[key] for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                       "http_proxy", "https_proxy", "all_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR")
                       if key in os.environ}, "HOME": str(home), "PATH": os.environ.get("PATH", "")},
@@ -583,14 +629,25 @@ class ColabAgent:
         while time.monotonic() < deadline:
             if self.tunnel_process.poll() is not None:
                 ColabAgent.stop_tunnel(self)
-                raise RuntimeError("Cloudflare tunnel exited: " + log.read_text(errors="replace")[-2000:])
-            match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log.read_text(errors="replace"))
-            if match:
-                self.tunnel_url = match.group(0)
-                return self.tunnel_url
+                detail = log.read_text(errors="replace")[-2000:]
+                raise RuntimeError("Cloudflare tunnel exited: " + (detail.replace(token, '[REDACTED]') if token else detail))
+            if fixed_url:
+                try:
+                    with urllib.request.urlopen(ready_url, timeout=2) as response:
+                        if response.status == 200:
+                            self.tunnel_url = fixed_url
+                            return self.tunnel_url
+                except OSError:
+                    pass
+            else:
+                match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", log.read_text(errors="replace"))
+                if match:
+                    self.tunnel_url = match.group(0)
+                    return self.tunnel_url
             time.sleep(1)
         ColabAgent.stop_tunnel(self)
-        raise RuntimeError("Cloudflare tunnel timed out: " + log.read_text(errors="replace")[-2000:])
+        detail = log.read_text(errors="replace")[-2000:]
+        raise RuntimeError("Cloudflare tunnel timed out: " + (detail.replace(token, '[REDACTED]') if token else detail))
 
     def dashboard(self):
         """Open the dashboard in Colab's supported embedded browser context."""

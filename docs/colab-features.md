@@ -73,3 +73,24 @@ Backup retains Node's own npm/corepack under `tools/node-<version>-linux-<arch>/
 For Hermes releases using the native PM store, startup first checks the exact Node/npm entries selected by Hermes. Missing bundled npm or a failed package check runs the confirmed repair command `hermes pm install node npm`, then validates the entries again before starting the dashboard. Named installs do not use `--tools-only`. Healthy entries skip installation. The existing legacy tools-folder repair remains available for older releases.
 
 Colab large-backup restores no longer abort after one minute below 1 KB/s: its launcher disables Git's low-speed threshold while retaining a 30-minute Git command/restore/startup bound. Existing cached clones stay reusable. Bootstrap logs the storage reader's redacted error instead of discarding stderr, and still refuses startup/backup seeding on an unknown remote state. The relaxed limits do not accelerate GitHub or guarantee a download finishes; they allow slow server pack preparation and downloads to complete.
+
+## Fixed dashboard hostname
+
+Cloudflare Quick Tunnels assign a different `trycloudflare.com` URL to each new process. A fixed URL uses a remotely managed named Cloudflare Tunnel and a hostname on a domain in your Cloudflare account.
+
+One-time setup:
+
+1. Create a named tunnel in Cloudflare Networking > Tunnels. Add a published application route for your chosen hostname, pointing to `http://localhost:10000`.
+2. Copy its connector tunnel token (the `eyJ...` value in the installation command).
+3. In Colab Secrets, enable notebook access for both settings below.
+
+| Colab Secret | Value |
+| --- | --- |
+| `CLOUDFLARE_TUNNEL_TOKEN` | Connector token for that named tunnel |
+| `HERMES_DASHBOARD_URL` | `https://hermes.your-domain.com` |
+
+The auto-updating launcher reconnects the same named tunnel on every start and displays that configured hostname. It checks cloudflared's loopback readiness endpoint before returning the URL. The Cloudflare hostname route itself must be configured correctly in Cloudflare; local connector readiness does not validate that external route.
+
+Tunnel tokens are read directly from Colab Secrets (or the launcher process environment), passed via a private 0600 temporary file, and removed when the tunnel is stopped. They do not enter Hermes' agent environment or private GitHub backup. The account/domain settings persist outside temporary Colab runtimes. Existing dashboard authentication remains active.
+
+With neither setting configured, the existing temporary Quick Tunnel remains available. Partial or invalid fixed-URL settings display a configuration error rather than switching silently to a random URL. A fixed hostname cannot preserve the previously assigned temporary `trycloudflare.com` address.
