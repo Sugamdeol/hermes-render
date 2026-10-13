@@ -17,3 +17,35 @@ Colab enables the bundled `render-api-providers` and `hermes-chat-dashboard` plu
 The authenticated proxy maps matching public origins to its loopback upstream origin, preserving the native WebSocket origin guard. Cross-origin requests remain rejected.
 
 After merging, use the auto-updating Colab launcher and refresh the dashboard. This restoration does not reintroduce the old Render memory limits, single-client chat bridge or turn serialization. Native Hermes provides session execution and recovery behavior. Third-party plugin functionality depends on its compatibility with current Hermes.
+
+
+## Colab capacity
+
+The v2 profile also upgrades existing Colab installs that already have the v1 marker.
+It sets the native session admission cap to **10** and the recovery worker default to 10.
+Startup keeps these Colab settings instead of discarding them after restoring Render state.
+
+| Setting | Colab v2 |
+| --- | --- |
+| Active sessions | 10 |
+| Retained live dashboard/TUI sessions | 32 |
+| Agent turns | Native unlimited (`null`) |
+| Gateway idle timeout | 3,600 seconds |
+| Delegation | 10 children, 250 iterations, depth 2, orchestrator enabled |
+| Session search concurrency | 10 |
+| Goal turns | 50 |
+| Scheduled job concurrency | 10 |
+| Terminal command timeout | 600 seconds |
+| Session Python kernels | 10 |
+| Browser idle / command timeout | 300 / 60 seconds |
+| File reads | 200,000 characters |
+| Tool output | 100,000 characters, 4,000 lines, 4,000 characters per line |
+
+The migration runs once; later dashboard config edits remain yours. Existing higher budgets
+and explicit unlimited values survive. Compression remains at the current upstream settings.
+The legacy worker launcher no longer forces one-agent cache and allocator settings in Colab.
+Provider rate limits, model context sizes and Colab's actual RAM/runtime lifetime still apply.
+
+After this adapter update is merged, save your state and restart through the auto-updating
+Colab start cell. Restarting only the dashboard cannot replace the launcher's environment
+or the gateway's existing admission slots. No upstream Hermes manual update is needed.

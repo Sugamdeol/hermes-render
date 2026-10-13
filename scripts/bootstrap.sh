@@ -272,7 +272,10 @@ if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
   /opt/hermes/.venv/bin/python /opt/render-tools/colab-profile.py "${DATA_DIR}" /opt/hermes
   unset MALLOC_ARENA_MAX OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS TOKENIZERS_PARALLELISM \
     HERMES_AGENT_CACHE_MAX_SIZE HERMES_AGENT_CACHE_IDLE_TTL_SECONDS HERMES_API_MAX_RETRIES \
-    HERMES_MAX_CONCURRENT_SESSIONS HERMES_CRON_MAX_PARALLEL HERMES_TUI_RPC_POOL_WORKERS NODE_OPTIONS
+    NODE_OPTIONS
+  export HERMES_MAX_CONCURRENT_SESSIONS="${HERMES_MAX_CONCURRENT_SESSIONS:-10}"
+  export HERMES_CRON_MAX_PARALLEL="${HERMES_CRON_MAX_PARALLEL:-10}"
+  export HERMES_TUI_RPC_POOL_WORKERS="${HERMES_TUI_RPC_POOL_WORKERS:-10}"
 fi
 # These internal addresses are part of the nginx routing contract, not
 # portable user settings. A restored public dashboard port can collide with
@@ -448,3 +451,4 @@ if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
   exec "$@"
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"
+
