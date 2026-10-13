@@ -49,3 +49,19 @@ Provider rate limits, model context sizes and Colab's actual RAM/runtime lifetim
 After this adapter update is merged, save your state and restart through the auto-updating
 Colab start cell. Restarting only the dashboard cannot replace the launcher's environment
 or the gateway's existing admission slots. No upstream Hermes manual update is needed.
+
+## Immediate state uploads
+
+Colab enables `GIT_STATE_EVENT_WATCH=1`. Linux inotify wakes the existing storage worker
+on writes, creates, atomic renames, deletions and SQLite/WAL changes. The observer stays
+active during uploads, so another write queues the next incremental save. No chat-stop
+or quiet-tree wait applies with the Colab zero-debounce / zero-push-gap settings.
+
+Idle change detection no longer repeatedly walks the entire state tree. The existing
+incremental mirror, encrypted SQLite snapshots and batched Git staging still handle each
+save. GitHub transfer time and snapshot preparation remain dependent on state size.
+
+Excluded logs/caches do not wake the uploader. Directory watches follow newly created or
+moved directories; queue overflow rebuilds the watches and requests a save. If Linux events
+are unavailable or fail, metadata polling resumes. The 60-second safety save stays enabled.
+`GIT_STATE_EVENT_WATCH=0` opts back into polling. Restart the updated Colab launcher to apply.
