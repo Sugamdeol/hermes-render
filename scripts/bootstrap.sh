@@ -116,7 +116,7 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
   # proof it holds state), so on every boot after the first this is a real
   # transfer on the pre-port-bind path. An empty answer means "unavailable",
   # which the case below already handles without seeding.
-  git_state="$(run_bounded gosu hermes "${GIT_SYNC}" state "${DATA_DIR}" 2>/dev/null | head -n 1)"
+  git_state="$(run_bounded gosu hermes "${GIT_SYNC}" state "${DATA_DIR}" | head -n 1)"
   case "${git_state}" in
     has-state)
       GIT_HAS_STATE=1
