@@ -2461,7 +2461,16 @@ def run_daemon(data_dir: Path, config: GitConfig,
     # Change-driven saves. The interval below is only the safety net: a change
     # is normally pushed within `debounce` seconds of the last write, not at
     # the next interval boundary.
-    watcher = ChangeWatcher(data_dir, config) if config.watch else None
+    events = None
+    if config.watch and os.environ.get('GIT_STATE_EVENT_WATCH', '1' if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full' else '0') == '1':
+        try:
+            import runpy
+            event_class = runpy.run_path(str(Path(__file__).with_name('state-events.py')))['StateEvents']
+            events = event_class(data_dir, lambda path: is_excluded(path, DEFAULT_EXCLUDES))
+            LOG.info('Linux state events enabled; writes wake the uploader immediately')
+        except (OSError, AttributeError, KeyError) as exc:
+            LOG.warning('State events unavailable; using metadata polling: %s', exc)
+    watcher = ChangeWatcher(data_dir, config, sampler=events.sample if events else None) if config.watch else None
 
     def push(reason: str) -> None:
         # Snapshot first: whatever is written while the push is in flight is
@@ -2484,6 +2493,14 @@ def run_daemon(data_dir: Path, config: GitConfig,
     next_sync = 0.0
     last_scan = 0.0
     while not stop.is_set():
+        if events is not None:
+            events.notify.clear()
+            if events.failed:
+                LOG.warning('State events stopped; reverting to metadata polling')
+                events.close()
+                events = None
+                watcher = ChangeWatcher(data_dir, config)
+                next_sync = 0.0
         now = time.time()
         # Recovery intent cannot wait for a quiet tree or the normal push gap.
         # The gateway waits for this acknowledgement before allocating an agent.
@@ -2511,7 +2528,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
                 stop.wait(5)
                 continue
 
-        if watcher is not None and now - last_scan >= config.watch_seconds:
+        if watcher is not None and (events is not None or now - last_scan >= config.watch_seconds):
             last_scan = now
             # A burst of writes should become one commit, so wait for quiet
             # before pushing -- then respect the minimum gap so a very chatty
@@ -2523,13 +2540,16 @@ def run_daemon(data_dir: Path, config: GitConfig,
             next_sync = now + config.interval
             push("safety-net interval")
 
-        stop.wait(min(
-            1,
-            config.watch_seconds,
-            config.poll_interval if config.failover else config.interval,
-            config.interval,
-        ))
+        delay = min(1, config.watch_seconds,
+                    config.poll_interval if config.failover else config.interval,
+                    config.interval)
+        if events is not None:
+            events.notify.wait(delay)
+        else:
+            stop.wait(delay)
 
+    if events is not None:
+        events.close()
     try:
         sync_once(data_dir, config, force=True)
     except GitStateError as exc:
@@ -2644,3 +2664,4 @@ def main(argv: "list[str] | None" = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
