@@ -41,6 +41,11 @@ class FullColabTests(unittest.TestCase):
         self.assertIn('HERMES_GATEWAY_TOKEN',env['HERMES_ENV_OVERRIDE_KEYS'])
         self.assertNotIn('OMP_NUM_THREADS',env)
         self.assertEqual(env['HERMES_MAX_CONCURRENT_SESSIONS'], '10')
+        self.assertEqual(env['GIT_STATE_HTTP_LOW_SPEED_LIMIT'], '0')
+        self.assertEqual(env['GIT_STATE_GIT_TIMEOUT_SECONDS'], '1800')
+        self.assertEqual(env['HERMES_RESTORE_TIMEOUT_SECONDS'], '1800')
+        self.assertEqual(env['HERMES_COLAB_STARTUP_TIMEOUT_SECONDS'], '1800')
+        self.assertIn('GIT_STATE_HTTP_LOW_SPEED_LIMIT', env['HERMES_ENV_OVERRIDE_KEYS'])
         self.assertIn('HERMES_MAX_CONCURRENT_SESSIONS', env['HERMES_ENV_OVERRIDE_KEYS'])
 
     def test_v2_upgrades_v1_and_preserves_higher_budgets(self):

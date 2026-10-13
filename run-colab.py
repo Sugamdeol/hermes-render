@@ -140,6 +140,11 @@ def runtime_env(token, key, dashboard_password=None):
         "GIT_STATE_DEBOUNCE_SECONDS": "0",
         "GIT_STATE_MIN_PUSH_INTERVAL_SECONDS": "0",
         "GIT_STATE_INTERVAL_SECONDS": "60",
+        # GitHub may spend over a minute preparing a large shallow clone.
+        "GIT_STATE_HTTP_LOW_SPEED_LIMIT": "0",
+        "GIT_STATE_GIT_TIMEOUT_SECONDS": "1800",
+        "HERMES_RESTORE_TIMEOUT_SECONDS": "1800",
+        "HERMES_COLAB_STARTUP_TIMEOUT_SECONDS": "1800",
         "HERMES_HOME": str(DATA), "GIT_STATE_WORKDIR": "/content/hermes-git-cache/state",
         "HERMES_UID": "", "HERMES_GID": "",
         "HERMES_RECOVERY_CHECKPOINT_FILE": "/tmp/hermes-recovery-checkpoint.json",
@@ -732,7 +737,7 @@ def main(confirm_switch=False):
     # Keep the stop/backup handle even if initialization later times out.
     globals()["HERMES_COLAB"] = agent
     print(f"Restoring saved data. Startup logs: {LOG}")
-    deadline = time.monotonic() + 600
+    deadline = time.monotonic() + int(env.get("HERMES_COLAB_STARTUP_TIMEOUT_SECONDS", "1800"))
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError(f"Startup exited. Inspect {LOG}; data has not been deleted")
