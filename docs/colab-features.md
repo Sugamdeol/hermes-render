@@ -65,3 +65,7 @@ Excluded logs/caches do not wake the uploader. Directory watches follow newly cr
 moved directories; queue overflow rebuilds the watches and requests a save. If Linux events
 are unavailable or fail, metadata polling resumes. The 60-second safety save stays enabled.
 `GIT_STATE_EVENT_WATCH=0` opts back into polling. Restart the updated Colab launcher to apply.
+
+## Bundled npm recovery
+
+Backup retains Node's own npm/corepack under `tools/node-<version>-linux-<arch>/lib/node_modules` while still excluding ordinary project dependencies. Earlier backups omitted npm, which caused the dashboard to repeatedly fail with `npm-cli.js` missing. Before starting the Colab dashboard, `repair-node-npm.py` detects that condition and restores npm from the matching official Node release archive after checking SHA-256. Existing Node binaries and session data are retained. Healthy installs skip the download. Network or checksum failures stop this repair rather than silently declare startup successful.
