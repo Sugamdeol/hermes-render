@@ -3,6 +3,7 @@ import importlib.util
 import io
 from pathlib import Path
 import tarfile
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,6 +17,36 @@ spec.loader.exec_module(repair)
 
 
 class NodeNpmTests(unittest.TestCase):
+    def test_managed_missing_npm_uses_working_named_install_then_rechecks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'pm').mkdir()
+            (root / 'pm/cli.py').touch()
+            results = [subprocess.CompletedProcess([], 10), subprocess.CompletedProcess([], 0), subprocess.CompletedProcess([], 0)]
+            with patch.object(repair.subprocess, 'run', side_effect=results) as run:
+                self.assertEqual(repair.repair_managed(root / 'data', root), 1)
+                self.assertEqual(run.call_args_list[1].args[0][1:], ['-m', 'pm.cli', 'install', 'node', 'npm'])
+                self.assertEqual(run.call_args_list[1].kwargs['env']['HERMES_HOME'], str(root / 'data'))
+                self.assertEqual(run.call_count, 3)
+
+    def test_managed_healthy_skips_install(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'pm').mkdir()
+            (root / 'pm/cli.py').touch()
+            with patch.object(repair.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+                self.assertEqual(repair.repair_managed(root, root), 0)
+                self.assertEqual(run.call_count, 1)
+
+    def test_managed_install_failure_stops_startup(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / 'pm').mkdir()
+            (root / 'pm/cli.py').touch()
+            with patch.object(repair.subprocess, 'run', side_effect=[subprocess.CompletedProcess([], 10), subprocess.CalledProcessError(1, ['pm'])]):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    repair.repair_managed(root, root)
+
     def test_bundled_npm_survives_but_project_modules_stay_excluded(self):
         storage = load_storage()
         for path in ('tools/node-26.7.0-linux-x64/lib/node_modules',

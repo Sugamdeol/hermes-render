@@ -69,3 +69,5 @@ are unavailable or fail, metadata polling resumes. The 60-second safety save sta
 ## Bundled npm recovery
 
 Backup retains Node's own npm/corepack under `tools/node-<version>-linux-<arch>/lib/node_modules` while still excluding ordinary project dependencies. Earlier backups omitted npm, which caused the dashboard to repeatedly fail with `npm-cli.js` missing. Before starting the Colab dashboard, `repair-node-npm.py` detects that condition and restores npm from the matching official Node release archive after checking SHA-256. Existing Node binaries and session data are retained. Healthy installs skip the download. Network or checksum failures stop this repair rather than silently declare startup successful.
+
+For Hermes releases using the native PM store, startup first checks the exact Node/npm entries selected by Hermes. Missing bundled npm or a failed package check runs the confirmed repair command `hermes pm install node npm`, then validates the entries again before starting the dashboard. Named installs do not use `--tools-only`. Healthy entries skip installation. The existing legacy tools-folder repair remains available for older releases.

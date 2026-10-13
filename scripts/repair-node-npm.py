@@ -5,14 +5,58 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import urllib.request
 
 
+MANAGED_PROBE = r"""
+import sys
+from pm.install import _installed_location, _lockfile
+from pm.registry import get_package
+from pm.store import current_target
+
+target = current_target()
+for name in ('node', 'npm'):
+    package = get_package(name)
+    location = _installed_location(package, _lockfile(), target)
+    if location is None:
+        sys.exit(10)
+    facts, store = location
+    entry = store.entry(facts.get(name)['entry'])
+    if package.verify(entry, target):
+        sys.exit(10)
+    if name == 'node':
+        binary = package.binary(entry, target)
+        cli = binary.parent.parent / 'lib/node_modules/npm/bin/npm-cli.js'
+        if not cli.is_file():
+            sys.exit(10)
+"""
+
+
+def repair_managed(home, install=None):
+    install = Path(install or os.environ.get('HERMES_INSTALL_DIR', '/opt/hermes'))
+    if not (install / 'pm/cli.py').is_file():
+        return 0  # Older Hermes releases only have the legacy tools layout.
+    env = dict(os.environ, HERMES_HOME=str(home))
+    probe = [sys.executable, '-c', MANAGED_PROBE]
+    result = subprocess.run(probe, cwd=install, env=env, capture_output=True, text=True)
+    if result.returncode == 0:
+        print('[node-repair] Hermes-managed Node/npm already healthy', flush=True)
+        return 0
+    print('[node-repair] Repairing Hermes-managed Node/npm with its package manager', flush=True)
+    # Named installs already stop after installing those packages. --tools-only
+    # is only valid for the unnamed closure and must not be combined with names.
+    subprocess.run([sys.executable, '-m', 'pm.cli', 'install', 'node', 'npm'],
+                   cwd=install, env=env, check=True)
+    subprocess.run(probe, cwd=install, env=env, check=True)
+    return 1
+
+
 def repair(home):
     home = Path(home).resolve()
-    repaired = 0
+    repaired = repair_managed(home)
     for node in sorted((home / 'tools').glob('node-*-linux-*/bin/node')):
         root = node.parent.parent
         cli = root / 'lib/node_modules/npm/bin/npm-cli.js'
