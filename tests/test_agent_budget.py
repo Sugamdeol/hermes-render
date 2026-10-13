@@ -15,6 +15,17 @@ spec.loader.exec_module(budget)
 
 
 class AgentBudgetTests(unittest.TestCase):
+    def test_colab_wrapper_does_not_force_render_cache_or_allocator(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'HERMES_RUNTIME_PROFILE': 'colab-full',
+                   'HERMES_WORKER_REGISTRY': tmp + '/workers',
+                   'HERMES_AGENT_CACHE_MAX_SIZE': '32',
+                   'HERMES_AGENT_CACHE_IDLE_TTL_SECONDS': '3600', 'MALLOC_ARENA_MAX': '4'}
+            code = "import os,json; print(json.dumps({k:os.getenv(k) for k in ['HERMES_AGENT_CACHE_MAX_SIZE','HERMES_AGENT_CACHE_IDLE_TTL_SECONDS','MALLOC_ARENA_MAX']}))"
+            result = subprocess.run([sys.executable, str(SCRIPT), 'run', 'chat', sys.executable, '-c', code], env=env, check=True, capture_output=True, text=True)
+            import json
+            self.assertEqual(json.loads(result.stdout), {'HERMES_AGENT_CACHE_MAX_SIZE':'32', 'HERMES_AGENT_CACHE_IDLE_TTL_SECONDS':'3600', 'MALLOC_ARENA_MAX':'4'})
+
     def test_gateway_survives_cache_heavy_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             current = Path(tmp) / 'memory.current'
@@ -74,3 +85,4 @@ class AgentBudgetTests(unittest.TestCase):
                         proc.wait()
                         if proc.stdout:
                             proc.stdout.close()
+

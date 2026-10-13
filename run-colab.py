@@ -152,6 +152,9 @@ def runtime_env(token, key, dashboard_password=None):
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
         "HERMES_RUNTIME_PROFILE": "colab-full",
+        "HERMES_MAX_CONCURRENT_SESSIONS": "10",
+        "HERMES_CRON_MAX_PARALLEL": "10",
+        "HERMES_TUI_RPC_POOL_WORKERS": "10",
         "HERMES_WEB_BUILD_MAX_OLD_SPACE_SIZE": "4096",
         # Colab only: the hermes account is uid 0 on an ephemeral VM, so no later
         # non-root run can be broken by root-owned files, which is the risk the
@@ -749,3 +752,4 @@ def main(confirm_switch=False):
 
 if __name__ == "__main__":
     HERMES_COLAB = main()
+

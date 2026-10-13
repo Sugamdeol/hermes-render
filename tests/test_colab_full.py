@@ -40,5 +40,39 @@ class FullColabTests(unittest.TestCase):
         self.assertEqual(env['HERMES_GATEWAY_TOKEN'],'test-password')
         self.assertIn('HERMES_GATEWAY_TOKEN',env['HERMES_ENV_OVERRIDE_KEYS'])
         self.assertNotIn('OMP_NUM_THREADS',env)
+        self.assertEqual(env['HERMES_MAX_CONCURRENT_SESSIONS'], '10')
+        self.assertIn('HERMES_MAX_CONCURRENT_SESSIONS', env['HERMES_ENV_OVERRIDE_KEYS'])
+
+    def test_v2_upgrades_v1_and_preserves_higher_budgets(self):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            (home / '.colab-full-profile-v1').touch()
+            (home / 'config.yaml').write_text('max_concurrent_sessions: 2\nagent:\n  max_turns: 30\n  gateway_timeout: 7200\nmodel:\n  default: my-model\ndelegation:\n  max_concurrent_children: 1\n')
+            channel = type('Channel', (), {'install_id': staticmethod(lambda p: 'test'), '_write_channel_record': staticmethod(lambda *a, **k: True)})()
+            with patch.dict('sys.modules', {'hermes_cli.update_channel': channel}):
+                profile.apply(home, home / 'install')
+                import yaml
+                config = yaml.safe_load((home / 'config.yaml').read_text())
+                self.assertEqual(config['max_concurrent_sessions'], 10)
+                self.assertIsNone(config['agent']['max_turns'])
+                self.assertEqual(config['agent']['gateway_timeout'], 7200)
+                self.assertEqual(config['delegation']['max_concurrent_children'], 10)
+                self.assertEqual(config['model']['default'], 'my-model')
+                self.assertTrue((home / '.colab-full-profile-v2').exists())
+                config['max_concurrent_sessions'] = 7
+                (home / 'config.yaml').write_text(yaml.safe_dump(config))
+                profile.apply(home, home / 'install')
+                self.assertEqual(yaml.safe_load((home / 'config.yaml').read_text())['max_concurrent_sessions'], 7)
+
+    def test_recovery_default_matches_colab_and_render(self):
+        recovery = load('concurrency_recovery', 'scripts/task-recovery.py')
+        with patch.dict(os.environ, {'HERMES_RUNTIME_PROFILE': 'colab-full'}, clear=True):
+            self.assertEqual(recovery.session_concurrency(), 10)
+            with patch.dict(os.environ, {'HERMES_MAX_CONCURRENT_SESSIONS': 'bad'}):
+                self.assertEqual(recovery.session_concurrency(), 10)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(recovery.session_concurrency(), 2)
+
 
 if __name__=='__main__':unittest.main()
+

@@ -112,12 +112,14 @@ if __name__ == '__main__':
         register(sys.argv[2])
         # Set before exec so glibc starts with one allocation arena, including
         # on existing deployments whose old Render env still specifies two.
-        os.environ['MALLOC_ARENA_MAX'] = '1'
-        os.environ['HERMES_AGENT_CACHE_MAX_SIZE'] = '1'
-        os.environ['HERMES_AGENT_CACHE_IDLE_TTL_SECONDS'] = '30'
+        if os.environ.get('HERMES_RUNTIME_PROFILE') != 'colab-full':
+            os.environ['MALLOC_ARENA_MAX'] = '1'
+            os.environ['HERMES_AGENT_CACHE_MAX_SIZE'] = '1'
+            os.environ['HERMES_AGENT_CACHE_IDLE_TTL_SECONDS'] = '30'
         # Remove the adapter's previous 64 MiB Node cap on existing services.
         if os.environ.get('NODE_OPTIONS') == '--max-old-space-size=64':
             os.environ.pop('NODE_OPTIONS')
         os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
     else:
         raise SystemExit('unknown agent budget mode')
+

@@ -18,6 +18,45 @@ LIMITS = {
 }
 
 
+# Applied once to existing Colab installs, including those migrated by v1.
+# Higher user budgets and explicit unlimited values remain valid.
+COLAB_LIMITS = {
+    'agent': {'max_turns': None, 'api_max_retries': 3, 'gateway_timeout': 3600},
+    'delegation': {'max_iterations': 250, 'max_concurrent_children': 10,
+                   'max_spawn_depth': 2, 'orchestrator_enabled': True},
+    'auxiliary.session_search': {'max_concurrency': 10},
+    'goals': {'max_turns': 50},
+    'terminal': {'timeout': 600},
+    'code_execution': {'max_session_kernels': 10},
+    'browser': {'inactivity_timeout': 300, 'command_timeout': 60},
+    'tool_output': {'max_bytes': 100000, 'max_lines': 4000, 'max_line_length': 4000},
+    '': {'file_read_max_chars': 200000, 'max_live_sessions': 32},
+}
+
+
+def expand_limits(config):
+    migrate(config)
+    config['max_concurrent_sessions'] = 10
+    gateway = config.get('gateway')
+    if isinstance(gateway, dict) and 'max_concurrent_sessions' in gateway:
+        gateway['max_concurrent_sessions'] = 10
+    for section, fields in COLAB_LIMITS.items():
+        target = config
+        for part in section.split('.') if section else []:
+            value = target.setdefault(part, {})
+            if not isinstance(value, dict):
+                raise ValueError(f'{section} must be a mapping')
+            target = value
+        for key, value in fields.items():
+            old = target.get(key)
+            if key not in target or (value is None and isinstance(old, (int, float))) or (
+                isinstance(value, bool) and isinstance(old, bool)
+            ) or (isinstance(value, (int, float)) and not isinstance(value, bool)
+                  and isinstance(old, (int, float)) and old < value):
+                target[key] = value
+    return config
+
+
 def migrate(config):
     for section, fields in LIMITS.items():
         target=config
@@ -32,12 +71,12 @@ def migrate(config):
 
 def apply(home, install):
     home=Path(home);install=Path(install)
-    marker=home/'.colab-full-profile-v1'
+    marker=home/'.colab-full-profile-v2'
     path=home/'config.yaml'
     if not marker.exists():
         config=yaml.safe_load(path.read_text()) if path.exists() else {}
         if not isinstance(config,dict):raise ValueError('Invalid saved config')
-        migrate(config)
+        expand_limits(config)
         skills=config.setdefault('skills',{})
         if isinstance(skills,dict):
             dirs=skills.setdefault('external_dirs',[])
@@ -67,3 +106,4 @@ def apply(home, install):
 
 
 if __name__=='__main__':apply(*sys.argv[1:3])
+

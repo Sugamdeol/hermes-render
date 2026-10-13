@@ -17,10 +17,11 @@ RETRY_MAX_SECONDS = 300
 
 def session_concurrency():
     """Maximum independently running gateway chats, shared with recovery."""
+    default = 10 if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full' else 2
     try:
-        return max(1, int(os.environ.get('HERMES_MAX_CONCURRENT_SESSIONS', '2')))
+        return max(1, int(os.environ.get('HERMES_MAX_CONCURRENT_SESSIONS', str(default))))
     except ValueError:
-        return 2
+        return default
 
 
 def _path():
@@ -414,3 +415,4 @@ async def _checkpoint_upload(strict):
             pass
         await asyncio.sleep(0.2)
     raise RuntimeError('Private backup checkpoint timed out. Task remains queued; recovery will retry automatically.')
+
