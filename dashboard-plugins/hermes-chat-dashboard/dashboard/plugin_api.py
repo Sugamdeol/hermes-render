@@ -183,7 +183,7 @@ def capabilities(request: Request):
         from hermes_cli.model_switch import list_authenticated_providers
         user_providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
         custom_providers = cfg.get("custom_providers") if isinstance(cfg.get("custom_providers"), list) else []
-        for provider in list_authenticated_providers(user_providers=user_providers, custom_providers=custom_providers, max_models=100):
+        for provider in list_authenticated_providers(user_providers=user_providers, custom_providers=custom_providers, max_models=500):
             for model in provider.get("models") or []:
                 mid = model.get("id") if isinstance(model, dict) else str(model)
                 if mid:
@@ -1141,4 +1141,5 @@ def get_shared(token: str, limit: int = 80, offset: int = -80):
             db.close()
         except Exception:
             pass
+
 

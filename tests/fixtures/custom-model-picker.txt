@@ -1,0 +1,158 @@
+# Native picker functions from NousResearch/hermes-agent@8f817911723e3ec13e7f47fc022fdcc9e2149354
+def _absorb_entry_models(grp: dict, entry: dict, active_model: Any) -> None:
+    """Fold one config entry's models into its group: the active selection first, then the declared
+    ``models:`` ids. The active selection alone never suppresses discovery, and a dict-shaped
+    ``models:`` is metadata rather than an allowlist (see ``_models_config_is_allowlist``), so only
+    list/string shapes pin the row."""
+    from hermes_cli.model_switch import _declared_model_ids, _entry_models_discovered, _models_config_is_allowlist
+    _extend_unique(grp["models"], [active_model])
+    models_field = entry.get("models")
+    if _models_config_is_allowlist(models_field, _entry_models_discovered(entry)):
+        grp["has_explicit_models"] = True
+    _extend_unique(grp["models"], _declared_model_ids(models_field))
+    _split_chain_entries(grp["models"])
+
+def _extend_unique(target: list, items) -> None:
+    """Append each truthy item of *items* not already in *target* (order preserved)."""
+    for item in items:
+        if item and item not in target:
+            target.append(item)
+
+def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
+    """Section 3: ``providers:`` dict entries, grouped by (api_url, credential, api_mode,
+    extra_headers) so keyed providers on one endpoint with the same wire protocol collapse into
+    one row (two Palantir Claude entries -> one "Palantir Claude" row); a different
+    key_env/api_mode/headers keeps distinct rows since the wire protocol or tenant differs."""
+    from hermes_cli.model_switch import _extra_headers_from_config, _scoped_key_env
+    from hermes_cli.config import coerce_provider_id, is_provider_enabled
+    ep_groups: dict[tuple, dict] = {}
+    for ep_name, ep_cfg in user_providers.items():
+        if not isinstance(ep_cfg, dict) or not is_provider_enabled(ep_cfg) or ep_name.lower() in b.seen_slugs:
+            continue
+        display_name = coerce_provider_id(ep_cfg.get("name")) or ep_name
+        api_url = _entry_base_url(ep_cfg, ("base_url", "api", "url"))
+        inline_api_key, key_env, cred_identity = _entry_credentials(ep_cfg, "key_env", "api_key_env")
+        headers = _extra_headers_from_config(ep_cfg)
+        group_key = (_norm_url(api_url), cred_identity, _entry_api_mode(ep_cfg), tuple(sorted(headers.items())))
+
+        if group_key not in ep_groups:
+            # slug = first ep_name encountered; probe key from the first member (inline api_key,
+            # else key_env through the per-profile secret scope).
+            ep_groups[group_key] = {
+                "slug": ep_name, "name": _group_display_name(display_name), "api_url": api_url, "models": [],
+                "has_explicit_models": False,
+                "api_key": inline_api_key or _scoped_key_env(key_env),
+                "headers": headers, "api_mode": ep_cfg.get("api_mode"),
+                "discovery_allowed": bool(api_url) and _discover_flag(ep_cfg), "raw_names": [], "aliases": set()}
+        grp = ep_groups[group_key]
+        # ``default_model`` is the legacy key; ``model`` matches custom_providers.
+        _absorb_entry_models(grp, ep_cfg, ep_cfg.get("default_model", "") or ep_cfg.get("model", ""))
+        grp["raw_names"].append(display_name)
+        grp["aliases"].update(custom_provider_aliases(display_name, str(ep_name)))
+
+    for grp in ep_groups.values():
+        ep_name, display_name, api_url = grp["slug"], grp["name"], grp["api_url"]
+        models_list = list(grp["models"])
+        # Official OpenAI rows often have base_url but no models: dict — avoid a misleading zero count.
+        if not models_list and base_url_host_matches(str(api_url).strip().lower(), "api.openai.com"):
+            models_list = list(b.curated.get("openai") or [])
+
+        ep_url_norm = _norm_url(api_url)
+        ep_aliases = {str(alias).lower() for alias in grp["aliases"]}
+        is_current = b.endpoint_is_current(ep_name, ep_aliases, ep_url_norm)
+        discovered, native_catalog_empty, _ = b.discover_endpoint(
+            grp["api_key"], api_url,
+            ep_name if str(ep_name).strip().lower() in {"ollama", "custom:ollama"} else "custom",
+            grp["has_explicit_models"], headers=grp["headers"] or None, api_mode=grp["api_mode"],
+            discovery_allowed=grp["discovery_allowed"], is_current=is_current)
+        if discovered is not None:
+            models_list = discovered
+
+        b.add_endpoint_row(ep_name, display_name, api_url, models_list, is_current, native_catalog_empty)
+        b.seen_slugs.update(ep_aliases)
+        # Record every raw member name so section 4 can match per-model custom_providers rows
+        # even though the group label was collapsed.
+        for raw_name in grp["raw_names"] or [display_name]:
+            if b.record_section3_pair(raw_name, ep_url_norm):
+                b.seen_slugs.add(custom_provider_slug(raw_name).lower())
+        b.record_section3_pair(display_name, ep_url_norm)
+
+def _lap_custom_provider_rows(b: _PickerBuild, custom_providers: list) -> None:
+    """Section 4: ``custom_providers:`` entries (one model each) grouped into one row per
+    (endpoint, credential identity, api_mode, extra_headers, display prefix). Four "Ollama — X"
+    entries on one host become one "Ollama" row; distinct prefixes sharing a proxy URL keep
+    their own rows."""
+    from hermes_cli.model_switch import _extra_headers_from_config, _scoped_key_env
+    from hermes_cli.config import coerce_provider_id
+    groups: dict[tuple, dict] = {}
+    for entry in custom_providers:
+        if not isinstance(entry, dict):
+            continue
+        raw_name = coerce_provider_id(entry.get("name"))
+        api_url = str(_entry_base_url(entry) or "").strip().rstrip("/")
+        if not raw_name or not api_url:
+            continue
+        inline_api_key, key_env, cred_identity = _entry_credentials(entry, "key_env")
+        api_key = inline_api_key or _scoped_key_env(key_env)
+        api_mode = _entry_api_mode(entry)
+        discover = _discover_flag(entry)
+        entry_extra_headers = _extra_headers_from_config(entry)
+        prefix = _display_prefix(raw_name)
+        provider_key = str(entry.get("provider_key") or "").strip()
+        group_key = (api_url, cred_identity, api_mode, tuple(sorted(entry_extra_headers.items())), prefix.lower())
+        display_name = prefix or raw_name
+        grp = groups.setdefault(group_key, {
+            "slug": custom_provider_slug(display_name, provider_key), "name": display_name,
+            "api_url": api_url, "api_key": "", "credential_identity": cred_identity, "models": [], "has_explicit_models": False,
+            "discover_models": True, "api_mode": api_mode, "extra_headers": entry_extra_headers,
+            "aliases": set()})
+        grp["api_key"] = grp["api_key"] or api_key  # first member with a key wins
+        grp["discover_models"] = grp["discover_models"] and discover  # one opt-out pins the whole row
+        grp["aliases"].update(custom_provider_aliases(raw_name, provider_key))
+        # ``model:`` is only the active selection; every configured model lives under ``models:``.
+        _absorb_entry_models(grp, entry, (entry.get("model") or "").strip())
+
+    section4_slugs: set = set()
+    current_url_group_count = sum(
+        1 for grp in groups.values()
+        if b.current_base_url_norm and _norm_url(grp["api_url"]) == b.current_base_url_norm)
+    for grp in groups.values():
+        api_url, api_key, slug = grp["api_url"], grp.get("api_key", ""), grp["slug"]
+        # Slug claimed by a built-in/overlay/providers: row -> skip (don't shadow).
+        if slug.lower() in b.seen_slugs and slug.lower() not in section4_slugs:
+            continue
+        # Two custom endpoints with the same cleaned name: suffix a counter so both stay visible.
+        if slug.lower() in section4_slugs:
+            base_slug, n = slug, 2
+            while f"{base_slug}-{n}".lower() in b.seen_slugs:
+                n += 1
+            slug = f"{base_slug}-{n}"
+            grp["slug"] = slug
+        grp_url_norm = _norm_url(api_url)
+        pair_key = (str(grp["name"]).strip().lower(), grp_url_norm)
+        if pair_key[0] and pair_key[1] and pair_key in b.section3_pairs:
+            continue
+        # A built-in row already represents this endpoint (e.g. "my-dashscope" vs the
+        # alibaba-coding-plan row): keep the built-in, hide the shadow.
+        if grp_url_norm and grp_url_norm in b.builtin_endpoints:
+            continue
+        is_current = b.endpoint_is_current(
+            slug, {str(alias).lower() for alias in grp["aliases"]}, grp_url_norm,
+            url_match_ok=current_url_group_count == 1)
+        discovered, native_catalog_empty, probe_live = b.discover_endpoint(
+            api_key, api_url,
+            "ollama" if "ollama" in {str(slug).strip().lower(), str(grp.get("name") or "").strip().lower()} else "custom",
+            bool(grp.get("has_explicit_models")), headers=grp.get("extra_headers") or None,
+            api_mode=grp.get("api_mode"), discovery_allowed=bool(api_url) and grp.get("discover_models", True),
+            is_current=is_current)
+        if discovered is not None:
+            grp["models"] = discovered
+            if probe_live:  # a successful live probe persists the catalog for no-probe surfaces
+                try:
+                    _save_discovered_models_to_config(
+                        api_url, discovered, api_mode=grp.get("api_mode"), headers=grp.get("extra_headers") or None,
+                        credential_identity=grp["credential_identity"])
+                except Exception:
+                    pass
+        b.add_endpoint_row(slug, grp["name"], grp["api_url"], grp["models"], is_current, native_catalog_empty)
+        section4_slugs.add(slug.lower())

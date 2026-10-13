@@ -60,9 +60,11 @@ def patch(root):
         path.write_text(text)
 
     import runpy
+    runpy.run_path(str(Path(__file__).with_name('patch-custom-models.py')))['patch'](root)
     dashboard = runpy.run_path(str(Path(__file__).with_name('patch-colab-dashboard.py')))
     dashboard['patch'](root)
 
 
 if __name__ == '__main__':
     patch(sys.argv[1])
+
