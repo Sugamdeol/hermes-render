@@ -67,6 +67,8 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 try: await self.gate.wait()
                 finally: self.active -= 1
             async def _start_finish_wiring(self, *args): return True
+            async def _handle_message(self, event): return 'native handler'
+            def _claim_active_session_slot(self, key, source): return None, 'normal capacity guard'
             async def _interrupt_and_clear_session(self, key, *args, **kwargs):
                 self.session_store._entries[key].resume_pending = False
             def _peek_session_state(self, key): return self.states.get(key)
@@ -167,6 +169,109 @@ class NativeRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_render_is_unchanged(self):
         with patch.dict(os.environ, {'HERMES_RUNTIME_PROFILE':'render-lite'}):
             self.assertFalse(self.native.install(type('Render', (), {})))
+
+
+class NativeIngressRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    entry = NativeRecoveryTests.entry
+    event = NativeRecoveryTests.event
+
+    async def asyncSetUp(self):
+        await NativeRecoveryTests.asyncSetUp(self)
+        fixture = load('native_ingress_fixture', 'tests/fixtures/native-recovery-ingress.py')
+        fixture.logger = SimpleNamespace(info=lambda *args:None, debug=lambda *args:None)
+        metrics = ModuleType('hermes_cli.observability.shared_metrics_gateway')
+        metrics.start_reply_clock = lambda *a, **k:None
+        modules = patch.dict(sys.modules, {'hermes_cli.observability.shared_metrics_gateway':metrics})
+        modules.start()
+        self.addCleanup(modules.stop)
+        base = self.Runner
+        # Use the original methods before installing on the subclass again.
+        class Runner(base):
+            _colab_task_recovery_installed = False
+            _handle_message = fixture.NativeIngress._handle_message
+            _run_startup_resume_event = fixture.NativeStartup._run_startup_resume_event
+            async def _hm_admit_event(self, event): return event, event.source, True
+            def _hm_estop_gate(self, *args): return None
+            def _session_key_for_source(self, source): return source.key
+            async def _hm_pending_reply_intercepts(self, *args): return None
+            def _hm_evict_idle_stale_agent(self, key): pass
+            def _hm_evict_reaped_agent(self, key): pass
+            def _is_session_running(self, key):
+                state = self.states.get(key)
+                return bool(state and state.turn.agent is not None)
+            async def _hm_handle_running_session_message(self, event, source, key):
+                self.queued.append(event)
+                return None
+            async def _hm_dispatch_idle_commands(self, *args): return False, None
+            def _hm_rescue_orphaned_fifo(self, *args): return args[:3]
+            def _session_state(self, key): return self.states[key]
+            def _persist_active_agents(self): pass
+            def _begin_session_run_generation(self, key): return 1
+            async def _handle_message_with_agent(self, event, source, key, generation):
+                self.executed.append(key)
+                return {'completed':True}
+            async def _run_post_turn_hooks(self, **kwargs): pass
+            def _restore_pending_one_turn_model_override(self, *args): pass
+            async def _clear_durable_active_turn(self, event): pass
+            def _release_running_agent_state(self, key, **kwargs): self.states.pop(key, None)
+            def _release_turn_lease(self, *args): pass
+
+        # Avoid wrapping inherited already-wrapped hooks twice.
+        for name in ('_mark_durable_active_turn', '_hmwa_persist_turn_transcript', '_resume_pending_candidates', '_start_finish_wiring', '_interrupt_and_clear_session', '_claim_active_session_slot'):
+            method = getattr(base, name)
+            setattr(Runner, name, getattr(method, '__wrapped__', method))
+        self.native.install(Runner)
+        self.runner = Runner()
+        self.runner.queued, self.runner.executed = [], []
+
+    def adapter(self):
+        runner = self.runner
+        class Adapter:
+            _session_tasks = {}
+            async def handle_message(self, event):
+                key = event.source.key
+                self._session_tasks[key] = asyncio.create_task(runner._handle_message(event))
+        return Adapter()
+
+    async def test_real_native_ingress_dispatches_reserved_recovery_instead_of_queueing(self):
+        entry = self.entry()
+        event = self.event(internal=True)
+        event.source = SimpleNamespace(key=entry.session_key)
+        await self.runner._run_startup_resume_event(self.adapter(), event, entry.session_key)
+        self.assertEqual(self.runner.executed, [entry.session_key])
+        self.assertEqual(self.runner.queued, [])
+
+    async def test_baseline_native_ingress_reproduces_the_self_queue_bug(self):
+        entry = self.entry()
+        event = self.event(internal=True)
+        event.source = SimpleNamespace(key=entry.session_key)
+        fixture = load('native_ingress_baseline', 'tests/fixtures/native-recovery-ingress.py')
+        await fixture.NativeStartup._run_startup_resume_event(self.runner, self.adapter(), event, entry.session_key)
+        self.assertEqual(self.runner.executed, [])
+        self.assertEqual(self.runner.queued, [event])
+
+    async def test_normal_message_cannot_borrow_a_recovery_reservation(self):
+        entry = self.entry()
+        real = self.event(internal=True)
+        other = self.event(internal=True)
+        other.source = SimpleNamespace(key=entry.session_key)
+        other.metadata = {'gateway_session_key':entry.session_key}
+        self.runner._colab_resume_claims = {entry.session_key:(real, object(), entry.session_id)}
+        await self.runner._handle_message(other)
+        self.assertEqual(self.runner.executed, [])
+        self.assertEqual(self.runner.queued, [other])
+
+    async def test_stop_during_native_admission_prevents_agent_execution(self):
+        entry = self.entry()
+        event = self.event(internal=True)
+        event.source = SimpleNamespace(key=entry.session_key)
+        async def stop_during_admission(event):
+            entry.resume_pending = False
+            return event, event.source, True
+        self.runner._hm_admit_event = stop_during_admission
+        await self.runner._run_startup_resume_event(self.adapter(), event, entry.session_key)
+        self.assertEqual(self.runner.executed, [])
+
 
 
 class RecoveryPatchTests(unittest.TestCase):
