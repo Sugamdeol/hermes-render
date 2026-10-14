@@ -1,5 +1,6 @@
 """Connect durable task intent to native gateway startup and turn ownership."""
 import asyncio
+from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
 import logging
@@ -8,6 +9,7 @@ import os
 from hermes_cli import render_recovery as journal
 
 LOG = logging.getLogger(__name__)
+_admission = ContextVar('colab_recovery_admission', default=None)
 
 
 def _recover(store):
@@ -35,7 +37,8 @@ def install(runner_class):
         return False
     names = ('_mark_durable_active_turn', '_hmwa_persist_turn_transcript',
              '_resume_pending_candidates', '_run_startup_resume_event',
-             '_start_finish_wiring', '_interrupt_and_clear_session')
+             '_start_finish_wiring', '_interrupt_and_clear_session',
+             '_handle_message', '_claim_active_session_slot')
     missing = [name for name in names if not callable(getattr(runner_class, name, None))]
     if missing:
         raise RuntimeError('Native recovery hooks changed: ' + ', '.join(missing))
@@ -120,9 +123,16 @@ def install(runner_class):
                                 gateway_session_key=session_key)
                 event.metadata = metadata
                 LOG.info('Auto-resuming interrupted chat %s', session_key)
+                claims = getattr(self, '_colab_resume_claims', None)
+                if claims is None:
+                    claims = self._colab_resume_claims = {}
+                claims[session_key] = (event, lease, expected_id)
                 # Native dispatch waits for the actual agent task, not just enqueue.
                 await original['_run_startup_resume_event'](self, adapter, event, session_key)
         finally:
+            claims = getattr(self, '_colab_resume_claims', {})
+            if claims.get(session_key, (None,))[0] is event:
+                claims.pop(session_key, None)
             if lease is not None:
                 lease.release()
             from gateway.run import _AGENT_PENDING_SENTINEL
@@ -152,7 +162,41 @@ def install(runner_class):
             self._retain_background_task(asyncio.create_task(watch(self)))
         return result
 
-    for name, function in zip(names, (mark, persist, candidates, resume, wiring, interrupt)):
+    @wraps(original['_handle_message'])
+    async def handle(self, event):
+        key = (getattr(event, 'metadata', None) or {}).get('gateway_session_key')
+        claim = getattr(self, '_colab_resume_claims', {}).get(key)
+        if claim is None or claim[0] is not event:
+            return await original['_handle_message'](self, event)
+        from gateway.run import _AGENT_PENDING_SENTINEL
+        state = self._peek_session_state(key)
+        if state is None or state.turn.agent is not _AGENT_PENDING_SENTINEL:
+            return None  # Stop/reset or another owner displaced this reservation.
+        # The adapter already owns the event's background task. Hand the
+        # reservation to native ingress so it does not queue behind itself.
+        state.turn.agent = None
+        token = _admission.set((self, key, claim))
+        try:
+            return await original['_handle_message'](self, event)
+        finally:
+            _admission.reset(token)
+
+    @wraps(original['_claim_active_session_slot'])
+    def slot(self, session_key, source):
+        admission = _admission.get()
+        if admission is None or admission[0] is not self or admission[1] != session_key:
+            return original['_claim_active_session_slot'](self, session_key, source)
+        claim = admission[2]
+        with self.session_store._lock:
+            entry = self.session_store._entries.get(session_key)
+            if (entry is None or entry.session_id != claim[2] or entry.suspended
+                    or not entry.resume_pending or journal.is_terminal(session_key)):
+                return None, 'Recovery cancelled because this chat was stopped or reset.'
+        # Capacity was already acquired before dispatch. Queued reservations
+        # are not executing agents and must not reject this admitted recovery.
+        return claim[1], None
+
+    for name, function in zip(names, (mark, persist, candidates, resume, wiring, interrupt, handle, slot)):
         setattr(runner_class, name, function)
     runner_class._colab_task_recovery_installed = True
     return True
