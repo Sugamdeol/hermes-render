@@ -47,6 +47,26 @@ class BusySQLiteBackupTests(unittest.TestCase):
             writer.rollback()
             writer.close()
 
+    def test_live_rollback_journal_is_folded_into_snapshot_and_not_replayed_on_restore(self):
+        writer = sqlite3.connect(self.source)
+        work = self.root/'work'; work.mkdir()
+        data = self.root/'source'; data.mkdir()
+        writer.close()
+        self.source.rename(data/'chrome.db')
+        writer = sqlite3.connect(data/'chrome.db')
+        try:
+            writer.execute('BEGIN EXCLUSIVE')
+            writer.execute("UPDATE state SET value='not committed'")
+            with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.1'}):
+                self.storage.build_worktree(data, work, make_config(self.storage))
+            self.assertFalse((work/'data/chrome.db-journal').exists())
+            restored = self.root/'restored'
+            self.storage.materialize(work, restored, make_config(self.storage))
+            with sqlite3.connect(restored/'chrome.db') as conn:
+                self.assertEqual(conn.execute('SELECT value FROM state').fetchone()[0], 'committed')
+        finally:
+            writer.rollback(); writer.close()
+
     def test_wal_commits_are_included_with_live_writer(self):
         writer = sqlite3.connect(self.source)
         try:

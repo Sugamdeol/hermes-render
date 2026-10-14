@@ -1141,7 +1141,7 @@ def sqlite_files(root: Path, relative_paths) -> tuple[set[str], set[str]]:
         except OSError:
             continue
     for relative in databases:
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             candidate = relative + suffix
             if candidate in paths:
                 sidecars.add(candidate)
@@ -1915,7 +1915,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     if isinstance(recorded_sqlite, list):
         sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
     for relative in sqlite_dbs:
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             if relative + suffix in source_relatives:
                 sqlite_sidecars.add(relative + suffix)
 
@@ -1934,6 +1934,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             # against this restored image.
             Path(str(destination) + "-wal").unlink(missing_ok=True)
             Path(str(destination) + "-shm").unlink(missing_ok=True)
+            Path(str(destination) + "-journal").unlink(missing_ok=True)
             destination.parent.mkdir(parents=True, exist_ok=True)
             with source.open("rb") as handle:
                 prefix = handle.readline(64)
@@ -1969,6 +1970,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             # newly restored snapshot.
             Path(str(destination) + "-wal").unlink(missing_ok=True)
             Path(str(destination) + "-shm").unlink(missing_ok=True)
+            Path(str(destination) + "-journal").unlink(missing_ok=True)
         if payload is None:
             shutil.copyfile(source, destination)
         else:
