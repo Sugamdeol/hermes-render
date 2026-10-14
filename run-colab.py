@@ -169,6 +169,7 @@ def runtime_env(token, key, dashboard_password=None):
         # Render and Docker never set this; see run-local.py and the Dockerfile.
         "HERMES_ALLOW_ROOT_GATEWAY": "1",
         "HERMES_RUNTIME_DEPS_AUTORESTORE": "1",
+        "HERMES_RUNTIME_DEPS_BACKGROUND": os.environ.get("HERMES_RUNTIME_DEPS_BACKGROUND", "1"),
         "HERMES_COLAB_SYSTEM_PYTHON": sys.executable,
         "HERMES_RUNTIME_CACHE_DIR": str(cache_directory()),
         "UV_CACHE_DIR": str(cache_directory()/'uv'),
@@ -438,9 +439,9 @@ def install():
         existing_uid = None
     for command in root_account_plan(existing_uid):
         run(command)
-    cache = Path("/content/hermes-git-cache")
+    cache = SOURCE.parent / "hermes-git-cache"
     cache.mkdir(parents=True, exist_ok=True)
-    run(["chown", "-R", "hermes:hermes", cache])
+    run(["chown", "hermes:hermes", cache])
     cache.chmod(0o700)
     git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     if not SOURCE.exists():
@@ -535,7 +536,9 @@ def install():
         target.parent.mkdir(parents=True, exist_ok=True)
         target.touch()
     DATA.mkdir(parents=True, exist_ok=True)
-    run(["chown", "-R", "hermes:hermes", INSTALL, TOOLS, DATA, "/opt/hermes-python"])
+    # Colab's hermes account is root, so it can read existing files without
+    # recursively touching every tool and session on each adapter update.
+    run(["chown", "hermes:hermes", INSTALL, TOOLS, DATA, "/opt/hermes-python"])
     marker.write_text(revision + "\n")
     (INSTALL / '.colab-native-updater').touch()
     runtime_marker.write_text(key+'\n')
@@ -815,4 +818,5 @@ def main(confirm_switch=False):
 
 if __name__ == "__main__":
     HERMES_COLAB = main()
+
 

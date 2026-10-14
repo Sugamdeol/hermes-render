@@ -58,7 +58,9 @@ fi
 # before we run the patcher. Idempotent — on Free this is the ephemeral
 # directory from the image; paid deployments may mount a disk here.
 mkdir -p "${DATA_DIR}"
-if ! chown -R hermes:hermes "${DATA_DIR}" 2>/dev/null; then
+if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ] && [ "$(id -u hermes)" = "0" ]; then
+  chown hermes:hermes "${DATA_DIR}"
+elif ! chown -R hermes:hermes "${DATA_DIR}" 2>/dev/null; then
   echo "[render-tools] warning: could not chown ${DATA_DIR}; continuing" >&2
 fi
 
@@ -409,12 +411,22 @@ if [ "${GIT_BACKEND}" -eq 1 ]; then
   echo "[render-tools] started git state sync inside diagnostics (delta uploads on change)"
 fi
 
-# Colab restores system apps before accepting Telegram requests.
+# Session restore is complete; extra applications can install alongside startup.
 if [ "${HERMES_RUNTIME_DEPS_AUTORESTORE:-0}" = "1" ] && [ "$(id -u)" = "0" ] \
    && [ -n "${HERMES_COLAB_SYSTEM_PYTHON:-}" ]; then
-  echo "[dependencies] Restoring saved apps and libraries before gateway startup"
-  if ! /opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"; then
-    echo "[dependencies] Some extra apps could not restore; starting Hermes with failure details in dependency status" >&2
+  restore_apps() {
+    if /opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"; then
+      echo "[dependencies] Saved apps and libraries are ready"
+    else
+      echo "[dependencies] Some extra apps could not restore; check dependency status" >&2
+    fi
+  }
+  if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ] && [ "${HERMES_RUNTIME_DEPS_BACKGROUND:-0}" = "1" ]; then
+    echo "[dependencies] Restoring saved apps in background; dashboard and Telegram can start now"
+    restore_apps &
+  else
+    echo "[dependencies] Restoring saved apps and libraries before gateway startup"
+    restore_apps
   fi
   export HERMES_RUNTIME_DEPS_RESTORED=1
 fi
@@ -456,4 +468,5 @@ if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
   exec "$@"
 fi
 exec /opt/hermes/docker/entrypoint.sh "$@"
+
 

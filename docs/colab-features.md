@@ -102,3 +102,13 @@ Colab applies `patch-custom-models.py` during installation and on every startup,
 Saving a manual list clears the old `models_discovered` ownership flag in both schemas, preserving per-model metadata and preventing automatic refreshes from replacing that list. Internal legacy catalog markers are omitted from the provider editor. The chat workspace can list up to all 500 IDs accepted by the provider editor, instead of stopping at 100.
 
 After applying this update through the launcher, re-save any custom IDs already lost to a prior discovery refresh. Provider endpoints and keys are retained. Showing a custom ID does not guarantee the API account supports it.
+
+## Faster Colab startup
+
+The launcher avoids recursive ownership changes across restored tools and sessions because Colab runs Hermes as root. Chunked restore stages only large files, reads ordinary files directly from the verified Git clone, and still checks every chunk before writing live data.
+
+On a relaunch in the same VM, restore can reuse local state only when its saved checkpoint matches the current GitHub revision, the local metadata fingerprint, and SQLite content hashes. Remote changes, local edits, a missing checkpoint, or a different repository require the normal restore. Backup writer fencing still runs before reuse. A fresh Colab VM still downloads and restores private state before the gateway starts.
+
+Saved extra applications and libraries install in the background by default on Colab, so their downloads do not hold dashboard and Telegram startup. Core Hermes dependencies and Node/npm repair remain on the startup path. Tools requiring extra apps may be unavailable until `/opt/data/.runtime-dependencies-status.json` reports `ready: true`; installer failures remain in that file and the startup log. Set `os.environ['HERMES_RUNTIME_DEPS_BACKGROUND'] = '0'` before the Start cell to wait for extras instead. Render retains its existing blocking behavior.
+
+Package inventory queries are batched, and successful Playwright system dependency installs are remembered outside the backup for the current VM. A fresh VM still installs those libraries, and a missing browser executable triggers repair. Startup time still depends on GitHub transfer speed and the size of the backup; no fixed startup duration is promised.

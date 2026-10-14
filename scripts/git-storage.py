@@ -1473,14 +1473,14 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
     root = workdir / DATA_SUBDIR
     with tempfile.TemporaryDirectory(prefix="hermes-restore-") as temporary:
         assembled = Path(temporary) / DATA_SUBDIR
-        # Hard links preserve modes without copying ordinary files into RAM or disk twice.
-        shutil.copytree(root, assembled, copy_function=os.link,
-                        ignore=lambda directory, names: [CHUNK_DIRECTORY] if Path(directory) == root else [])
+        # Only chunked files need staging. Read ordinary files directly from
+        # the clone instead of creating another 100,000-file directory tree.
+        assembled.mkdir(parents=True)
         for relative, record in records.items():
             if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in PurePosixPath(relative).parts or PurePosixPath(relative).parts[0] == CHUNK_DIRECTORY:
                 raise GitStateError("Unsafe large-file restore path")
             destination = assembled / relative
-            if destination.exists() or not isinstance(record, dict):
+            if (root / relative).exists() or destination.exists() or not isinstance(record, dict):
                 raise GitStateError("Conflicting large-file restore entry")
             parts = record.get("parts")
             if not isinstance(parts, list) or not parts:
@@ -1503,7 +1503,7 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
                 raise GitStateError("Backup chunk integrity verification failed")
             os.chmod(destination, int(record.get("mode", 0o644)) & 0o777)
         # Verify all chunks before touching live state, then use the existing decryption path.
-        return _materialize_tree(workdir, data_dir, config, source_root=assembled)
+        return _materialize_tree(workdir, data_dir, config, extra_root=assembled)
 
 
 def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
@@ -1695,7 +1695,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
     return manifest
 
 
-def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None) -> int:
+def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
     Existing local files are overwritten, but local files absent from the repo
@@ -1711,9 +1711,24 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     if not isinstance(recorded_modes, dict):
         recorded_modes = {}
 
-    source_files = [source for source in source_root.rglob("*") if source.is_file()]
-    source_relatives = [source.relative_to(source_root).as_posix() for source in source_files]
+    source_files = []
+    for directory, dirs, files in os.walk(source_root):
+        if Path(directory) == source_root:
+            dirs[:] = [name for name in dirs if name != CHUNK_DIRECTORY]
+        source_files.extend(Path(directory) / name for name in files
+                            if (Path(directory) / name).is_file())
+    relative_paths = {source: source.relative_to(source_root).as_posix() for source in source_files}
+    if extra_root is not None:
+        for source in extra_root.rglob("*"):
+            if source.is_file():
+                source_files.append(source)
+                relative_paths[source] = source.relative_to(extra_root).as_posix()
+    source_relatives = list(relative_paths.values())
     sqlite_dbs, sqlite_sidecars = sqlite_files(source_root, source_relatives)
+    if extra_root is not None:
+        extra_dbs, extra_sidecars = sqlite_files(extra_root, source_relatives)
+        sqlite_dbs.update(extra_dbs)
+        sqlite_sidecars.update(extra_sidecars)
     recorded_sqlite = manifest.get("sqlite_snapshots", [])
     if isinstance(recorded_sqlite, list):
         sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
@@ -1724,7 +1739,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
 
     restored = 0
     for source in sorted(source_files):
-        relative = source.relative_to(source_root).as_posix()
+        relative = relative_paths[source]
         if relative in sqlite_sidecars:
             continue
         logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if relative.endswith(ENCRYPTED_SUFFIX) else relative
@@ -2123,9 +2138,21 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     return True
 
 
+def local_restore_is_current(data_dir: Path, config: GitConfig, remote_sha: str) -> bool:
+    if os.environ.get('HERMES_RUNTIME_PROFILE') != 'colab-full':
+        return False
+    base = _read_sync_base(config)
+    if not remote_sha or not base or base.get('remote_sha') != remote_sha:
+        return False
+    if base.get('local_fingerprint') != state_fingerprint(data_dir):
+        return False
+    return base.get('sqlite_hashes') == _sqlite_fingerprints(data_dir)
+
+
 def restore(data_dir: Path, config: GitConfig) -> bool:
     try:
         workdir = ensure_clone(config)
+        reuse_local = local_restore_is_current(data_dir, config, head_commit(workdir, config))
         if (os.environ.get('GIT_STATE_FENCE_ON_RESTORE', '0') == '1'
                 and not (config.failover and config.role == ROLE_STANDBY)
                 and remote_has_data(workdir)):
@@ -2140,6 +2167,11 @@ def restore(data_dir: Path, config: GitConfig) -> bool:
     except GitStateError as exc:
         LOG.warning("git state restore unavailable: %s", redact(str(exc)))
         return False
+    if reuse_local:
+        _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+                         _sqlite_fingerprints(data_dir))
+        LOG.info('Verified local state already matches GitHub; skipping repeat restore')
+        return True
     restored = materialize(workdir, data_dir, config)
     _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
                      _sqlite_fingerprints(data_dir))
@@ -2672,4 +2704,5 @@ def main(argv: "list[str] | None" = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
