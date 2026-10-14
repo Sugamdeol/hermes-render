@@ -83,6 +83,8 @@ class Transaction:
                 saved = self.folder/backup
                 if not saved.is_file():
                     raise RuntimeError('Incomplete snapshot rollback journal; refusing to publish')
+                if path.is_dir():
+                    shutil.rmtree(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(saved, path)
         if (self.folder/'mode').exists() and (self.folder/'mode').read_text() == 'new-tree' and self.target.exists():
@@ -107,12 +109,27 @@ class Transaction:
         self.records[name] = backup
 
     def write(self, path, writer):
+        parent = path.parent
+        while parent != self.work and parent.is_relative_to(self.work):
+            if parent.is_file():
+                self.remove(parent)
+            parent = parent.parent
+        if path.is_dir():
+            for root, dirs, files in os.walk(path, topdown=False):
+                for name in files:
+                    self.remove(Path(root)/name)
+                for name in dirs:
+                    (Path(root)/name).rmdir()
+            path.rmdir()
         self.remember(path)
         atomic(path, writer)
 
     def remove(self, path):
         self.remember(path)
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except NotADirectoryError:
+            pass  # A former parent directory is now a regular file.
 
     def finish(self, ok):
         self.index.close()
@@ -181,7 +198,7 @@ def affected_plan(data, changes, inventory, manifest, g):
         path = data/name
         try:
             info = path.lstat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             info = None
         prefix = name+'/'
         # Existing regular files are dictionary lookups, not whole-tree scans.
@@ -232,7 +249,7 @@ def affected_plan(data, changes, inventory, manifest, g):
             with os.scandir(path) as entries:
                 populated = any(not g['is_excluded'](entry.path[len(str(data))+1:])
                                 for entry in entries)
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             empty.discard(name); continue
         if populated: empty.discard(name)
         else: empty.add(name)
@@ -377,6 +394,8 @@ def build_snapshot(data, work, config, g, changes=None):
                 raise g['GitStateError']('Cannot snapshot '+name+'; previous backup retained: '+g['redact'](str(error))) from error
         new_physical = physical_paths(representations, large)
         for name in old_physical-new_physical:
+            if (target/name).is_dir():
+                continue  # A former file is now the parent of new snapshot files.
             transaction.remove(target/name)
             parent = (target/name).parent
             while parent != target:

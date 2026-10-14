@@ -46,6 +46,15 @@ class ChangedPathTests(unittest.TestCase):
         self.assertEqual((self.work/'data/renamed/nested/chat').read_text(),'saved')
         shutil.rmtree(self.data/'renamed'); (self.data/'empty').mkdir(); result=self.save(['renamed','empty'])
         self.assertEqual(result['files'],0); self.assertIn('empty',result['empty_dirs'])
+    def test_directory_replaced_by_file_handles_late_child_events(self):
+        self.put('folder/nested/chat'); self.save()
+        shutil.rmtree(self.data/'folder'); self.put('folder','now a file')
+        self.save(['folder', 'folder/nested/chat'])
+        self.assertEqual((self.work/'data/folder').read_text(), 'now a file')
+        (self.data/'folder').unlink(); self.put('folder/nested/chat', 'back to a directory')
+        self.save(['folder', 'folder/nested/chat'])
+        self.assertEqual((self.work/'data/folder/nested/chat').read_text(), 'back to a directory')
+
     def test_wal_write_snapshots_database_without_waiting_for_connection_close(self):
         db=sqlite3.connect(self.data/'state.db'); self.addCleanup(db.close)
         db.execute('PRAGMA journal_mode=WAL'); db.execute('CREATE TABLE chat (text)'); db.commit(); self.save()
