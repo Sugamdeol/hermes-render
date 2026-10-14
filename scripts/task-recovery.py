@@ -68,7 +68,8 @@ def _event_metadata(event):
     raw = getattr(event, '__dict__', {})
     if not isinstance(raw, dict):
         return {}
-    ignored = {'text', 'source', 'internal', 'message_type'}
+    ignored = {'text', 'source', 'internal', 'message_type',
+               '_gateway_active_turn_session_key', '_gateway_active_turn_token'}
     return {
         key: value for key, item in raw.items()
         if key not in ignored and (value := _json_value(item)) is not None
