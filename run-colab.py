@@ -542,6 +542,7 @@ def install_runtime(revision):
     INSTALL.mkdir(parents=True, exist_ok=True)
     # Runtime files belong to hermes; the root installer still needs to
     # update this one known checkout on subsequent runs.
+    git_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     git = ["git", "-c", f"safe.directory={INSTALL}"]
     if not (INSTALL / ".git").exists():
         run([*git, "init", "."], cwd=INSTALL)
