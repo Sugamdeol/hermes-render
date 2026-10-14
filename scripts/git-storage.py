@@ -195,6 +195,13 @@ def is_excluded(relative: str, excludes: "tuple[str, ...]" = DEFAULT_EXCLUDES) -
     without pulling in a dependency.
     """
     parts = [part for part in relative.replace("\\", "/").split("/") if part not in ("", ".")]
+    if excludes == DEFAULT_EXCLUDES and os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
+        # Only known runtime churn is disposable. Project files, installed
+        # tools and nested dependency trees are part of a complete Colab home.
+        return bool(parts and (parts[0] == 'logs'
+                    or parts[:2] in (['.cache', 'pip'], ['.cache', 'uv'], ['.cache', 'npm'])
+                    or relative in ('gateway.log', 'gateway.log.1')
+                    or any(part == '__pycache__' or part.endswith('.pyc') for part in parts)))
     bundled_npm = (len(parts) >= 4 and parts[0] == 'tools'
                    and re.fullmatch(r'node-v?\d+\.\d+\.\d+-linux-(?:x64|arm64)', parts[1])
                    and parts[2:4] == ['lib', 'node_modules']
@@ -445,6 +452,7 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
                        else DEFAULT_HTTP_LOW_SPEED_LIMIT)
     low_speed_time = (config.http_low_speed_time if config
                       else DEFAULT_HTTP_LOW_SPEED_TIME)
+    colab = os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full'
     base = [
         "git",
         "-c", "user.name=hermes-state",
@@ -453,14 +461,14 @@ def run_git(args: "list[str]", cwd: "Path | None" = None, check: bool = True,
         "-c", "core.compression=1",
         "-c", "core.trustctime=false",
         "-c", "gc.auto=0",
-        "-c", "pack.threads=1",
-        "-c", "pack.windowMemory=4m",
-        "-c", "pack.window=0",
-        "-c", "core.bigFileThreshold=1m",
-        "-c", "pack.deltaCacheSize=4m",
-        "-c", "core.deltaBaseCacheLimit=4m",
-        "-c", "core.packedGitWindowSize=4m",
-        "-c", "core.packedGitLimit=32m",
+        "-c", ("pack.threads=4" if colab else "pack.threads=1"),
+        "-c", ("pack.windowMemory=128m" if colab else "pack.windowMemory=4m"),
+        "-c", ("pack.window=10" if colab else "pack.window=0"),
+        "-c", ("core.bigFileThreshold=50m" if colab else "core.bigFileThreshold=1m"),
+        "-c", ("pack.deltaCacheSize=64m" if colab else "pack.deltaCacheSize=4m"),
+        "-c", ("core.deltaBaseCacheLimit=128m" if colab else "core.deltaBaseCacheLimit=4m"),
+        "-c", ("core.packedGitWindowSize=32m" if colab else "core.packedGitWindowSize=4m"),
+        "-c", ("core.packedGitLimit=512m" if colab else "core.packedGitLimit=32m"),
         # Transport tuning for the large pushes this backend makes. See
         # DEFAULT_HTTP_POST_BUFFER_BYTES: without it git chunks the request
         # body and GitHub's front end answers "RPC failed; HTTP 408".
@@ -878,8 +886,20 @@ def _read_sync_base(config: GitConfig) -> dict | None:
     return value
 
 
+def local_tree_identity(data_dir: Path) -> list:
+    info = data_dir.stat()
+    return [str(data_dir.resolve()), info.st_dev, info.st_ino]
+
+
+def runtime_boot_id() -> str:
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    except OSError:
+        return ''
+
+
 def _write_sync_base(config: GitConfig, remote_sha: str, local_fingerprint: str,
-                     sqlite_hashes: dict[str, str] | None = None) -> None:
+                     sqlite_hashes: dict[str, str] | None = None, *, data_dir: Path | None = None) -> None:
     """Atomically record which remote revision this local tree came from."""
     path = _sync_base_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -889,7 +909,9 @@ def _write_sync_base(config: GitConfig, remote_sha: str, local_fingerprint: str,
             json.dump({"repo": config.api_repo, "remote": _remote_identity(config),
                        "branch": config.branch,
                        "remote_sha": remote_sha, "local_fingerprint": local_fingerprint,
-                       "sqlite_hashes": sqlite_hashes or {}}, handle)
+                       "sqlite_hashes": sqlite_hashes or {},
+                       "boot_id": runtime_boot_id(),
+                       "local_identity": local_tree_identity(data_dir) if data_dir else None}, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
@@ -989,10 +1011,9 @@ def safe_symlink_target(link: Path, data_dir: Path) -> "str | None":
 
     A symlink is data -- dropping one silently changes what a restored
     instance points at -- but it is also the one kind of entry that can name a
-    path outside the tree. So only a *relative* target that resolves inside the
-    data directory is carried; an absolute target or one that climbs out with
-    ``..`` is dropped, because restoring it would be a way to write outside the
-    restored tree.
+    path outside the tree. Targets must resolve inside the data directory.
+    Absolute links inside the home are made relative so they also work when
+    the backup is restored at another location.
     """
     try:
         raw = os.readlink(link)
@@ -1000,7 +1021,8 @@ def safe_symlink_target(link: Path, data_dir: Path) -> "str | None":
         return None
     candidate = PurePosixPath(raw)
     if candidate.is_absolute():
-        return None
+        raw = os.path.relpath(raw, link.parent)
+        candidate = PurePosixPath(raw)
     try:
         # Non-strict: a dangling link is still a link worth restoring.
         resolved = (link.parent / candidate).resolve()
@@ -1035,7 +1057,10 @@ def plan_tree(data_dir: Path,
     files: list[str] = []
     kept_dirs: list[str] = []
     symlinks: dict[str, str] = {}
-    for root, dirs, filenames in os.walk(data_dir, topdown=True, followlinks=False):
+    def unreadable(error):
+        raise GitStateError(f'Cannot scan backup source: {redact(str(error))}; snapshot not published')
+
+    for root, dirs, filenames in os.walk(data_dir, topdown=True, followlinks=False, onerror=unreadable):
         root_path = Path(root)
         keep: list[str] = []
         for name in sorted(dirs):
@@ -1075,9 +1100,12 @@ def plan_tree(data_dir: Path,
                     continue
                 symlinks[relative] = target
                 continue
-            if not path.is_file():
-                continue
-            files.append(relative)
+            try:
+                regular = stat.S_ISREG(path.stat().st_mode)
+            except OSError as exc:
+                raise GitStateError(f'Cannot inspect {relative}; snapshot not published: {redact(str(exc))}') from exc
+            if regular:
+                files.append(relative)
 
     populated: set[str] = set()
     for relative in files:
@@ -1506,7 +1534,40 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
         return _materialize_tree(workdir, data_dir, config, extra_root=assembled)
 
 
-def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
+def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
+    """Publish a complete local snapshot, retaining the old tree on failure."""
+    cache_root = workdir / '.git' if (workdir / '.git').is_dir() else workdir
+    previous = cache_root / 'hermes-state-data-previous'
+    target = workdir / DATA_SUBDIR
+    # A killed snapshot builder leaves its last complete tree here.
+    if previous.exists():
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(previous, target)
+    metadata = (workdir / MANIFEST_NAME, cache_root / 'hermes-source-signatures.json')
+    saved = {path: path.read_bytes() if path.exists() else None for path in metadata}
+    try:
+        result = _build_worktree(data_dir, workdir, config)
+    except BaseException:
+        if previous.exists():
+            if target.exists():
+                shutil.rmtree(target)
+            os.replace(previous, target)
+        else:
+            if target.exists():
+                shutil.rmtree(target)
+        for path, payload in saved.items():
+            if payload is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(payload)
+        raise
+    if previous.exists():
+        shutil.rmtree(previous)
+    return result
+
+
+def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     """Rebuild <workdir>/data from data_dir. Returns a manifest dict.
 
     The tree is rebuilt rather than patched so that files deleted locally
@@ -1560,12 +1621,12 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
         if relative in SENSITIVE_FILES:
             try:
                 payload = source.read_bytes()
-            except OSError:
-                continue
+            except OSError as exc:
+                raise GitStateError(f'Cannot read {relative}; snapshot not published: {redact(str(exc))}') from exc
             payload, disposition = _prepare_sensitive(payload, config)
             if disposition == ENV_MODE_OMIT:
-                # Either the operator asked for omit, or encrypt was asked for
-                # and age could not seal it. Neither falls back to plaintext.
+                if config.env_mode == ENV_MODE_ENCRYPT:
+                    raise GitStateError(f'Cannot encrypt {relative}; retaining the previous backup')
                 skipped.append(relative)
                 LOG.warning(
                     "%s left OUT of the git backup (GIT_STATE_ENV_MODE=%s%s). "
@@ -1653,8 +1714,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
             else:
                 shutil.copy2(source, destination)
             next_signatures[relative] = signature
-        except OSError:
-            continue
+        except OSError as exc:
+            raise GitStateError(f'Cannot snapshot {relative}; retaining the previous backup: {redact(str(exc))}') from exc
         if mode not in (0o644, 0o755):
             # git records only the executable bit, so every other mode has to
             # travel in the manifest -- otherwise a 0600 key comes back from a
@@ -1664,9 +1725,6 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> "dict":
 
     _warn_plaintext_env(plaintext_env, config)
     config._sqlite_hashes = sqlite_hashes
-    if previous_target.exists():
-        shutil.rmtree(previous_target, ignore_errors=True)
-
     large_files = split_large_blobs(target, reused_large)
     LOG.info("snapshot ready: %d files, %d unchanged files reused", copied, reused_files)
     manifest = {
@@ -1776,10 +1834,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             relative = relative[: -len(ENCRYPTED_SUFFIX)]
             opened = age_decrypt(payload, config)
             if opened is None:
-                LOG.warning(
-                    "could not decrypt %s; skipping (is SOPS_AGE_KEY set?)", relative
-                )
-                continue
+                raise GitStateError(f'Could not decrypt {relative}; restore is incomplete and backup remains blocked')
             payload = opened
         destination = data_dir / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1823,10 +1878,11 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             (data_dir / relative).mkdir(parents=True, exist_ok=True)
             restored += 1
         except OSError as exc:
-            LOG.warning("could not restore directory %s: %s", relative, exc)
+            raise GitStateError(f'Could not restore directory {relative}: {redact(str(exc))}') from exc
     for relative, target in (manifest.get("symlinks") or {}).items():
-        if restore_symlink(data_dir, relative, target):
-            restored += 1
+        if not restore_symlink(data_dir, relative, target):
+            raise GitStateError(f'Could not restore symlink {relative}; restore is incomplete')
+        restored += 1
     return restored
 
 
@@ -2092,8 +2148,10 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
 
     saved_manifest = run_git(["show", f"HEAD:{MANIFEST_NAME}"], cwd=workdir, check=False, config=config)
     previous_files = 0
+    prior_manifest = {}
     if saved_manifest.returncode == 0:
-        previous_files = int(json.loads(saved_manifest.stdout).get("files", 0) or 0)
+        prior_manifest = json.loads(saved_manifest.stdout)
+        previous_files = int(prior_manifest.get("files", 0) or 0)
     capture_runtime_secrets(data_dir, config)
     manifest = build_worktree(data_dir, workdir, config)
     reject_destructive_shrink(previous_files, int(manifest["files"]))
@@ -2105,12 +2163,15 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     # exactly the bandwidth waste this backend exists to avoid.
     status = run_git(["status", "--porcelain", "--", DATA_SUBDIR],
                      cwd=workdir, config=config)
-    if not status.stdout.strip() and not force:
+    metadata_keys = ('large_files', 'encrypted', 'omitted', 'plaintext_env',
+                     'empty_dirs', 'symlinks', 'sqlite_snapshots', 'modes')
+    metadata_changed = any(prior_manifest.get(key) != manifest.get(key) for key in metadata_keys)
+    if not status.stdout.strip() and not metadata_changed and not force:
         LOG.debug("state unchanged; nothing to commit")
         run_git(["checkout", "HEAD", "--", MANIFEST_NAME], cwd=workdir,
                 check=False, config=config)
         _write_sync_base(config, remote_sha, state_fingerprint(data_dir),
-                         getattr(config, "_sqlite_hashes", {}))
+                         getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
         return True
 
     message = (
@@ -2124,7 +2185,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     if should_compact(manifest.get("generation", 0), config.max_commits):
         compact_history(workdir, config, expected_remote=remote_sha)
         _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
-                         getattr(config, "_sqlite_hashes", {}))
+                         getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
         return True
 
     # The remote may have advanced from another writer. Never replace that
@@ -2133,7 +2194,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     # whether a response-lost push reached our exact commit.
     push_branch(workdir, config)
     _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
-                     getattr(config, "_sqlite_hashes", {}))
+                     getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
     LOG.info("pushed state: %s", message)
     return True
 
@@ -2150,9 +2211,18 @@ def local_restore_is_current(data_dir: Path, config: GitConfig, remote_sha: str)
 
 
 def restore(data_dir: Path, config: GitConfig) -> bool:
+    data_dir.mkdir(parents=True, exist_ok=True)
     try:
         workdir = ensure_clone(config)
-        reuse_local = local_restore_is_current(data_dir, config, head_commit(workdir, config))
+        remote_sha = head_commit(workdir, config)
+        base = _read_sync_base(config)
+        boot_id = runtime_boot_id()
+        same_vm = (os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full'
+                   and data_dir.is_dir()
+                   and base and boot_id and base.get('boot_id') == boot_id
+                   and base.get('local_identity') == local_tree_identity(data_dir)
+                   and base.get('remote_sha') == remote_sha)
+        reuse_local = bool(same_vm) or local_restore_is_current(data_dir, config, remote_sha)
         if (os.environ.get('GIT_STATE_FENCE_ON_RESTORE', '0') == '1'
                 and not (config.failover and config.role == ROLE_STANDBY)
                 and remote_has_data(workdir)):
@@ -2168,13 +2238,19 @@ def restore(data_dir: Path, config: GitConfig) -> bool:
         LOG.warning("git state restore unavailable: %s", redact(str(exc)))
         return False
     if reuse_local:
-        _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
-                         _sqlite_fingerprints(data_dir))
-        LOG.info('Verified local state already matches GitHub; skipping repeat restore')
+        # These hashes describe the remote snapshot, not unsaved local edits.
+        # Replacing them with current DB hashes could reuse stale ciphertext.
+        _write_sync_base(config, head_commit(workdir, config),
+                         base['local_fingerprint'] if same_vm else state_fingerprint(data_dir),
+                         base.get('sqlite_hashes', {}) if same_vm else _sqlite_fingerprints(data_dir),
+                         data_dir=data_dir)
+        LOG.info('Retaining local state from this VM; skipping repeat restore and preserving unsynced changes')
         return True
+    # A partial restore must never leave permission to publish this tree.
+    _sync_base_path(config).unlink(missing_ok=True)
     restored = materialize(workdir, data_dir, config)
     _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
-                     _sqlite_fingerprints(data_dir))
+                     _sqlite_fingerprints(data_dir), data_dir=data_dir)
     LOG.info("restored %d file(s) from %s@%s", restored, config.api_repo, config.branch)
     return restored > 0
 
@@ -2655,7 +2731,7 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("restore", "sync", "seed", "state", "daemon", "role", "release"),
+        choices=("restore", "sync", "seed", "state", "daemon", "role", "release", "prefetch"),
     )
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args(argv)
@@ -2672,6 +2748,10 @@ def main(argv: "list[str] | None" = None) -> int:
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if args.command == "prefetch":
+            ensure_clone(config)
+            LOG.info('Private state download is ready for restore')
+            return 0
         if args.command == "role":
             print(current_role(config))
             return 0
