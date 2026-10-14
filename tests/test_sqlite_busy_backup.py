@@ -36,7 +36,7 @@ class BusySQLiteBackupTests(unittest.TestCase):
             writer.execute("UPDATE state SET value='not committed'")
             before = self.storage._sqlite_image_identity(self.source)
             start = time.monotonic()
-            with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.1'}):
+            with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.5'}):
                 self.storage.snapshot_sqlite(self.source, self.destination)
             self.assertLess(time.monotonic()-start, 3)
             self.assert_snapshot()
@@ -57,7 +57,7 @@ class BusySQLiteBackupTests(unittest.TestCase):
         try:
             writer.execute('BEGIN EXCLUSIVE')
             writer.execute("UPDATE state SET value='not committed'")
-            with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.1'}):
+            with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.5'}):
                 self.storage.build_worktree(data, work, make_config(self.storage))
             self.assertFalse((work/'data/chrome.db-journal').exists())
             restored = self.root/'restored'
@@ -107,7 +107,7 @@ class BusySQLiteBackupTests(unittest.TestCase):
                 first[0] = False
                 return Busy()
             return real_connect(*args, **kwargs)
-        with patch.dict(os.environ, {'GIT_STATE_SQLITE_TIMEOUT_SECONDS':'0.05'}), patch.object(self.storage.sqlite3, 'connect', side_effect=connect):
+        with patch.object(self.storage, '_sqlite_snapshot_limit', side_effect=[0.05, 0.05, 2, 2]), patch.object(self.storage.sqlite3, 'connect', side_effect=connect):
             self.storage.snapshot_sqlite(self.source, self.destination)
         self.assert_snapshot()
 

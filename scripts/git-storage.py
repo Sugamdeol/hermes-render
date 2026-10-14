@@ -1196,8 +1196,11 @@ def _snapshot_sqlite_connection(source: Path, destination: Path, *, offline=Fals
         source_db = sqlite3.connect(location, uri=not offline, timeout=min(1, _sqlite_snapshot_limit()))
         # Pin one read view: WAL writers can continue without restarting the
         # backup on every new message. An exclusive browser lock fails quickly.
-        source_db.execute('BEGIN')
+        if not offline:
+            source_db.execute('BEGIN')
         source_db.execute('SELECT count(*) FROM sqlite_schema').fetchone()
+        # The offline image has no writer. Keep recovery in autocommit mode
+        # so a recovered hot journal cannot hold a write transaction during backup.
         if offline:
             if [row[0] for row in source_db.execute('PRAGMA quick_check')] != ['ok']:
                 raise GitStateError('Copied SQLite image failed integrity validation')
