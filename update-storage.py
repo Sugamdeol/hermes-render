@@ -142,6 +142,13 @@ def main(agent):
     workdir = Path(env.get('GIT_STATE_WORKDIR', '/content/hermes-git-cache/state')).resolve()
     attach_stop(agent)
     wait_for_old_worker(pid, started, workdir)
+    repair = subprocess.run(
+        ['/opt/hermes/.venv/bin/python', str(TOOLS/'git-storage.py'), 'repair-enc', env.get('HERMES_HOME', '/opt/data')],
+        env=env, capture_output=True, text=True)
+    if repair.stdout or repair.stderr:
+        print((repair.stdout + repair.stderr).strip())
+    if repair.returncode:
+        raise RuntimeError('Missing .enc file recovery failed; local data was retained. Inspect the message above.')
     # Existing apps were already restored; keep recipe capture without reinstalling.
     env['HERMES_RUNTIME_DEPS_RESTORED'] = '1'
     with LOG.open('a') as log:
