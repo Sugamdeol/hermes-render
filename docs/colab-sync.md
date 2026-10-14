@@ -25,3 +25,9 @@ exec(urllib.request.urlopen(
 The updater validates the running backup process, installs scripts from one immutable main revision, waits for the old uploader and its Git children to finish, and starts the replacement worker. It never runs restore, resets the state repository, or restarts Telegram, the dashboard or the tunnel. It also keeps the replacement worker attached to `HERMES_COLAB.stop()` and runs `HERMES_COLAB.backup()` for confirmation. If saving fails, keep Colab running and retry `HERMES_COLAB.backup()` after correcting the reported cause.
 
 The automatically updated Start cell picks up startup improvements on the next launch. Files that never reached GitHub and are already gone from the VM cannot be recovered by changing backup rules.
+
+## Active browser databases
+
+SQLite snapshots pin a read transaction and have a bounded progress deadline (10 seconds by default, configurable with `GIT_STATE_SQLITE_TIMEOUT_SECONDS`). If a browser holds an exclusive lock, the worker captures a stable database plus WAL/rollback journal, checks that their metadata did not change during copying, validates the temporary image, and snapshots that copy. No live browser connection is closed or modified. An unstable image, failed integrity check or external multi-database super-journal retains the previous backup and reports the reason.
+
+Encryption is identified from the manifest, with header-based compatibility for legacy backups. A filename ending in `.enc` alone is not evidence of backup encryption. Tcl encoding tables and user-owned encrypted artifacts keep their filenames and bytes. The running updater recovers missing ordinary `.enc` files from the local current/previous backup trees without replacing existing live files, then restarts only the uploader and confirms a save.

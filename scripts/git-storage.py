@@ -1141,42 +1141,122 @@ def sqlite_files(root: Path, relative_paths) -> tuple[set[str], set[str]]:
         except OSError:
             continue
     for relative in databases:
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             candidate = relative + suffix
             if candidate in paths:
                 sidecars.add(candidate)
     return databases, sidecars
 
 
-def snapshot_sqlite(source: Path, destination: Path) -> None:
-    """Create a transactionally consistent, bounded-memory SQLite snapshot."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=destination.parent, prefix=f".{destination.name}.", suffix=".snapshot"
-    )
-    os.close(fd)
-    temporary = Path(temporary_name)
+class SQLiteSnapshotTimeout(GitStateError):
+    pass
+
+
+def _sqlite_snapshot_limit() -> float:
+    try:
+        value = float(os.environ.get('GIT_STATE_SQLITE_TIMEOUT_SECONDS', '10'))
+        return max(0.05, min(value, 300)) if value == value else 10
+    except ValueError:
+        return 10
+
+
+def _snapshot_sqlite_connection(source: Path, destination: Path, *, offline=False) -> None:
+    deadline = time.monotonic() + _sqlite_snapshot_limit()
     source_db = target_db = None
     try:
-        source_uri = source.resolve().as_uri() + "?mode=ro"
-        source_db = sqlite3.connect(source_uri, uri=True, timeout=10)
-        target_db = sqlite3.connect(str(temporary), timeout=10)
-        source_db.backup(target_db, pages=128, sleep=0.05)
-        target_db.close()
-        target_db = None
-        source_db.close()
-        source_db = None
-        os.replace(temporary, destination)
-    except Exception as exc:
+        location = str(source) if offline else source.resolve().as_uri() + '?mode=ro'
+        source_db = sqlite3.connect(location, uri=not offline, timeout=min(1, _sqlite_snapshot_limit()))
+        # Pin one read view: WAL writers can continue without restarting the
+        # backup on every new message. An exclusive browser lock fails quickly.
+        source_db.execute('BEGIN')
+        source_db.execute('SELECT count(*) FROM sqlite_schema').fetchone()
+        if offline:
+            if [row[0] for row in source_db.execute('PRAGMA quick_check')] != ['ok']:
+                raise GitStateError('Copied SQLite image failed integrity validation')
+        target_db = sqlite3.connect(str(destination), timeout=1)
+        def progress(status, remaining, total):
+            if time.monotonic() >= deadline:
+                raise SQLiteSnapshotTimeout('SQLite snapshot exceeded its deadline')
+        source_db.backup(target_db, pages=128, sleep=0.05, progress=progress)
+    finally:
         if target_db is not None:
             target_db.close()
         if source_db is not None:
             source_db.close()
-        temporary.unlink(missing_ok=True)
-        raise GitStateError(
-            f"could not create a consistent SQLite snapshot of {source.name}: "
-            f"{type(exc).__name__}"
-        ) from exc
+
+
+def _sqlite_image_identity(source: Path) -> dict:
+    result = {}
+    for suffix in ('', '-wal', '-journal'):
+        path = Path(str(source) + suffix)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if not suffix:
+                raise
+            result[suffix] = None
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            raise GitStateError('SQLite image contains a non-regular database or sidecar')
+        result[suffix] = (info.st_dev, info.st_ino, info.st_size,
+                          info.st_mtime_ns, info.st_ctime_ns)
+    return result
+
+
+def _validate_copied_sqlite_journal(image: Path) -> None:
+    journal = Path(str(image) + '-journal')
+    if not journal.exists() or journal.stat().st_size < 16:
+        return
+    with journal.open('rb') as handle:
+        handle.seek(-16, os.SEEK_END)
+        footer = handle.read(16)
+    # SQLite pager.c readSuperJournal: recovery may follow this external path.
+    # Refuse attached multi-DB transactions instead of touching a live journal.
+    if footer[8:] == b'\xd9\xd5\x05\xf9\x20\xa1\x63\xd7' and int.from_bytes(footer[:4], 'big'):
+        raise GitStateError('Locked multi-database transaction needs an online SQLite snapshot')
+
+
+def _snapshot_locked_sqlite(source: Path, destination: Path) -> None:
+    # Chrome can keep an exclusive lock even while its DB is idle. Copy a
+    # stable DB + WAL/rollback journal and recover only that disposable copy.
+    # No connection changes, checkpoints or writes touch the live browser DB.
+    for attempt in range(3):
+        with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.sqlite-image-') as folder:
+            image = Path(folder)/source.name
+            before = _sqlite_image_identity(source)
+            for suffix, identity in before.items():
+                if identity is not None:
+                    shutil.copyfile(Path(str(source)+suffix), Path(str(image)+suffix))
+            if before != _sqlite_image_identity(source):
+                LOG.info('SQLite image changed during capture; retrying %s', source.name)
+                continue
+            _validate_copied_sqlite_journal(image)
+            _snapshot_sqlite_connection(image, destination, offline=True)
+            return
+    raise GitStateError(f'SQLite files kept changing during capture of {source.name}; previous backup retained')
+
+
+def snapshot_sqlite(source: Path, destination: Path) -> None:
+    """Bounded online snapshot, with validated stable-copy recovery for locked DBs."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(dir=destination.parent,
+                                         prefix=f'.{destination.name}.', suffix='.snapshot')
+    os.close(fd)
+    temporary = Path(temporary_name)
+    try:
+        LOG.info('Snapshotting SQLite database: %s', source)
+        try:
+            _snapshot_sqlite_connection(source, temporary)
+        except (sqlite3.OperationalError, SQLiteSnapshotTimeout) as exc:
+            code = getattr(exc, 'sqlite_errorcode', 0) & 255
+            if not isinstance(exc, SQLiteSnapshotTimeout) and code not in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise
+            LOG.info('SQLite online read is busy; capturing a stable file image: %s', source.name)
+            temporary.unlink(missing_ok=True)
+            _snapshot_locked_sqlite(source, temporary)
+        os.replace(temporary, destination)
+    except Exception as exc:
+        raise GitStateError(f'Could not snapshot SQLite {source.name}: {redact(str(exc))}') from exc
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1753,6 +1833,50 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     return manifest
 
 
+def backup_file_is_encrypted(source: Path, relative: str, manifest: dict) -> bool:
+    if not relative.endswith(ENCRYPTED_SUFFIX):
+        return False
+    logical = relative[:-len(ENCRYPTED_SUFFIX)]
+    recorded = manifest.get('encrypted')
+    if isinstance(recorded, list):
+        return logical in recorded
+    # Legacy manifests may lack the explicit list. Root credentials remain
+    # fail-closed; other files need a real encryption header, not just .enc.
+    if logical in SENSITIVE_FILES:
+        return True
+    with source.open('rb') as handle:
+        prefix = handle.read(64)
+    return prefix.startswith((_SEALED_PREFIX, _STREAM_SEALED_PREFIX,
+                              _COMPRESSED_STREAM_PREFIX, b'age-encryption.org/v1',
+                              b'-----BEGIN AGE ENCRYPTED FILE-----'))
+
+
+def repair_plaintext_enc_files(workdir: Path, data_dir: Path) -> int:
+    """Recover missing ordinary .enc files without restoring over live state."""
+    manifest = read_manifest(workdir)
+    restored = 0
+    roots = (workdir / DATA_SUBDIR, workdir / '.git/hermes-state-data-previous')
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for source in root.rglob('*.enc'):
+            if source.is_symlink() or not source.is_file():
+                continue
+            relative = source.relative_to(root).as_posix()
+            if backup_file_is_encrypted(source, relative, manifest):
+                continue
+            destination = data_dir / relative
+            if destination.exists() or destination.is_symlink():
+                continue
+            if not destination.resolve().is_relative_to(data_dir.resolve()):
+                raise GitStateError('Cannot recover .enc file through a path outside the home')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            restored += 1
+    LOG.info('Recovered %d missing ordinary .enc files; existing files left intact', restored)
+    return restored
+
+
 def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
@@ -1791,7 +1915,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     if isinstance(recorded_sqlite, list):
         sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
     for relative in sqlite_dbs:
-        for suffix in ("-wal", "-shm"):
+        for suffix in ("-wal", "-shm", "-journal"):
             if relative + suffix in source_relatives:
                 sqlite_sidecars.add(relative + suffix)
 
@@ -1800,7 +1924,8 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         relative = relative_paths[source]
         if relative in sqlite_sidecars:
             continue
-        logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if relative.endswith(ENCRYPTED_SUFFIX) else relative
+        sealed = backup_file_is_encrypted(source, relative, manifest)
+        logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
         is_sqlite = logical_relative in sqlite_dbs
         destination = data_dir / logical_relative
         if is_sqlite:
@@ -1809,12 +1934,13 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             # against this restored image.
             Path(str(destination) + "-wal").unlink(missing_ok=True)
             Path(str(destination) + "-shm").unlink(missing_ok=True)
+            Path(str(destination) + "-journal").unlink(missing_ok=True)
             destination.parent.mkdir(parents=True, exist_ok=True)
             with source.open("rb") as handle:
                 prefix = handle.readline(64)
             if prefix in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
                 decrypt_stream_file(source, destination, config)
-            elif relative.endswith(ENCRYPTED_SUFFIX):
+            elif sealed:
                 decrypt_age_file(source, destination, config)
             else:
                 # Older mirrors stored the main file and live WAL/SHM as
@@ -1829,7 +1955,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             restored += 1
             continue
         payload = None
-        if relative.endswith(ENCRYPTED_SUFFIX):
+        if sealed:
             payload = source.read_bytes()
             relative = relative[: -len(ENCRYPTED_SUFFIX)]
             opened = age_decrypt(payload, config)
@@ -1844,6 +1970,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             # newly restored snapshot.
             Path(str(destination) + "-wal").unlink(missing_ok=True)
             Path(str(destination) + "-shm").unlink(missing_ok=True)
+            Path(str(destination) + "-journal").unlink(missing_ok=True)
         if payload is None:
             shutil.copyfile(source, destination)
         else:
@@ -2731,7 +2858,7 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("restore", "sync", "seed", "state", "daemon", "role", "release", "prefetch"),
+        choices=("restore", "sync", "seed", "state", "daemon", "role", "release", "prefetch", "repair-enc"),
     )
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args(argv)
@@ -2748,6 +2875,9 @@ def main(argv: "list[str] | None" = None) -> int:
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
     try:
+        if args.command == 'repair-enc':
+            repair_plaintext_enc_files(config.workdir, args.data_dir)
+            return 0
         if args.command == "prefetch":
             ensure_clone(config)
             LOG.info('Private state download is ready for restore')
