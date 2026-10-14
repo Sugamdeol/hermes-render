@@ -1,5 +1,6 @@
 """Save package recipes, not installed binaries or credentials, in private state."""
 import json
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -100,6 +101,26 @@ def missing_python(desired,current,exact=True):
              (exact and present[re.sub(r'[-_.]+','-',n).lower()]!=v))]
 
 
+def missing_apt(names):
+    desired = sorted({n for n in names if isinstance(n, str) and NAME.fullmatch(n)
+                      and not n.startswith(('linux-', 'cuda-', 'nvidia-'))})
+    if not desired:
+        return []
+    result = command(['dpkg-query', '-W', '-f=${binary:Package}\t${Status}\n', *desired])
+    installed = {line.split('\t', 1)[0].split(':', 1)[0]
+                 for line in result.stdout.splitlines()
+                 if '\t' in line and line.split('\t', 1)[1] == 'install ok installed'}
+    return [name for name in desired if name not in installed]
+
+
+def browser_ready(python, browser):
+    probe = "from pathlib import Path; from playwright.sync_api import sync_playwright; import sys\nwith sync_playwright() as p: sys.exit(0 if Path(getattr(p, sys.argv[1]).executable_path).is_file() else 1)"
+    try:
+        return command([python, '-c', probe, browser]).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def restore(home):
     home=Path(home);recipe=read(home/'.runtime-dependencies.json')
     if os.environ.get('HERMES_RUNTIME_DEPS_AUTORESTORE') == '1':
@@ -108,17 +129,16 @@ def restore(home):
         recipe['apt'] = sorted(set(recipe.get('apt',[])) | {'google-chrome-stable'})
     if not recipe:return []
     if recipe.get('version')!=1:raise RuntimeError('Unsupported dependency recipe version')
+    atomic(home/'.runtime-dependencies-status.json', {'ready':False, 'state':'installing', 'errors':[], 'updated_at':int(time.time())})
     errors=[]
     def install(args):
         try:
             result=command(args,timeout=900)
             if result.returncode:errors.append('Installer failed: '+args[0])
+            return result.returncode == 0
         except (OSError,subprocess.TimeoutExpired):errors.append('Installer unavailable or timed out: '+args[0])
-    missing=[]
-    for n in recipe.get('apt',[]):
-        if not isinstance(n,str) or not NAME.fullmatch(n) or n.startswith(('linux-','cuda-','nvidia-')):continue
-        result=command(['dpkg-query','-W','-f=${Status}',n])
-        if result.returncode or result.stdout.strip()!='install ok installed':missing.append(n)
+        return False
+    missing=missing_apt(recipe.get('apt',[]))
     if 'google-chrome-stable' in missing:
         # Chrome's downloaded .deb is not necessarily registered in apt sources.
         try:
@@ -161,8 +181,15 @@ def restore(home):
     except (OSError,ValueError):errors.append('Global npm inventory unavailable')
     for browser in recipe.get('browsers',[]):
         if browser in ('chromium','firefox','webkit'):
-            install([targets['agent'],'-m','playwright','install','--with-deps',browser])
-    atomic(home/'.runtime-dependencies-status.json',{'ready':not errors,'errors':errors,'updated_at':int(time.time())})
+            # This marker is local to the Colab VM, never part of the backup.
+            # A fresh VM still installs system libraries, even with restored binaries.
+            identity = hashlib.sha256((str(home.resolve()) + targets['agent'] + browser).encode()).hexdigest()
+            marker = Path('/tmp/hermes-browser-ready') / identity
+            if marker.is_file() and browser_ready(targets['agent'], browser):
+                continue
+            if install([targets['agent'],'-m','playwright','install','--with-deps',browser]):
+                atomic(marker, {'browser':browser})
+    atomic(home/'.runtime-dependencies-status.json',{'ready':not errors,'state':'error' if errors else 'ready','errors':errors,'updated_at':int(time.time())})
     return errors
 
 
@@ -173,3 +200,4 @@ if __name__=='__main__':
         errors=restore(home)
         for error in errors:print('[dependencies]',error,flush=True)
         raise SystemExit(bool(errors))
+
