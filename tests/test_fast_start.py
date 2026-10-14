@@ -94,6 +94,7 @@ class FastDependencyTests(unittest.TestCase):
         start = source.index('# Session restore is complete;')
         end = source.index('\nfi', start) + len('\nfi')
         block = source[start:end].replace('/opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py restore "${DATA_DIR}"', 'sleep 0.2')
+        block = block.replace('$(id -u)', '0')
         env = dict(os.environ, HERMES_RUNTIME_PROFILE='colab-full', HERMES_RUNTIME_DEPS_BACKGROUND='1', HERMES_RUNTIME_DEPS_AUTORESTORE='1', HERMES_COLAB_SYSTEM_PYTHON='python', DATA_DIR='/tmp')
         result = subprocess.run(['sh', '-c', block + '\necho gateway-started\nwait'], env=env, capture_output=True, text=True, check=True)
         self.assertLess(result.stdout.index('gateway-started'), result.stdout.index('Saved apps and libraries are ready'))

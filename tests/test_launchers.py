@@ -15,6 +15,9 @@ def load(name):
     spec = importlib.util.spec_from_file_location(name.replace('-', '_'), ROOT / (name + '.py'))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    if name == 'run-colab':
+        # Runtime environment tests must not create Colab's /content on CI.
+        module.cache_directory = Mock(return_value=Path(tempfile.gettempdir()) / 'hermes-launcher-tests-cache')
     return module
 
 
@@ -124,10 +127,13 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(len(cells),1)
         source = ''.join(cells[0]['source'])
         compile(source,'Hermes.ipynb','exec')
-        self.assertRegex(source,r'hexdigest\(\) != "[a-f0-9]{64}"')
+        self.assertIn('hashlib.sha1(blob).hexdigest() != snapshot.get("sha")', source)
+        self.assertIn('base64.b64decode', source)
+        self.assertIn('validate=True', source)
         self.assertIn('confirm_switch=True',source)
         self.assertNotIn('/hermes-render/main/run-colab.py',source)
-        self.assertRegex(source,r'/hermes-render/[a-f0-9]{40}/run-colab.py')
+        self.assertIn('/hermes-render/contents/run-colab.py', source)
+        self.assertIn('?ref=main&fresh=', source)
         self.assertIn('finally:',source)
         self.assertEqual(cells[0]['outputs'],[])
 
@@ -293,7 +299,7 @@ class LauncherTests(unittest.TestCase):
             log.write_text('[hermes-git-state] recovery checkpoint failed: could not confirm owner/repo is private\n')
             with patch.object(module, 'LOG', log), patch.object(module.subprocess, 'run', return_value=timed_out), \
                  patch('builtins.print'):
-                with self.assertRaisesRegex(RuntimeError, 'did not confirm a save within 5 minutes'):
+                with self.assertRaisesRegex(RuntimeError, 'did not confirm a save within 20 minutes'):
                     agent.backup()
 
     def test_backup_failure_names_the_newest_known_cause(self):
@@ -336,3 +342,4 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

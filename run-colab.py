@@ -439,7 +439,7 @@ def install():
         existing_uid = None
     for command in root_account_plan(existing_uid):
         run(command)
-    cache = Path("/content/hermes-git-cache")
+    cache = SOURCE.parent / "hermes-git-cache"
     cache.mkdir(parents=True, exist_ok=True)
     run(["chown", "hermes:hermes", cache])
     cache.chmod(0o700)

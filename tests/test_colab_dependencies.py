@@ -83,7 +83,8 @@ class ChromeRestoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             deps.atomic(Path(td)/'.runtime-dependencies.json', {'version':1,'apt':['google-chrome-stable','libnss3'],'python':{},'npm':{}})
             def command(args,timeout=60):
-                return subprocess.CompletedProcess(args,0,'install ok installed' if args[0]=='dpkg-query' else '{}','')
+                out = ''.join(name+'\tinstall ok installed\n' for name in args[3:]) if args[0]=='dpkg-query' else '{}'
+                return subprocess.CompletedProcess(args,0,out,'')
             with patch.object(deps,'command',command),patch.object(deps.urllib.request,'urlretrieve') as download:
                 self.assertEqual(deps.restore(td),[])
             download.assert_not_called()
@@ -127,3 +128,4 @@ class StartupCacheTests(unittest.TestCase):
                 colab.install()
             self.assertFalse(any(c[0] in ('apt-get','npm') or 'pip' in c for c in calls))
             self.assertTrue(any('patch-colab-full.py' in ' '.join(c) for c in calls))
+
