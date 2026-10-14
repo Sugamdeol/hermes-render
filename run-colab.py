@@ -427,7 +427,58 @@ def save_ui_cache(cache, key):
         Path(temporary).unlink(missing_ok=True)
 
 
-def install():
+class StatePrefetch:
+    """Download private state while public runtime dependencies are installing."""
+    def __init__(self, env, script):
+        self.env, self.script, self.process, self.log = env, script, None, None
+
+    def __enter__(self):
+        if not self.env or not self.env.get('GIT_STATE_TOKEN') or not self.env.get('GIT_STATE_REPO'):
+            return self
+        path = SOURCE.parent / 'hermes-state-prefetch.log'
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        self.log = os.fdopen(fd, 'w')
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, str(self.script), 'prefetch', str(DATA)],
+                env=self.env, stdout=self.log, stderr=subprocess.STDOUT,
+                start_new_session=True)
+        except BaseException:
+            self.log.close()
+            raise
+        print('Downloading saved state alongside runtime installation…')
+        return self
+
+    def __exit__(self, kind, value, traceback):
+        if self.process is None:
+            return False
+        try:
+            if kind is None:
+                try:
+                    code = self.process.wait(timeout=int(self.env.get('HERMES_RESTORE_TIMEOUT_SECONDS', '1800')))
+                    if code:
+                        print('State download needs a retry; the normal restore will check it before starting.')
+                except subprocess.TimeoutExpired:
+                    print('Background state download timed out; the normal restore will retry.')
+        finally:
+            try:
+                if self.process.poll() is None:
+                    try:
+                        os.killpg(self.process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        self.process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(self.process.pid, signal.SIGKILL)
+                        self.process.wait()
+            finally:
+                self.log.close()
+        return False
+
+
+def install(env=None):
     # dpkg status is local: do not hit apt repositories on every relaunch.
     missing = []
     for package in CORE_PACKAGES:
@@ -458,6 +509,11 @@ def install():
         run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=SOURCE)
     revision = run(["git", "rev-parse", "HEAD"], cwd=SOURCE,
                    capture_output=True, text=True).stdout.strip()
+    with StatePrefetch(env, SOURCE / 'scripts/git-storage.py'):
+        install_runtime(revision)
+
+
+def install_runtime(revision):
     marker = INSTALL / ".colab-launcher-revision"
     core_ready = (INSTALL/".venv/bin/python").exists() and all(p.exists() and p.stat().st_size > 0 for p in (INSTALL/"hermes_cli/web_dist/index.html", INSTALL/"ui-tui/dist/entry.js"))
     if core_ready and (INSTALL / ".colab-native-updater").exists() and marker.exists() and marker.read_text().strip() == revision:
@@ -934,7 +990,7 @@ def main(confirm_switch=False):
 
 
 def launch_with_progress(env, progress):
-    install()
+    install(env)
     progress.step(1)
     offset = log_offset()
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)

@@ -377,14 +377,10 @@ class SecretHandlingTests(unittest.TestCase):
         self.assertEqual(manifest["encrypted"], [".env", "config.yaml"])
         self.assertEqual(manifest["plaintext_env"], [])
 
-    def test_encrypt_mode_omits_rather_than_falling_back_to_plaintext(self):
-        """No working age setup must never quietly mean "in the clear"."""
+    def test_encrypt_failure_aborts_without_falling_back_to_plaintext(self):
         self.storage.age_encrypt = lambda payload, config: None
-        manifest, mirrored, blob = self._mirror(env_mode="encrypt",
-                                                age_recipient="")
-        self.assertNotIn("data/.env", mirrored)
-        self.assertNotIn("super-secret", blob)
-        self.assertIn(".env", manifest["omitted"])
+        with self.assertRaisesRegex(self.storage.GitStateError, 'Cannot encrypt'):
+            self._mirror(env_mode="encrypt", age_recipient="")
 
     def test_omit_mode_leaves_the_dotenv_out(self):
         manifest, mirrored, blob = self._mirror(env_mode="omit")
@@ -1455,7 +1451,8 @@ class RestoreFidelityTests(LocalRemoteTests):
 
         data_dir = self.root / "restored"
         data_dir.mkdir()
-        storage.materialize(workdir, data_dir, self.make_config())
+        with self.assertRaisesRegex(storage.GitStateError, 'Could not restore symlink'):
+            storage.materialize(workdir, data_dir, self.make_config())
 
         self.assertFalse(Path("/tmp/hermes-escape-test").exists())
         self.assertFalse(Path("/etc/hermes").exists())
@@ -1628,3 +1625,4 @@ class RuntimeEnvironmentBackupTests(unittest.TestCase):
             for name in ("STORAGE_ENCRYPTION_KEY", "RENDER_EXTERNAL_URL", "PATH"):
                 self.assertNotIn(name, data)
             self.assertIn(".render-runtime-env.json", storage.SENSITIVE_FILES)
+
