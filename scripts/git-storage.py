@@ -1040,6 +1040,19 @@ def _mark_populated(populated: "set[str]", relative: str) -> None:
         parent = parent.parent
 
 
+def confirmed_source_deletion(source: Path, data_dir: Path) -> bool:
+    """Distinguish an absent source from permissions and destination failures."""
+    try:
+        if not data_dir.is_dir():
+            return False
+        source.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def plan_tree(data_dir: Path,
               excludes) -> "tuple[list[str], list[str], dict[str, str]]":
     """What under data_dir belongs in the backup.
@@ -1058,6 +1071,9 @@ def plan_tree(data_dir: Path,
     kept_dirs: list[str] = []
     symlinks: dict[str, str] = {}
     def unreadable(error):
+        if isinstance(error, FileNotFoundError) and error.filename and confirmed_source_deletion(Path(error.filename), data_dir):
+            LOG.debug('Directory removed during backup scan: %s', error.filename)
+            return
         raise GitStateError(f'Cannot scan backup source: {redact(str(error))}; snapshot not published')
 
     for root, dirs, filenames in os.walk(data_dir, topdown=True, followlinks=False, onerror=unreadable):
@@ -1102,6 +1118,10 @@ def plan_tree(data_dir: Path,
                 continue
             try:
                 regular = stat.S_ISREG(path.stat().st_mode)
+            except FileNotFoundError:
+                if confirmed_source_deletion(path, data_dir):
+                    continue
+                raise
             except OSError as exc:
                 raise GitStateError(f'Cannot inspect {relative}; snapshot not published: {redact(str(exc))}') from exc
             if regular:
@@ -1624,6 +1644,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
         if target.exists():
             shutil.rmtree(target)
         os.replace(previous, target)
+    had_target = target.exists()
     metadata = (workdir / MANIFEST_NAME, cache_root / 'hermes-source-signatures.json')
     saved = {path: path.read_bytes() if path.exists() else None for path in metadata}
     try:
@@ -1633,9 +1654,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
             if target.exists():
                 shutil.rmtree(target)
             os.replace(previous, target)
-        else:
-            if target.exists():
-                shutil.rmtree(target)
+        elif not had_target and target.exists():
+            shutil.rmtree(target)
         for path, payload in saved.items():
             if payload is None:
                 path.unlink(missing_ok=True)
@@ -1654,6 +1674,7 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     disappear from the next commit: `git add -A` sees them gone.
     """
     excludes = DEFAULT_EXCLUDES
+    source_identity = local_tree_identity(data_dir)
     # Read the previous generation before the manifest is overwritten. The
     # clone is shallow, so "git rev-list --count" cannot tell us how long the
     # remote history is; we carry the count in the manifest instead.
@@ -1701,6 +1722,11 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
         if relative in SENSITIVE_FILES:
             try:
                 payload = source.read_bytes()
+            except FileNotFoundError:
+                if confirmed_source_deletion(source, data_dir):
+                    LOG.info('Source deleted during backup: %s', relative)
+                    continue
+                raise
             except OSError as exc:
                 raise GitStateError(f'Cannot read {relative}; snapshot not published: {redact(str(exc))}') from exc
             payload, disposition = _prepare_sensitive(payload, config)
@@ -1736,7 +1762,18 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
                 skipped.append(relative)
                 continue
             snapshot_path = destination.with_name(destination.name + ".snapshot-tmp")
-            snapshot_sqlite(source, snapshot_path)
+            try:
+                snapshot_sqlite(source, snapshot_path)
+            except GitStateError as exc:
+                cause = exc.__cause__
+                missing = (isinstance(cause, FileNotFoundError)
+                           or isinstance(cause, sqlite3.OperationalError)
+                           and (getattr(cause, 'sqlite_errorcode', 0) & 255) == sqlite3.SQLITE_CANTOPEN)
+                if missing and confirmed_source_deletion(source, data_dir):
+                    snapshot_path.unlink(missing_ok=True)
+                    LOG.info('Database deleted during backup: %s', relative)
+                    continue
+                raise
             sqlite_digest = _hash_file(snapshot_path)
             sqlite_hashes[relative] = sqlite_digest
             if config.env_mode == ENV_MODE_ENCRYPT:
@@ -1794,6 +1831,12 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
             else:
                 shutil.copy2(source, destination)
             next_signatures[relative] = signature
+        except FileNotFoundError as exc:
+            if confirmed_source_deletion(source, data_dir):
+                destination.unlink(missing_ok=True)
+                LOG.info('Source deleted during backup: %s', relative)
+                continue
+            raise GitStateError(f'Cannot snapshot {relative}; source still exists, previous backup retained: {redact(str(exc))}') from exc
         except OSError as exc:
             raise GitStateError(f'Cannot snapshot {relative}; retaining the previous backup: {redact(str(exc))}') from exc
         if mode not in (0o644, 0o755):
@@ -1803,6 +1846,8 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
             modes[relative] = format(mode, "o")
         copied += 1
 
+    if local_tree_identity(data_dir) != source_identity:
+        raise GitStateError('Backup source home was replaced during capture; previous backup retained')
     _warn_plaintext_env(plaintext_env, config)
     config._sqlite_hashes = sqlite_hashes
     large_files = split_large_blobs(target, reused_large)
