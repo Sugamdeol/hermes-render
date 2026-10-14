@@ -21,6 +21,7 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
             'GIT_STATE_REPO': 'owner/private', 'GIT_STATE_TOKEN': 'test-only',
             'HERMES_RECOVERY_CHECKPOINT_FILE': str(self.request),
             'HERMES_RECOVERY_CHECKPOINT_TIMEOUT_SECONDS': '2',
+            'GIT_STATE_STATUS_FILE': str(Path(self.tmp.name)/'status.json'),
         })
         self.env.start()
         self.recovery = runpy.run_path(str(ROOT / 'scripts/task-recovery.py'))
@@ -84,9 +85,14 @@ class CheckpointTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_root_storage_ack_is_owned_by_unprivileged_gateway(self):
         self.request.write_text(json.dumps({'nonce': 'unprivileged'}))
+        original_stat = Path.stat
+        def request_owner(path, *args, **kwargs):
+            if path == self.request:
+                return SimpleNamespace(st_uid=10000, st_gid=10000)
+            return original_stat(path, *args, **kwargs)
         with patch.object(self.storage, 'sync_once', return_value=True), \
              patch.object(os, 'geteuid', return_value=0), \
-             patch.object(Path, 'stat', return_value=SimpleNamespace(st_uid=10000, st_gid=10000)), \
+             patch.object(Path, 'stat', request_owner), \
              patch.object(os, 'fchown') as transfer:
             self.storage.recovery_checkpoint(Path(self.tmp.name), self.config)
         self.assertEqual(transfer.call_args.args[1:], (10000, 10000))
