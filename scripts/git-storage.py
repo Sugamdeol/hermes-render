@@ -1644,6 +1644,7 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
         if target.exists():
             shutil.rmtree(target)
         os.replace(previous, target)
+    had_target = target.exists()
     metadata = (workdir / MANIFEST_NAME, cache_root / 'hermes-source-signatures.json')
     saved = {path: path.read_bytes() if path.exists() else None for path in metadata}
     try:
@@ -1653,9 +1654,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
             if target.exists():
                 shutil.rmtree(target)
             os.replace(previous, target)
-        else:
-            if target.exists():
-                shutil.rmtree(target)
+        elif not had_target and target.exists():
+            shutil.rmtree(target)
         for path, payload in saved.items():
             if payload is None:
                 path.unlink(missing_ok=True)

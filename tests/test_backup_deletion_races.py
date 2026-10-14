@@ -71,6 +71,13 @@ class BackupDeletionRaceTests(unittest.TestCase):
         with self.assertRaises(self.storage.GitStateError):
             self.storage.plan_tree(absent, self.storage.DEFAULT_EXCLUDES)
 
+    def test_missing_home_before_capture_keeps_existing_snapshot_intact(self):
+        self.data.rename(self.root/'moved-home')
+        with self.assertRaises(FileNotFoundError):
+            self.storage.build_worktree(self.data, self.work, self.config)
+        self.assertEqual((self.work/'data/keep').read_text(), 'saved session')
+        self.assertEqual((self.work/'data'/self.rotating.name).read_text(), 'old data')
+
     def test_sqlite_database_deleted_before_open_is_mirrored_as_deleted(self):
         import sqlite3
         source = self.data/'rotating.db'
