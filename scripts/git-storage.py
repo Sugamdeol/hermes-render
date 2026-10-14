@@ -604,6 +604,7 @@ def ensure_clone(config: GitConfig) -> Path:
                 else:
                     run_git(["checkout", "-B", config.branch, "FETCH_HEAD"],
                             cwd=workdir, config=config)
+                    _invalidate_local_mirror(workdir)
             return workdir
         LOG.info(
             "state workdir holds a clone of a different repository; starting a "
@@ -636,6 +637,13 @@ def ensure_clone(config: GitConfig) -> Path:
         run_git(["init", "-q", "-b", config.branch, "."], cwd=workdir, config=config)
         run_git(["remote", "add", "origin", config.remote_url], cwd=workdir, config=config)
     return workdir
+
+
+def _invalidate_local_mirror(workdir: Path) -> None:
+    """A Git checkout can replace files without changing the source inventory."""
+    cache = workdir/'.git' if (workdir/'.git').is_dir() else workdir
+    for name in ('hermes-source-inventory.json', 'hermes-source-signatures.json'):
+        (cache/name).unlink(missing_ok=True)
 
 
 def head_commit(workdir: Path, config: GitConfig) -> str:
@@ -2814,7 +2822,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
             config._source_changes = None if event_baseline is None or time.time()-last_full_audit >= audit_interval else events.changes_since(event_baseline)
             return events.sample()
         config._source_changes = None
-        return watcher.snapshot() if watcher is not None else None
+        return None
 
     def finish_changes(snapshot):
         nonlocal event_baseline, last_full_audit
@@ -2823,7 +2831,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
         if events is not None and snapshot is not None:
             event_baseline = snapshot
             events.acknowledge(snapshot)
-        if watcher is not None:
+        if watcher is not None and snapshot is not None:
             watcher.mark_pushed(snapshot)
 
     def push(reason: str) -> bool:

@@ -46,6 +46,19 @@ class ChangedPathTests(unittest.TestCase):
         self.assertEqual((self.work/'data/renamed/nested/chat').read_text(),'saved')
         shutil.rmtree(self.data/'renamed'); (self.data/'empty').mkdir(); result=self.save(['renamed','empty'])
         self.assertEqual(result['files'],0); self.assertIn('empty',result['empty_dirs'])
+    def test_git_checkout_invalidates_signatures_before_retrying_failed_upload(self):
+        self.m.run_git(['init', '-q'], cwd=self.work, config=self.config)
+        self.put('chat', 'old'); self.save(); self.m.stage_snapshot(self.work, self.config)
+        self.m.run_git(['commit', '-q', '-m', 'first'], cwd=self.work, config=self.config)
+        first = self.m.head_commit(self.work, self.config)
+        self.put('chat', 'new'); self.save(['chat']); self.m.stage_snapshot(self.work, self.config)
+        self.m.run_git(['commit', '-q', '-m', 'unuploaded'], cwd=self.work, config=self.config)
+        # Simulate refetching the old remote after an upload failure.
+        self.m.run_git(['reset', '--hard', first], cwd=self.work, config=self.config)
+        self.m._invalidate_local_mirror(self.work)
+        self.save([])
+        self.assertEqual((self.work/'data/chat').read_text(), 'new')
+
     def test_directory_replaced_by_file_handles_late_child_events(self):
         self.put('folder/nested/chat'); self.save()
         shutil.rmtree(self.data/'folder'); self.put('folder','now a file')
