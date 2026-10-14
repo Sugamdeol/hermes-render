@@ -12,7 +12,7 @@ REPO = 'Sugamdeol/hermes-render'
 TOOLS = Path('/opt/render-tools')
 PROC = Path('/proc')
 LOG = Path('/content/hermes-colab.log')
-FILES = ('git-storage.py', 'state-events.py')
+FILES = ('git-storage.py', 'state-events.py', 'incremental-mirror.py')
 
 
 def process_info(pid):
@@ -133,10 +133,10 @@ def main(agent):
         raise RuntimeError('This update is only for the Colab runtime; no process was stopped.')
     for name, content in payloads.items():
         destination = TOOLS/name
-        previous = destination.stat()
+        previous = destination.stat() if destination.exists() else TOOLS.stat()
         temporary = destination.with_name(destination.name+'.update.tmp')
         temporary.write_bytes(content)
-        temporary.chmod(previous.st_mode & 0o777)
+        temporary.chmod(0o755)
         os.chown(temporary, previous.st_uid, previous.st_gid)
         temporary.replace(destination)
     workdir = Path(env.get('GIT_STATE_WORKDIR', '/content/hermes-git-cache/state')).resolve()
@@ -159,7 +159,7 @@ def main(agent):
     time.sleep(1)
     if agent.storage_process.poll() is not None:
         raise RuntimeError('Updated backup worker exited. Chats are still running; inspect /content/hermes-colab.log.')
-    print('Complete-file backup worker installed. Dashboard and Telegram stayed running.')
+    print('Changed-path backup worker installed. Dashboard and Telegram stayed running.')
     print('Confirming the first backup with the updated rules…')
     agent.backup()
 

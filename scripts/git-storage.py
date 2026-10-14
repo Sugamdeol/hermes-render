@@ -1585,6 +1585,8 @@ def reuse_chunks(previous: Path, target: Path, record: dict) -> bool:
         path = previous / part
         if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(previous.resolve()):
             return False
+    if previous == target:
+        return True
     for part in parts:
         destination = target / part
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1644,6 +1646,11 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
         if target.exists():
             shutil.rmtree(target)
         os.replace(previous, target)
+    if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
+        import runpy
+        helper = runpy.run_path(str(Path(__file__).with_name('incremental-mirror.py')))
+        return helper['build_snapshot'](data_dir, workdir, config, globals(),
+                                       changes=getattr(config, '_source_changes', None))
     had_target = target.exists()
     metadata = (workdir / MANIFEST_NAME, cache_root / 'hermes-source-signatures.json')
     saved = {path: path.read_bytes() if path.exists() else None for path in metadata}
@@ -1878,9 +1885,27 @@ def _build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     return manifest
 
 
+def decoded_backup_path(relative: str, manifest: dict) -> str:
+    if manifest.get('path_encoding') == 'git-components-v1':
+        import runpy
+        global _path_decoder
+        try:
+            if '_path_decoder' not in globals():
+                _path_decoder = runpy.run_path(str(Path(__file__).with_name('incremental-mirror.py')))['decode']
+            if relative.endswith(ENCRYPTED_SUFFIX):
+                plain = _path_decoder(relative[:-len(ENCRYPTED_SUFFIX)])
+                if plain in manifest.get('encrypted', []):
+                    return plain + ENCRYPTED_SUFFIX
+            return _path_decoder(relative)
+        except (ValueError, UnicodeError) as exc:
+            raise GitStateError('Invalid encoded backup path') from exc
+    return relative
+
+
 def backup_file_is_encrypted(source: Path, relative: str, manifest: dict) -> bool:
     if not relative.endswith(ENCRYPTED_SUFFIX):
         return False
+    relative = decoded_backup_path(relative, manifest)
     logical = relative[:-len(ENCRYPTED_SUFFIX)]
     recorded = manifest.get('encrypted')
     if isinstance(recorded, list):
@@ -1910,7 +1935,7 @@ def repair_plaintext_enc_files(workdir: Path, data_dir: Path) -> int:
             relative = source.relative_to(root).as_posix()
             if backup_file_is_encrypted(source, relative, manifest):
                 continue
-            destination = data_dir / relative
+            destination = data_dir / decoded_backup_path(relative, manifest)
             if destination.exists() or destination.is_symlink():
                 continue
             if not destination.resolve().is_relative_to(data_dir.resolve()):
@@ -1956,6 +1981,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         extra_dbs, extra_sidecars = sqlite_files(extra_root, source_relatives)
         sqlite_dbs.update(extra_dbs)
         sqlite_sidecars.update(extra_sidecars)
+    sqlite_dbs = {decoded_backup_path(name, manifest) for name in sqlite_dbs}
     recorded_sqlite = manifest.get("sqlite_snapshots", [])
     if isinstance(recorded_sqlite, list):
         sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
@@ -1967,9 +1993,12 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     restored = 0
     for source in sorted(source_files):
         relative = relative_paths[source]
-        if relative in sqlite_sidecars:
+        if relative in sqlite_sidecars or any(decoded_backup_path(relative, manifest) == db + suffix
+                                             for suffix in ('-wal', '-shm', '-journal')
+                                             for db in sqlite_dbs):
             continue
         sealed = backup_file_is_encrypted(source, relative, manifest)
+        relative = decoded_backup_path(relative, manifest)
         logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
         is_sqlite = logical_relative in sqlite_dbs
         destination = data_dir / logical_relative
@@ -2246,8 +2275,8 @@ def reject_destructive_shrink(previous_files: int, current_files: int) -> None:
 
 def stage_snapshot(workdir: Path, config: GitConfig) -> None:
     """Stage bounded batches so one large first backup cannot time out as a whole."""
-    changed = run_git(["diff", "--name-only", "-z"], cwd=workdir, config=config)
-    untracked = run_git(["ls-files", "--others", "--exclude-standard", "-z"], cwd=workdir, config=config)
+    changed = run_git(["diff", "--name-only", "-z", "--", DATA_SUBDIR, MANIFEST_NAME], cwd=workdir, config=config)
+    untracked = run_git(["ls-files", "--others", "-z", "--", DATA_SUBDIR, MANIFEST_NAME], cwd=workdir, config=config)
     paths = [Path(value) for value in (changed.stdout + untracked.stdout).split("\0") if value]
     paths = sorted(set(paths), key=lambda path: path.as_posix())
     batch, size, staged = [], 0, 0
@@ -2259,7 +2288,7 @@ def stage_snapshot(workdir: Path, config: GitConfig) -> None:
             with os.fdopen(fd, "wb") as handle:
                 for path in batch:
                     handle.write(os.fsencode(path.as_posix()) + b"\0")
-            run_git(["--literal-pathspecs", "add", "-A", "--pathspec-from-file=" + name,
+            run_git(["--literal-pathspecs", "add", "-f", "-A", "--pathspec-from-file=" + name,
                      "--pathspec-file-nul"], cwd=workdir, config=config)
             staged += len(batch)
             LOG.info("staging backup: %d/%d paths", staged, len(paths))
@@ -2328,6 +2357,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     manifest = build_worktree(data_dir, workdir, config)
     reject_destructive_shrink(previous_files, int(manifest["files"]))
 
+    _write_sync_progress(config, 'staging')
     stage_snapshot(workdir, config)
     # Only real state changes are worth a commit. The manifest carries a
     # timestamp and generation counter that differ on every run, so asking
@@ -2336,13 +2366,13 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     status = run_git(["status", "--porcelain", "--", DATA_SUBDIR],
                      cwd=workdir, config=config)
     metadata_keys = ('large_files', 'encrypted', 'omitted', 'plaintext_env',
-                     'empty_dirs', 'symlinks', 'sqlite_snapshots', 'modes')
+                     'empty_dirs', 'symlinks', 'sqlite_snapshots', 'modes', 'path_encoding')
     metadata_changed = any(prior_manifest.get(key) != manifest.get(key) for key in metadata_keys)
     if not status.stdout.strip() and not metadata_changed and not force:
         LOG.debug("state unchanged; nothing to commit")
         run_git(["checkout", "HEAD", "--", MANIFEST_NAME], cwd=workdir,
                 check=False, config=config)
-        _write_sync_base(config, remote_sha, state_fingerprint(data_dir),
+        _write_sync_base(config, remote_sha, None if getattr(config, '_incremental_mode', False) else state_fingerprint(data_dir),
                          getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
         return True
 
@@ -2356,7 +2386,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
 
     if should_compact(manifest.get("generation", 0), config.max_commits):
         compact_history(workdir, config, expected_remote=remote_sha)
-        _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+        _write_sync_base(config, head_commit(workdir, config), None if getattr(config, '_incremental_mode', False) else state_fingerprint(data_dir),
                          getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
         return True
 
@@ -2364,8 +2394,9 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     # state as a retry: a normal push is safe to retry, but a force push can
     # destroy newer sessions and memories. `push_branch` already checks
     # whether a response-lost push reached our exact commit.
+    _write_sync_progress(config, 'uploading')
     push_branch(workdir, config)
-    _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),
+    _write_sync_base(config, head_commit(workdir, config), None if getattr(config, '_incremental_mode', False) else state_fingerprint(data_dir),
                      getattr(config, "_sqlite_hashes", {}), data_dir=data_dir)
     LOG.info("pushed state: %s", message)
     return True
@@ -2620,7 +2651,7 @@ def _sync_status_path() -> Path:
     ))
 
 
-def _write_sync_status(config: GitConfig, state: str, error: str = "") -> None:
+def _write_sync_status(config: GitConfig, state: str, error: str = "", **progress) -> None:
     """Publish a small, secret-free backup health record for the dashboard."""
     path = _sync_status_path()
     previous = {}
@@ -2638,6 +2669,7 @@ def _write_sync_status(config: GitConfig, state: str, error: str = "") -> None:
         "branch": config.branch,
         "error": redact(error)[:300] if error else "",
     }
+    status.update(progress)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".state-status-")
     try:
@@ -2649,6 +2681,10 @@ def _write_sync_status(config: GitConfig, state: str, error: str = "") -> None:
         os.replace(temporary_name, path)
     finally:
         Path(temporary_name).unlink(missing_ok=True)
+
+
+def _write_sync_progress(config, phase, processed=0, total=0, current=''):
+    _write_sync_status(config, 'running', phase=phase, processed=processed, total=total, current=current)
 
 
 # ---------------------------------------------------------------------------
@@ -2674,6 +2710,8 @@ def recovery_checkpoint(data_dir: Path, config: GitConfig) -> bool:
     except (OSError, ValueError, KeyError, TypeError):
         return False
     ok = False
+    config._checkpoint_ok = False
+    _write_sync_progress(config, "preparing")
     try:
         if config.env_mode == ENV_MODE_OMIT:
             raise GitStateError('Recovery checkpoint requires encrypted or private plaintext state, not omit mode')
@@ -2682,8 +2720,11 @@ def recovery_checkpoint(data_dir: Path, config: GitConfig) -> bool:
         ok = bool(sync_once(data_dir, config))
         if ok:
             config._last_push_at = time.time()
+            config._checkpoint_ok = True
+            _write_sync_status(config, 'ok')
             LOG.info('recovery checkpoint uploaded')
     except Exception as exc:
+        _write_sync_status(config, 'error', str(exc))
         LOG.warning('recovery checkpoint failed: %s', redact(str(exc)))
     fd, name = tempfile.mkstemp(dir=request.parent, prefix='.checkpoint-ack-')
     try:
@@ -2760,10 +2801,36 @@ def run_daemon(data_dir: Path, config: GitConfig,
             LOG.warning('State events unavailable; using metadata polling: %s', exc)
     watcher = ChangeWatcher(data_dir, config, sampler=events.sample if events else None) if config.watch else None
 
-    def push(reason: str) -> None:
+    event_baseline = None
+    last_full_audit = 0.0
+    try:
+        audit_interval = max(60.0, float(os.environ.get('GIT_STATE_FULL_AUDIT_SECONDS', '3600')))
+    except ValueError:
+        audit_interval = 3600.0
+
+    def prepare_changes():
+        if events is not None:
+            events.flush()
+            config._source_changes = None if event_baseline is None or time.time()-last_full_audit >= audit_interval else events.changes_since(event_baseline)
+            return events.sample()
+        config._source_changes = None
+        return watcher.snapshot() if watcher is not None else None
+
+    def finish_changes(snapshot):
+        nonlocal event_baseline, last_full_audit
+        if config._source_changes is None:
+            last_full_audit = time.time()
+        if events is not None and snapshot is not None:
+            event_baseline = snapshot
+            events.acknowledge(snapshot)
+        if watcher is not None:
+            watcher.mark_pushed(snapshot)
+
+    def push(reason: str) -> bool:
         # Snapshot first: whatever is written while the push is in flight is
         # not part of the commit, so it has to stay pending afterwards.
-        snapshot = watcher.snapshot() if watcher is not None else None
+        snapshot = prepare_changes() if events is not None else watcher.snapshot() if watcher is not None else None
+        _write_sync_progress(config, "preparing")
         try:
             sync_once(data_dir, config)
         except GitStateError as exc:
@@ -2772,11 +2839,14 @@ def run_daemon(data_dir: Path, config: GitConfig,
                         reason, redact(str(exc)))
             if watcher is not None:
                 watcher.defer(config.retry_seconds)
-            return
+            return False
         config._last_push_at = time.time()
         _write_sync_status(config, "ok")
-        if watcher is not None:
+        if events is not None:
+            finish_changes(snapshot)
+        elif watcher is not None:
             watcher.mark_pushed(snapshot)
+        return True
 
     next_sync = 0.0
     last_scan = 0.0
@@ -2788,11 +2858,20 @@ def run_daemon(data_dir: Path, config: GitConfig,
                 events.close()
                 events = None
                 watcher = ChangeWatcher(data_dir, config)
+                event_baseline = None
+                config._source_changes = None
                 next_sync = 0.0
         now = time.time()
         # Recovery intent cannot wait for a quiet tree or the normal push gap.
         # The gateway waits for this acknowledgement before allocating an agent.
-        recovery_checkpoint(data_dir, config)
+        checkpoint_snapshot = prepare_changes()
+        checkpoint_attempted = recovery_checkpoint(data_dir, config)
+        if checkpoint_attempted is True and getattr(config, '_checkpoint_ok', False):
+            finish_changes(checkpoint_snapshot)
+        if checkpoint_attempted is True:
+            next_sync = time.time() + config.interval
+            # Checkpoint already captured this batch; never scan it twice.
+            continue
         if config.failover:
             if now - last_heartbeat >= config.heartbeat_interval:
                 try:
@@ -2823,10 +2902,13 @@ def run_daemon(data_dir: Path, config: GitConfig,
             # agent cannot turn one minute into dozens of commits.
             if watcher.poll() and now - config._last_push_at >= config.min_push_interval:
                 push("change detected")
+                next_sync = time.time() + config.interval
 
-        if now >= next_sync:
-            next_sync = now + config.interval
-            push("safety-net interval")
+        if time.time() >= next_sync:
+            # Inotify covers idle trees; overflow or watcher failure forces a full audit.
+            if events is None or event_baseline is None or time.time()-last_full_audit >= audit_interval or events.changes_since(event_baseline) is None or events.changes_since(event_baseline):
+                push("safety-net interval")
+            next_sync = time.time() + config.interval
 
         delay = min(1, config.watch_seconds,
                     config.poll_interval if config.failover else config.interval,
@@ -2836,6 +2918,7 @@ def run_daemon(data_dir: Path, config: GitConfig,
         else:
             stop.wait(delay)
 
+    prepare_changes()
     if events is not None:
         events.close()
     try:

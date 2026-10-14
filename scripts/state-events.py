@@ -29,6 +29,9 @@ class StateEvents:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._revision = 0
+        self._paths = {}
+        self._overflow_revision = -1
+        self._consume_lock = threading.RLock()
         self.failed = False
         self._dirs = {}
         self._libc = ctypes.CDLL(None, use_errno=True)
@@ -50,9 +53,35 @@ class StateEvents:
         with self._lock:
             return str(self._revision)
 
-    def _changed(self):
+    def changes_since(self, revision):
+        with self._lock:
+            if self._overflow_revision > int(revision):
+                return None
+            return [name for name, version in self._paths.items() if version > int(revision)]
+
+    def acknowledge(self, revision):
+        with self._lock:
+            self._paths = {name: version for name, version in self._paths.items()
+                           if version > int(revision)}
+
+    def flush(self):
+        with self._consume_lock:
+            while True:
+                try:
+                    data = os.read(self.fd, 1024 * 1024)
+                except BlockingIOError:
+                    break
+                if not data:
+                    break
+                self._consume(data)
+
+    def _changed(self, path=None):
         with self._lock:
             self._revision += 1
+            if path is None or path == self.root:
+                self._overflow_revision = self._revision
+            else:
+                self._paths[path.relative_to(self.root).as_posix()] = self._revision
         self.notify.set()
 
     def _skip(self, path):
@@ -98,7 +127,7 @@ class StateEvents:
             path = parent / name if name else parent
             if self._skip(path):
                 continue
-            self._changed()
+            self._changed(path)
             if mask & self.ISDIR and mask & (self.MOVED_FROM | self.DELETE):
                 self._forget_tree(path)
             if mask & self.ISDIR and mask & (self.CREATE | self.MOVED_TO):
@@ -109,10 +138,7 @@ class StateEvents:
             while not self._stop.is_set():
                 ready, _, _ = select.select([self.fd], [], [], 0.25)
                 if ready:
-                    try:
-                        self._consume(os.read(self.fd, 1024 * 1024))
-                    except BlockingIOError:
-                        pass
+                    self.flush()
         except (OSError, ValueError):
             self.failed = True
             self.notify.set()
