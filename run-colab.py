@@ -19,6 +19,8 @@ save; automatic backups preserve only work that reached GitHub beforehand.
 """
 import getpass
 import html
+import math
+import threading
 import hashlib
 import importlib.util
 import json
@@ -766,6 +768,143 @@ class ColabAgent:
             print("Saved and stopped. You can now start the Render/local copy.")
 
 
+class StartupProgress:
+    STAGES = ('Preparing Hermes', 'Restoring saved sessions', 'Checking core tools',
+              'Starting dashboard and Telegram', 'Connecting dashboard URL')
+
+    def __init__(self, cache, warm=False, clock=time.monotonic):
+        self.path = Path(cache) / 'startup-timings.json'
+        self.kind = 'relaunch' if warm else 'fresh'
+        self.clock = clock
+        self.started = self.stage_started = clock()
+        self.index = 0
+        self.durations = {}
+        self.history = {}
+        self.handle = None
+        self.state = 'loading'
+        self.done = threading.Event()
+        self.lock = threading.RLock()
+        try:
+            if self.path.stat().st_size <= 16384:
+                raw = json.loads(self.path.read_text())
+                for kind in ('fresh', 'relaunch'):
+                    row = raw.get(kind, {})
+                    if isinstance(row, dict) and all(isinstance(row.get(stage), (int, float))
+                            and not isinstance(row[stage], bool) and math.isfinite(row[stage])
+                            and 0 <= row[stage] <= 86400 for stage in self.STAGES):
+                        self.history[kind] = row
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    @staticmethod
+    def duration(seconds):
+        seconds = max(0, int(seconds))
+        return f'{seconds // 60}m {seconds % 60:02d}s'
+
+    def snapshot(self):
+        with self.lock:
+            elapsed = self.clock() - self.started
+            percent = 100 if self.state == 'ready' else self.index * 20
+            stage = 'Hermes is ready' if self.state == 'ready' else self.STAGES[self.index]
+            if self.state == 'paused':
+                stage = 'Startup needs attention. Check the message below.'
+            previous = self.history.get(self.kind)
+            if self.state == 'ready':
+                eta = 'Ready'
+            elif self.state == 'paused':
+                eta = 'Estimate paused'
+            elif previous:
+                current_remaining = previous[self.STAGES[self.index]] - (self.clock() - self.stage_started)
+                if current_remaining <= 0:
+                    eta = 'Taking longer than last time; estimate updating'
+                else:
+                    remaining = current_remaining + sum(previous[stage] for stage in self.STAGES[self.index + 1:])
+                    eta = 'About ' + self.duration(remaining) + ' left (based on your last similar start)'
+            else:
+                eta = 'Calculating time left on this first ' + self.kind + ' start'
+            return {'stage':stage, 'percent':percent, 'elapsed':self.duration(elapsed), 'eta':eta}
+
+    def render(self):
+        try:
+            self._render()
+        except Exception:
+            # Notebook output is optional; it must not stop the agent.
+            self.handle = None
+
+    def _render(self):
+        view = self.snapshot()
+        if self.handle is not None:
+            from IPython.display import HTML
+            content = f'''<div role="status" aria-live="polite" style="padding:16px;border:1px solid #93c5fd;border-radius:16px;background:#eff6ff;color:#172554;max-width:640px;font-family:system-ui">
+<div style="font-weight:700">{html.escape(view['stage'])}</div>
+<progress aria-label="Startup steps completed" max="100" value="{view['percent']}" style="width:100%;height:12px;accent-color:#2563eb;margin:10px 0"></progress>
+<div>Elapsed: {view['elapsed']} · {html.escape(view['eta'])}</div>
+<small>Bar shows completed steps. Download speed can change the estimate.</small></div>'''
+            self.handle.update(HTML(content))
+        else:
+            print(f"[startup] {view['stage']} | elapsed {view['elapsed']} | {view['eta']}", flush=True)
+
+    def step(self, index):
+        with self.lock:
+            if index <= self.index:
+                return
+            now = self.clock()
+            self.durations[self.STAGES[self.index]] = now - self.stage_started
+            for skipped in range(self.index + 1, index):
+                self.durations[self.STAGES[skipped]] = 0
+            self.index, self.stage_started = index, now
+        self.render()
+
+    def observe(self, text):
+        # Only fixed milestones affect the UI. Log contents and secrets are
+        # never interpolated into the notebook progress display.
+        if '[render-tools] state restore finished' in text:
+            self.step(2)
+        if '[render-tools] starting one foreground' in text:
+            self.step(3)
+
+    def finish(self):
+        with self.lock:
+            self.durations[self.STAGES[self.index]] = self.clock() - self.stage_started
+            self.state = 'ready'
+            self.history[self.kind] = {stage:self.durations.get(stage, 0) for stage in self.STAGES}
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix('.tmp')
+                temporary.write_text(json.dumps(self.history))
+                temporary.replace(self.path)
+            except OSError:
+                pass
+        self.render()
+
+    def __enter__(self):
+        try:
+            from IPython import get_ipython
+            from IPython.display import HTML, display
+            if get_ipython() is not None:
+                self.handle = display(HTML('Starting Hermes…'), display_id=True)
+        except Exception:
+            self.handle = None
+        self.render()
+        def refresh():
+            while not self.done.wait(1 if self.handle is not None else 10):
+                try:
+                    self.render()
+                except Exception:
+                    # Display errors cannot interrupt startup or its backup controls.
+                    pass
+        self.thread = threading.Thread(target=refresh, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *error):
+        self.done.set()
+        self.thread.join(timeout=2)
+        if self.state != 'ready':
+            self.state = 'paused'
+            self.render()
+
+
 def main(confirm_switch=False):
     if sys.version_info < (3, 11):
         raise RuntimeError("Use a current Colab Python runtime (Python 3.11 or newer)")
@@ -787,7 +926,16 @@ def main(confirm_switch=False):
     prepare_cache()
     password = get_bootstrap_secret("HERMES_DASHBOARD_PASSWORD", "Dashboard password: ")
     env = runtime_env(token, key, password)
+    warm = all((INSTALL / name).exists() for name in (
+        '.venv/bin/python', 'hermes_cli/web_dist/index.html', 'ui-tui/dist/entry.js'))
+    with StartupProgress(cache_directory(), warm=warm) as progress:
+        return launch_with_progress(env, progress)
+
+
+def launch_with_progress(env, progress):
     install()
+    progress.step(1)
+    offset = log_offset()
     fd = os.open(LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a") as logfile:
         process = subprocess.Popen(["bash", str(TOOLS / "bootstrap.sh"), "sleep", "infinity"],
@@ -799,6 +947,12 @@ def main(confirm_switch=False):
     print(f"Restoring saved data. Startup logs: {LOG}")
     deadline = time.monotonic() + int(env.get("HERMES_COLAB_STARTUP_TIMEOUT_SECONDS", "1800"))
     while time.monotonic() < deadline:
+        try:
+            with LOG.open('rb') as startup_log:
+                startup_log.seek(max(offset, LOG.stat().st_size - 32768))
+                progress.observe(startup_log.read().decode('utf-8', errors='replace'))
+        except OSError:
+            pass
         if process.poll() is not None:
             raise RuntimeError(f"Startup exited. Inspect {LOG}; data has not been deleted")
         try:
@@ -811,7 +965,9 @@ def main(confirm_switch=False):
         time.sleep(2)
     else:
         raise RuntimeError(f"Startup is still pending. Inspect {LOG} and use HERMES_COLAB.status()")
+    progress.step(4)
     agent.dashboard()
+    progress.finish()
     print("Telegram polling is running. Use HERMES_COLAB.backup() and HERMES_COLAB.stop() before switching hosts.")
     return agent
 
