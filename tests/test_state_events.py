@@ -108,6 +108,52 @@ class StateEventTests(unittest.TestCase):
             finally:
                 monitor.close()
 
+    def test_exact_paths_flush_and_ack_preserve_writes_during_upload(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            monitor = module.StateEvents(root, lambda p: False)
+            try:
+                (root/'chat').write_text('first')
+                monitor.flush()
+                snapshot = monitor.sample()
+                self.assertEqual(monitor.changes_since('0'), ['chat'])
+                (root/'chat').write_text('during upload')
+                (root/'new').write_text('new')
+                monitor.flush()
+                monitor.acknowledge(snapshot)
+                self.assertEqual(set(monitor.changes_since(snapshot)), {'chat', 'new'})
+                latest = monitor.sample()
+                monitor.acknowledge(latest)
+                self.assertEqual(monitor.changes_since(latest), [])
+                monitor._consume(struct.pack('iIII', -1, monitor.OVERFLOW, 0, 0))
+                self.assertIsNone(monitor.changes_since(latest))
+            finally:
+                monitor.close()
+
+    def test_daemon_passes_only_dirty_paths_and_keeps_edits_during_upload(self):
+        storage = load_storage()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td); stop = threading.Event(); batches = []
+            config = make_config(storage, interval=60, watch_seconds=30, debounce_seconds=0, min_push_interval=0)
+            def sync(*args, **kwargs):
+                batches.append(config._source_changes)
+                if len(batches) == 1:
+                    (root/'chat').write_text('first')
+                elif len(batches) == 2:
+                    (root/'chat').write_text('during upload')
+                    (root/'new').write_text('new')
+                elif len(batches) == 3:
+                    stop.set()
+            timer = threading.Timer(4, stop.set); timer.start()
+            try:
+                with patch.dict(os.environ, {'GIT_STATE_EVENT_WATCH':'1'}), patch.object(stop,'wait',return_value=False), patch.object(storage,'_write_sync_status'), patch.object(storage,'seed_on_startup'), patch.object(storage,'recovery_checkpoint',return_value=False), patch.object(storage,'sync_once',side_effect=sync):
+                    storage.run_daemon(root,config,stop)
+                self.assertIsNone(batches[0])
+                self.assertEqual(set(batches[1]), {'chat'})
+                self.assertEqual(set(batches[2]), {'chat','new'})
+            finally:
+                timer.cancel()
+
     def test_daemon_wakes_on_event_before_long_poll_interval(self):
         storage = load_storage()
         with tempfile.TemporaryDirectory() as td:

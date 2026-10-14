@@ -35,3 +35,11 @@ Encryption is identified from the manifest, with header-based compatibility for 
 ## Files deleted while a backup is running
 
 A file or directory can disappear between enumeration and copying, especially when Chrome rotates Safe Browsing stores. The worker confirms that the source entry is absent while the home remains accessible, removes partial output for that entry, and records its deletion. A replaced/still-present source, a missing destination or a permission/read error still fails the snapshot and retains the prior backup. A home directory replaced during capture is rejected. The same rule handles SQLite databases removed before they can be opened.
+
+## Upload changes immediately
+
+Colab's Linux watcher now records the exact changed paths. Once the first reconciliation completes, a write wakes the uploader without a debounce or minimum interval. It updates only those files in the existing snapshot, records additions, renames and deletions, and folds WAL changes into a consistent SQLite database snapshot even while chats remain open. Edits made during an upload stay queued for the next upload. No chat completion is required.
+
+A rollback journal protects the previous local snapshot if copying fails or the worker exits mid-update. Initial reconciliation, inotify overflow and watcher failure still require a full audit. An hourly audit (`GIT_STATE_FULL_AUDIT_SECONDS`, default 3600) also catches changes that bypass filesystem notifications. Ordinary saves do not rebuild or fingerprint the complete home. Git staging forces inclusion of ignored files, and an encoded backup path preserves nested `.git` directories and ordinary `.enc` filenames without Git's embedded-repository handling; restore reverses the encoding.
+
+`update-storage.py` installs the changed-path worker while Dashboard and Telegram remain running. The first update builds its inventory once and can take longer than later saves. `GIT_STATE_STATUS_FILE` reports planning, snapshot, staging and uploading phases. Upload completion still depends on GitHub and network speed; “saved” is reported only after confirmation.
