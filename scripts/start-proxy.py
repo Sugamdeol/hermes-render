@@ -55,6 +55,21 @@ http {
       auth_basic off;
       proxy_pass http://127.0.0.1:8443/telegram;
     }
+    # Native Files streams accept 100 MiB; chat attachments keep their own limit.
+    location = /api/files/upload-stream {
+      client_max_body_size FILES_UPLOAD_BODY_LIMIT;
+      proxy_pass http://127.0.0.1:9119;
+      proxy_http_version 1.1;
+      proxy_set_header Host "127.0.0.1:9119";
+      proxy_set_header Origin $hermes_origin;
+      proxy_set_header Authorization "";
+      proxy_set_header X-Forwarded-For "";
+      proxy_set_header Upgrade $http_upgrade;
+      proxy_set_header Connection $connection_upgrade;
+      proxy_request_buffering off;
+      proxy_read_timeout 3600s;
+      proxy_buffering off;
+    }
     location / {
       proxy_pass http://127.0.0.1:9119;
       proxy_http_version 1.1;
@@ -69,5 +84,5 @@ http {
     }
   }
 }
-'''.replace("PORT_VALUE", str(port)).replace('UPLOAD_BODY_LIMIT', str(upload_limit + 1024 * 1024)))
+'''.replace("PORT_VALUE", str(port)).replace('FILES_UPLOAD_BODY_LIMIT', str(101 * 1024 * 1024)).replace('UPLOAD_BODY_LIMIT', str(upload_limit + 1024 * 1024)))
 subprocess.run(["nginx", "-s", "reload"] if Path("/run/nginx.pid").exists() else ["nginx"], check=True)
