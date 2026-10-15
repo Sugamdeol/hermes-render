@@ -2021,6 +2021,62 @@ function observeAnswerBlocks(root) {
 
   // ── settings modal ──────────────────────────────────────────────────
 
+  function AgentUpdatePanel() {
+    const [state, setState] = useState(null);
+    const [error, setError] = useState("");
+    const [pending, setPending] = useState(false);
+    const [confirming, setConfirming] = useState(false);
+    const sending = useRef(false);
+    const generation = useRef(0);
+    const busy = pending || !!(state && ["queued", "running"].includes(state.phase));
+    useEffect(() => {
+      let disposed = false;
+      let timer;
+      const poll = async () => {
+        const version = generation.current;
+        try {
+          const next = await fetchJSON(`${BASE}/agent-update`);
+          if (!disposed && version === generation.current && !sending.current) { setState(next); setError(""); }
+        } catch {
+          if (!disposed) setError("Cannot reach update control. If Hermes is restarting, wait or reopen its link from Colab.");
+        }
+        if (!disposed) timer = setTimeout(poll, 3000);
+      };
+      poll();
+      return () => { disposed = true; clearTimeout(timer); };
+    }, []);
+    const submit = async (action) => {
+      if (sending.current || busy) return;
+      sending.current = true;
+      generation.current++;
+      setPending(true); setError(""); setConfirming(false);
+      try {
+        const next = await fetchJSON(`${BASE}/agent-update`, { method: "POST",
+          headers: { "X-Hermes-Update": "1" },
+          body: { action, ref: action === "update" ? state.result.target : "main" } });
+        setState(next);
+      } catch (e) { setError(str(e.message, "Request failed. Check the Colab notebook before retrying.")); }
+      finally { sending.current = false; setPending(false); }
+    };
+    const result = state && state.result;
+    const canUpdate = state && state.available && state.phase === "succeeded" && state.action === "check" && result && result.update_available;
+    return h("section", { className: "hcd-agent-update", "aria-labelledby": "hcd-agent-update-title" },
+      h("h5", { id: "hcd-agent-update-title" }, "Hermes agent"),
+      h("p", { className: "hcd-hint" }, "Check the official Hermes repository and update from Colab."),
+      result ? h("p", { className: "hcd-hint" }, `Installed ${str(result.current).slice(0, 12)} · Latest ${str(result.target).slice(0, 12)}`) : null,
+      h("p", { role: "status", "aria-live": "polite", className: "hcd-hint" }, state ? state.message : "Loading update control…"),
+      error ? h("p", { role: "alert" }, error) : null,
+      h("div", { className: "hcd-settings-foot" },
+        h("button", { type: "button", disabled: !state || !state.available || busy, onClick: () => submit("check") }, busy ? "Working…" : "Check for updates"),
+        canUpdate ? h("button", { type: "button", className: "primary", disabled: busy, onClick: () => setConfirming(true) }, "Update Hermes") : null),
+      confirming ? h("div", { className: "hcd-update-confirm", role: "group", "aria-label": "Confirm Hermes update" },
+        h("p", null, "Update Hermes now? Finish any running tasks first. A backup is required and the dashboard will briefly disconnect. Keep Colab running."),
+        h("p", { className: "hcd-hint" }, "If the dashboard address changes, open the new link shown in Colab."),
+        h("div", { className: "hcd-settings-foot" },
+          h("button", { type: "button", onClick: () => setConfirming(false) }, "Cancel"),
+          h("button", { type: "button", className: "primary", disabled: busy, onClick: () => submit("update") }, "Back up and update"))) : null);
+  }
+
   function SettingsModal({ settings, onChange, onClose, onReset }) {
     const set = (patch) => onChange(patch);
     const Toggle = ({ label, k, hint }) =>
@@ -2042,6 +2098,7 @@ function observeAnswerBlocks(root) {
         h(Choice, { label: "Density", k: "density", opts: [["comfortable", "Comfortable"], ["compact", "Compact"]] }),
         h(Choice, { label: "Message width", k: "messageWidth", opts: [["wide", "Wide"], ["narrow", "Narrow"]] }),
         h(Choice, { label: "Font size", k: "fontSize", opts: [["small", "Small"], ["medium", "Medium"], ["large", "Large"]] }),
+        h(AgentUpdatePanel),
         h("h5", null, "Behaviour"),
         h(Toggle, { label: "Confirm before deleting", k: "confirmDelete" }),
         h(Toggle, { label: "Auto-title new conversations", k: "autoTitle" }),

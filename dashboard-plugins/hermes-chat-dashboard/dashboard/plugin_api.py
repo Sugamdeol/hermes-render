@@ -1233,3 +1233,65 @@ def get_shared(token: str, limit: int = 80, offset: int = -80):
             pass
 
 
+
+
+# Colab owns lifecycle control outside the gateway process so a restart cannot
+# kill the updater that must validate and roll back the replacement.
+def _update_directory():
+    directory = os.environ.get("HERMES_COLAB_UPDATE_DIR")
+    if os.environ.get("HERMES_RUNTIME_PROFILE") != "colab-full" or not directory:
+        raise HTTPException(503, "Agent updates require the current Colab launcher")
+    path = Path(directory)
+    try:
+        heartbeat = json.loads((path / "heartbeat.json").read_text())
+        if not 0 <= time.time() - float(heartbeat["time"]) < 30:
+            raise ValueError("stale worker")
+    except (OSError, ValueError, KeyError, TypeError):
+        raise HTTPException(503, "Update control is offline. Rerun Start Hermes in Colab")
+    return path
+
+
+@router.get("/agent-update")
+def agent_update_status(request: Request):
+    _require_session(request)
+    try:
+        directory = _update_directory()
+    except HTTPException as exc:
+        return {"available": False, "phase": "unavailable", "message": exc.detail}
+    try:
+        status = json.loads((directory / "status.json").read_text())
+    except (OSError, ValueError):
+        status = {"phase": "idle", "message": "Check for an official Hermes update."}
+    return {**status, "available": True}
+
+
+@router.post("/agent-update")
+def queue_agent_update(request: Request, body: dict):
+    _require_session(request)
+    if request.headers.get("x-hermes-update") != "1":
+        raise HTTPException(403, "Update request header required")
+    action = body.get("action")
+    ref = body.get("ref", "main")
+    if action not in ("check", "update") or not isinstance(ref, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}", ref) or ".." in ref:
+        raise HTTPException(422, "Choose check or update and a valid upstream ref")
+    if action == "update" and not re.fullmatch(r"[0-9a-f]{40}", ref):
+        raise HTTPException(422, "Check for updates first, then update the checked commit")
+    directory = _update_directory()
+    import fcntl
+    with (directory / "queue.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = agent_update_status(request)
+        if state.get("phase") in ("queued", "running") or (directory / "request.json").exists():
+            raise HTTPException(409, "An update operation is already in progress")
+        if action == "update" and (state.get("action") != "check" or state.get("phase") != "succeeded" or state.get("result", {}).get("target") != ref):
+            raise HTTPException(409, "Check for updates again before installing")
+        job = {"id": secrets.token_hex(12), "action": action, "ref": ref, "phase": "queued", "message": "Check queued." if action == "check" else "Update queued. Keep the Colab notebook running."}
+        for name in ("status.json", "request.json"):
+            fd, temporary = tempfile.mkstemp(dir=directory, prefix=".update-")
+            try:
+                with os.fdopen(fd, "w") as handle:
+                    json.dump(job, handle)
+                os.replace(temporary, directory / name)
+            finally:
+                Path(temporary).unlink(missing_ok=True)
+    return {**job, "available": True}

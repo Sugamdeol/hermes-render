@@ -21,5 +21,12 @@ Rounded workspace shell (22px), composer (22px), controls (9–13px). The square
 ## Components
 The existing plugin owns message rendering, composer, command palette, tool activity, metadata and settings. Extend those owners rather than introducing another chat or gateway connection. CSS overrides are scoped to `.hcd`; other dashboard routes retain their typography.
 
+### Agent updates
+Chat settings owns the Hermes agent update section. Reuse the existing Modal,
+button styles and hint text. The authenticated plugin API queues operations;
+the Colab notebook owns execution across gateway restarts. Check precedes an
+explicit Back up and update confirmation. Disable duplicate actions, announce
+status and errors, and show notebook recovery instructions during disconnects.
+
 ## Do's and Don'ts
 Quick 140ms color/border feedback only; do not animate message height or replay entrance animations while streaming. Starting prompts are buttons that fill the draft without sending. Keep keyboard focus visible and motion optional. Keep code copy/export, model selection, attachments and tools available. Never replay a prompt automatically. Submission locks prevent duplicate sends. Read-only sessions cannot submit.
