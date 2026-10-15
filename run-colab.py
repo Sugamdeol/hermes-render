@@ -170,6 +170,7 @@ def runtime_env(token, key, dashboard_password=None):
         "HERMES_DASHBOARD_PORT": "9119",
         "HERMES_RUNTIME_PROFILE": "colab-full",
         "HERMES_NOTEBOOK_HOST": NOTEBOOK_HOST,
+        "HERMES_RESTORE_COPY_WORKERS": os.environ.get("HERMES_RESTORE_COPY_WORKERS", "4"),
         "HERMES_COLAB_UPDATE_DIR": "/tmp/hermes-colab-control",
         "HERMES_MAX_CONCURRENT_SESSIONS": "10",
         "HERMES_RESUME_ALL_INTERRUPTED": "1",

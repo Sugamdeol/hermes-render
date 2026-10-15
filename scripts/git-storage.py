@@ -2235,72 +2235,93 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     restored = 0
     managed = set()
     last_report = time.monotonic()
-    for source in sorted(source_files):
-        if time.monotonic() - last_report >= 10:
-            LOG.info('[restore] Local files: %d/%d processed', restored, len(source_files))
-            last_report = time.monotonic()
-        relative = relative_paths[source]
-        # Decode once per file; comparing every file to every database was quadratic.
-        decoded = decoded_backup_path(relative, manifest)
-        if relative in sqlite_sidecars or decoded in decoded_sidecars:
-            continue
-        sealed = backup_file_is_encrypted(source, relative, manifest)
-        relative = decoded
-        logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
-        is_sqlite = logical_relative in sqlite_dbs
-        validate_restore_name(logical_relative)
-        if is_sqlite:
-            # Restore only the database snapshot. A legacy branch may still
-            # contain sidecars from the old raw-file mirror; never replay them
-            # against this restored image.
-            with source.open("rb") as handle:
-                prefix = handle.readline(64)
-            if prefix in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
-                writer = lambda target: decrypt_stream_file(source, target, config)
-            elif sealed:
-                writer = lambda target: decrypt_age_file(source, target, config)
+    from concurrent.futures import ThreadPoolExecutor
+    from collections import deque
+    default_workers = '4' if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full' else '1'
+    try:
+        workers = max(1, min(8, int(os.environ.get('HERMES_RESTORE_COPY_WORKERS', default_workers))))
+    except ValueError as exc:
+        raise GitStateError('HERMES_RESTORE_COPY_WORKERS must be an integer') from exc
+    LOG.info('[restore] Using %d bounded file-copy worker(s)', workers)
+    pending = deque()
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='hermes-restore') as pool:
+        for source in sorted(source_files):
+            if time.monotonic() - last_report >= 10:
+                LOG.info('[restore] Local files: %d/%d processed', restored, len(source_files))
+                last_report = time.monotonic()
+            relative = relative_paths[source]
+            # Decode once per file; comparing every file to every database was quadratic.
+            decoded = decoded_backup_path(relative, manifest)
+            if relative in sqlite_sidecars or decoded in decoded_sidecars:
+                continue
+            sealed = backup_file_is_encrypted(source, relative, manifest)
+            relative = decoded
+            logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
+            is_sqlite = logical_relative in sqlite_dbs
+            validate_restore_name(logical_relative)
+            if logical_relative in managed:
+                raise GitStateError('Conflicting logical restore paths')
+            if is_sqlite:
+                # Restore only the database snapshot. A legacy branch may still
+                # contain sidecars from the old raw-file mirror; never replay them
+                # against this restored image.
+                with source.open("rb") as handle:
+                    prefix = handle.readline(64)
+                if prefix in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
+                    writer = lambda target: decrypt_stream_file(source, target, config)
+                elif sealed:
+                    writer = lambda target: decrypt_age_file(source, target, config)
+                else:
+                    # Older mirrors stored the main file and live WAL/SHM as
+                    # separate blobs. Fold any same-generation WAL frames into a
+                    # new DB snapshot instead of discarding the latest commits.
+                    writer = lambda target: snapshot_sqlite(source, target)
+                mode = manifest_mode(recorded_modes.get(logical_relative))
+                publish_restored_file(data_dir, logical_relative, writer,
+                                      mode or (source.stat().st_mode & 0o777), sqlite=True)
+                restored += 1
+                managed.add(logical_relative)
+                continue
+            payload = None
+            if sealed:
+                payload = source.read_bytes()
+                relative = relative[: -len(ENCRYPTED_SUFFIX)]
+                opened = age_decrypt(payload, config)
+                if opened is None:
+                    raise GitStateError(f'Could not decrypt {relative}; restore is incomplete and backup remains blocked')
+                payload = opened
+            writer = (lambda target: shutil.copyfile(source, target)) if payload is None else (lambda target: target.write_bytes(payload))
+            # git records the executable bit in the object mode, so a script that
+            # was 0755 in /opt/data has to come back runnable -- a restored
+            # entrypoint or hook that lost its +x simply does not run. Modes git
+            # cannot express (a 0600 key) come from the manifest instead. A
+            # restored .env holds live keys, so it is owner-only whatever either
+            # of them says.
+            if relative in SENSITIVE_FILES:
+                mode = 0o600
             else:
-                # Older mirrors stored the main file and live WAL/SHM as
-                # separate blobs. Fold any same-generation WAL frames into a
-                # new DB snapshot instead of discarding the latest commits.
-                writer = lambda target: snapshot_sqlite(source, target)
-            mode = manifest_mode(recorded_modes.get(logical_relative))
-            publish_restored_file(data_dir, logical_relative, writer,
-                                  mode or (source.stat().st_mode & 0o777), sqlite=True)
+                mode = manifest_mode(recorded_modes.get(relative))
+                if mode is None:
+                    try:
+                        mode = source.stat().st_mode & 0o777
+                    except OSError:
+                        mode = 0o644
+            if payload is None:
+                if workers == 1:
+                    copy_restored_plain_file(source, data_dir, relative, mode or 0o644)
+                else:
+                    pending.append(pool.submit(copy_restored_plain_file, source, data_dir, relative, mode or 0o644))
+                    if len(pending) >= workers * 2:
+                        pending.popleft().result()
+            else:
+                publish_restored_file(data_dir, relative, writer, mode or 0o644,
+                                      sqlite=relative in sqlite_dbs)
             restored += 1
-            managed.add(logical_relative)
-            continue
-        payload = None
-        if sealed:
-            payload = source.read_bytes()
-            relative = relative[: -len(ENCRYPTED_SUFFIX)]
-            opened = age_decrypt(payload, config)
-            if opened is None:
-                raise GitStateError(f'Could not decrypt {relative}; restore is incomplete and backup remains blocked')
-            payload = opened
-        writer = (lambda target: shutil.copyfile(source, target)) if payload is None else (lambda target: target.write_bytes(payload))
-        # git records the executable bit in the object mode, so a script that
-        # was 0755 in /opt/data has to come back runnable -- a restored
-        # entrypoint or hook that lost its +x simply does not run. Modes git
-        # cannot express (a 0600 key) come from the manifest instead. A
-        # restored .env holds live keys, so it is owner-only whatever either
-        # of them says.
-        if relative in SENSITIVE_FILES:
-            mode = 0o600
-        else:
-            mode = manifest_mode(recorded_modes.get(relative))
-            if mode is None:
-                try:
-                    mode = source.stat().st_mode & 0o777
-                except OSError:
-                    mode = 0o644
-        if payload is None:
-            copy_restored_plain_file(source, data_dir, relative, mode or 0o644)
-        else:
-            publish_restored_file(data_dir, relative, writer, mode or 0o644,
-                                  sqlite=relative in sqlite_dbs)
-        restored += 1
-        managed.add(relative)
+            managed.add(relative)
+        # No completion marker, symlink publication or backup is allowed until
+        # every file has finished and every worker exception has propagated.
+        while pending:
+            pending.popleft().result()
 
     # Directories git could not hold, and the symlinks the walk did not copy
     # as blobs. Both come from the manifest the mirror wrote.
