@@ -2052,10 +2052,10 @@ function observeAnswerBlocks(root) {
       setPending(true); setError(""); setConfirming(false);
       try {
         const next = await fetchJSON(`${BASE}/agent-update`, { method: "POST",
-          headers: { "X-Hermes-Update": "1" },
-          body: { action, ref: action === "update" ? state.result.target : "main" } });
+          headers: { "X-Hermes-Update": "1", "Content-Type": "application/json" },
+          body: JSON.stringify({ action, ref: action === "update" ? state.result.target : "main" }) });
         setState(next);
-      } catch (e) { setError(str(e.message, "Request failed. Check the your notebook notebook before retrying.")); }
+      } catch (e) { setError(str(e.message, "Request failed. Check your notebook before retrying.")); }
       finally { sending.current = false; setPending(false); }
     };
     const result = state && state.result;
