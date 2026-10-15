@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import urllib.request
 
 UPSTREAM = 'https://github.com/NousResearch/hermes-agent.git'
 
@@ -38,8 +39,15 @@ def check(ns, ref='main'):
 
 
 def idle(agent, home):
-    if agent.status().get('active_sessions'):
-        raise RuntimeError('Wait for active sessions to finish before updating')
+    # active_sessions counts recently used chats, including idle conversations.
+    # Read the actual gateway work count instead (status() omits these fields).
+    with urllib.request.urlopen('http://127.0.0.1:10000/healthz', timeout=5) as response:
+        status = json.load(response)
+    count = status.get('active_agents')
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise RuntimeError('Cannot verify running tasks; retry when gateway status is available')
+    if count or status.get('gateway_busy'):
+        raise RuntimeError('Wait for running tasks to finish before updating')
     journal = home / '.render-recovery.json'
     records = json.loads(journal.read_text()) if journal.exists() else {}
     if not isinstance(records, dict) or any(not isinstance(v, dict) or v.get('status', 'pending') == 'pending' for v in records.values()):

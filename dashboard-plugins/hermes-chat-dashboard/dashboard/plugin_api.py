@@ -1276,6 +1276,12 @@ def queue_agent_update(request: Request, body: dict):
         raise HTTPException(422, "Choose check or update and a valid upstream ref")
     if action == "update" and not re.fullmatch(r"[0-9a-f]{40}", ref):
         raise HTTPException(422, "Check for updates first, then update the checked commit")
+    if action == "update":
+        bridge = sys.modules.get('_hermes_chat_bridge')
+        if bridge:
+            with bridge.bridge.lock:
+                if any(row.get('running') for row in bridge.bridge.states.values()):
+                    raise HTTPException(409, "Wait for the running dashboard task to finish before updating")
     directory = _update_directory()
     import fcntl
     with (directory / "queue.lock").open("a") as lock:

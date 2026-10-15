@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 import fastapi
@@ -53,6 +55,16 @@ class DashboardUpdateTests(unittest.TestCase):
         self.assertEqual(self.client.post('/agent-update', json={'action':'update','ref':target}, headers=self.headers).status_code, 409)
         self.control.write(self.directory/'status.json', {'phase':'succeeded','action':'check','result':{'target':target}})
         self.assertEqual(self.client.post('/agent-update', json={'action':'update','ref':target}, headers=self.headers).status_code, 200)
+
+    def test_idle_dashboard_chat_allowed_but_running_task_blocks(self):
+        target = 'a'*40
+        self.control.write(self.directory/'status.json', {'phase':'succeeded','action':'check','result':{'target':target}})
+        bridge = SimpleNamespace(lock=threading.RLock(), states={'chat': {'running': True}})
+        with patch.dict(sys.modules, {'_hermes_chat_bridge':SimpleNamespace(bridge=bridge)}):
+            self.assertEqual(self.client.post('/agent-update', json={'action':'update','ref':target}, headers=self.headers).status_code, 409)
+            self.assertFalse((self.directory/'request.json').exists())
+            bridge.states['chat']['running'] = False
+            self.assertEqual(self.client.post('/agent-update', json={'action':'update','ref':target}, headers=self.headers).status_code, 200)
 
     def test_stale_or_unsupported_worker_disables_controls(self):
         self.control.write(self.directory/'heartbeat.json', {'time':time.time()-60})
