@@ -73,3 +73,38 @@ class ChunkResume(unittest.TestCase):
         second=m.assemble_restore_blob(self.data,self.record,self.cache,'second.bin')
         self.assertNotEqual(first,second)
         self.assertEqual(first.read_bytes(),second.read_bytes())
+
+    def test_plain_retry_reuses_only_byte_identical_files_and_repairs_mode(self):
+        source=self.root/'source';source.write_bytes(b'same')
+        target=self.root/'destination';target.mkdir();leaf=target/'file';leaf.write_bytes(b'same');leaf.chmod(0o644)
+        with patch.object(m,'publish_restored_file',side_effect=AssertionError('identical file recopied')):
+            m.copy_restored_plain_file(source,target,'file',0o600)
+        self.assertEqual(leaf.stat().st_mode&0o777,0o600)
+        leaf.write_bytes(b'evil')
+        m.copy_restored_plain_file(source,target,'file',0o600)
+        self.assertEqual(leaf.read_bytes(),b'same')
+
+    def test_plain_retry_replaces_leaf_symlink_without_modifying_external_file(self):
+        source=self.root/'source';source.write_bytes(b'saved')
+        outside=self.root/'outside';outside.write_bytes(b'keep')
+        target=self.root/'destination';target.mkdir();(target/'file').symlink_to(outside)
+        m.copy_restored_plain_file(source,target,'file',0o600)
+        self.assertEqual(outside.read_bytes(),b'keep');self.assertFalse((target/'file').is_symlink())
+
+    def test_metadata_decoding_is_linear_in_file_count(self):
+        work=self.root/'work';data=work/'data';data.mkdir(parents=True)
+        for i in range(20):(data/f'file{i}').write_bytes(b'value')
+        (work/m.MANIFEST_NAME).write_text(json.dumps({'sqlite_snapshots':[f'db{i}.db' for i in range(50)]}))
+        config=m.GitConfig('owner/repo','fixture',workdir=work)
+        with patch.object(m,'decoded_backup_path',wraps=m.decoded_backup_path) as decode:
+            m._materialize_tree(work,self.root/'restored',config)
+        self.assertLessEqual(decode.call_count,25)
+
+    def test_plain_retry_breaks_external_hardlink_before_changing_mode(self):
+        import os
+        source=self.root/'source';source.write_bytes(b'saved')
+        outside=self.root/'outside';outside.write_bytes(b'saved');outside.chmod(0o644)
+        target=self.root/'destination';target.mkdir();os.link(outside,target/'file')
+        m.copy_restored_plain_file(source,target,'file',0o600)
+        self.assertEqual(outside.stat().st_mode&0o777,0o644)
+        self.assertNotEqual(outside.stat().st_ino,(target/'file').stat().st_ino)

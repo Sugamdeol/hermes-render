@@ -939,6 +939,11 @@ class StartupProgress:
         if '[restore] Large backups verified; restoring local files' in text:
             self.restore_detail = 'Large backups verified. Restoring local files…'
             self.render()
+        files = re.findall(r'\[restore\] Local files: (\d+)/(\d+) processed', text)
+        if files:
+            done, total = map(int, files[-1])
+            self.restore_detail = f'Local files: {done:,} / {total:,} processed'
+            self.render()
         if '[render-tools] state restore finished' in text:
             self.step(2)
         if '[render-tools] starting one foreground' in text:
