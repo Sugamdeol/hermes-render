@@ -1,3 +1,5 @@
+import json
+import io
 import importlib.util
 from pathlib import Path
 import subprocess
@@ -12,6 +14,25 @@ spec.loader.exec_module(updater)
 
 
 class UpdateTests(unittest.TestCase):
+    def setUp(self):
+        self.health = patch.object(updater.urllib.request, 'urlopen',
+            side_effect=lambda *a, **kw: io.BytesIO(json.dumps(self.status).encode()))
+        self.status = {'active_agents': 0, 'gateway_busy': False, 'active_sessions': 4}
+        self.health.start()
+        self.addCleanup(self.health.stop)
+
+    def test_idle_recent_chats_do_not_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            updater.idle(Mock(), Path(td))
+
+    def test_running_or_unknown_work_blocks(self):
+        with tempfile.TemporaryDirectory() as td:
+            for status in ({'active_agents': 1}, {'active_agents': 0, 'gateway_busy': True},
+                           {}, {'active_agents': '0'}, {'active_agents': False}):
+                self.status = status
+                with self.assertRaises(RuntimeError):
+                    updater.idle(Mock(), Path(td))
+
     def test_annotated_release_resolves_to_commit(self):
         run = Mock(return_value=subprocess.CompletedProcess([], 0, 'a'*40+'\trefs/tags/v1\n'+'b'*40+'\trefs/tags/v1^{}\n'))
         self.assertEqual(updater.resolve({'run': run}, 'v1'), 'b'*40)
