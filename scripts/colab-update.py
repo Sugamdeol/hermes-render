@@ -52,7 +52,7 @@ def update(ns, agent, ref='main'):
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            raise RuntimeError('Another Colab update is already running')
+            raise RuntimeError('Another notebook update is already running')
         info = check(ns, ref)
         if not info['update_available']:
             return agent

@@ -331,3 +331,26 @@ update job, so the operation survives the dashboard restarting. Its status is
 shown when you reopen settings. If a tunnel address changes, open the new
 link shown in Colab. Older notebook launchers show an offline update control;
 save, stop and rerun Start once to enable it.
+
+## Use the same launcher on Kaggle
+
+Import `Hermes.ipynb` into a **private Kaggle notebook**, enable **Internet**, and
+use the CPU runtime. In **Add-ons → Secrets**, add and enable `GIT_STATE_TOKEN`,
+`STORAGE_ENCRYPTION_KEY`, and `HERMES_DASHBOARD_PASSWORD`. Use the same storage
+repository and encryption key as your existing host. Optional named-tunnel
+secrets are supported too. Save and stop the previous host before switching.
+
+The notebook detects Kaggle automatically. It uses Kaggle Secrets, skips Drive
+mounting and Colab embedding, and displays the authenticated Cloudflare link.
+Private state stays in `/opt/data`; launcher, Git checkout and default cache are
+under `/kaggle/temp/hermes`, outside saved notebook outputs. The default cache
+is temporary. An optional writable `HERMES_NOTEBOOK_CACHE_DIR` can point to
+`/kaggle/working/HermesRuntimeCache` for public build caching in saved outputs.
+Never export tokens, logs or private state as notebook outputs.
+
+Both platforms support `HERMES` and the legacy `HERMES_COLAB` handle, backup/stop,
+resumable restore, and agent updates. Internally `colab-full` is the retained
+full notebook runtime profile on both hosts. Requires Linux with root access
+and Python 3.11 or newer. Host-routing/secrets behavior is tested locally; a
+complete live Kaggle launch remains unverified. No always-on lifetime or speed
+is promised.
