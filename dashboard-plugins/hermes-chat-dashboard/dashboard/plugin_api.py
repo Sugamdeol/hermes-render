@@ -1240,14 +1240,14 @@ def get_shared(token: str, limit: int = 80, offset: int = -80):
 def _update_directory():
     directory = os.environ.get("HERMES_COLAB_UPDATE_DIR")
     if os.environ.get("HERMES_RUNTIME_PROFILE") != "colab-full" or not directory:
-        raise HTTPException(503, "Agent updates require the current Colab launcher")
+        raise HTTPException(503, "Agent updates require the current notebook launcher")
     path = Path(directory)
     try:
         heartbeat = json.loads((path / "heartbeat.json").read_text())
         if not 0 <= time.time() - float(heartbeat["time"]) < 30:
             raise ValueError("stale worker")
     except (OSError, ValueError, KeyError, TypeError):
-        raise HTTPException(503, "Update control is offline. Rerun Start Hermes in Colab")
+        raise HTTPException(503, "Update control is offline. Rerun Start Hermes in your notebook")
     return path
 
 
@@ -1285,7 +1285,7 @@ def queue_agent_update(request: Request, body: dict):
             raise HTTPException(409, "An update operation is already in progress")
         if action == "update" and (state.get("action") != "check" or state.get("phase") != "succeeded" or state.get("result", {}).get("target") != ref):
             raise HTTPException(409, "Check for updates again before installing")
-        job = {"id": secrets.token_hex(12), "action": action, "ref": ref, "phase": "queued", "message": "Check queued." if action == "check" else "Update queued. Keep the Colab notebook running."}
+        job = {"id": secrets.token_hex(12), "action": action, "ref": ref, "phase": "queued", "message": "Check queued." if action == "check" else "Update queued. Keep the notebook running."}
         for name in ("status.json", "request.json"):
             fd, temporary = tempfile.mkstemp(dir=directory, prefix=".update-")
             try:

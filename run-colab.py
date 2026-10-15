@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Paste this whole file into ONE Colab code cell and run it.
 
-It installs the reviewed current upstream Hermes with the full Colab profile, restores the private
+It installs the reviewed current upstream Hermes on Colab or Kaggle with the full notebook profile, restores the private
 Sugamdeol/hermes-storage@state repository and starts Telegram in polling mode.
 In Colab the agent runs as root, like notebook cells do, so `!apt-get
 install ...` and other system downloads from the agent's own tools work.
 Only GIT_STATE_TOKEN and the existing STORAGE_ENCRYPTION_KEY are needed.
-Stop the Render/local copy after its successful backup before starting here.
+Stop your other Hermes host after its successful backup before starting here.
 
 After launch, use another cell:
     HERMES_COLAB.backup()    # wait for a confirmed GitHub save
@@ -41,11 +41,19 @@ import urllib.request
 from urllib.parse import urlsplit
 
 CODE_URL = "https://github.com/Sugamdeol/hermes-render.git"
-SOURCE = Path("/content/hermes-render-source")
+def notebook_host():
+    if os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_CONTAINER_NAME") or Path("/kaggle/working").is_dir():
+        return "kaggle"
+    return "colab"
+
+
+NOTEBOOK_HOST = notebook_host()
+NOTEBOOK_ROOT = Path("/kaggle/temp/hermes") if NOTEBOOK_HOST == "kaggle" else Path("/content")
+SOURCE = NOTEBOOK_ROOT / "hermes-render-source"
 INSTALL = Path("/opt/hermes")
 TOOLS = Path("/opt/render-tools")
 DATA = Path("/opt/data")
-LOG = Path("/content/hermes-colab.log")
+LOG = NOTEBOOK_ROOT / ("hermes-" + NOTEBOOK_HOST + ".log")
 CHECKPOINT = r'''
 import json,os,secrets,tempfile,time
 from pathlib import Path
@@ -148,7 +156,7 @@ def runtime_env(token, key, dashboard_password=None):
         "GIT_STATE_GIT_TIMEOUT_SECONDS": "1800",
         "HERMES_RESTORE_TIMEOUT_SECONDS": "1800",
         "HERMES_COLAB_STARTUP_TIMEOUT_SECONDS": "1800",
-        "HERMES_HOME": str(DATA), "GIT_STATE_WORKDIR": "/content/hermes-git-cache/state",
+        "HERMES_HOME": str(DATA), "GIT_STATE_WORKDIR": str(SOURCE.parent / "hermes-git-cache/state"),
         "HERMES_UID": "", "HERMES_GID": "",
         "HERMES_RECOVERY_CHECKPOINT_FILE": "/tmp/hermes-recovery-checkpoint.json",
         "HERMES_INSTANCE_ID": "colab-" + secrets.token_hex(6),
@@ -161,6 +169,7 @@ def runtime_env(token, key, dashboard_password=None):
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
         "HERMES_RUNTIME_PROFILE": "colab-full",
+        "HERMES_NOTEBOOK_HOST": NOTEBOOK_HOST,
         "HERMES_COLAB_UPDATE_DIR": "/tmp/hermes-colab-control",
         "HERMES_MAX_CONCURRENT_SESSIONS": "10",
         "HERMES_RESUME_ALL_INTERRUPTED": "1",
@@ -191,36 +200,33 @@ def runtime_env(token, key, dashboard_password=None):
     return dict(base, **values)
 
 
-def get_bootstrap_secret(name, prompt):
-    """Reuse account-owned Colab Secrets without copying them into a notebook."""
-    value = os.environ.get(name)
+def notebook_secret(name):
+    value = os.environ.get(name, '')
     if value:
         return value
     try:
+        if NOTEBOOK_HOST == 'kaggle':
+            from kaggle_secrets import UserSecretsClient
+            return str(UserSecretsClient().get_secret(name) or '')
         from google.colab import userdata
-    except ImportError:
-        userdata = None
-    if userdata is not None:
-        try:
-            value = userdata.get(name)
-        except Exception:
-            # Missing/disabled secrets still work through a hidden prompt.
-            # Never print exception text, which may contain credential details.
-            value = None
-        if value:
-            return value
+        return str(userdata.get(name) or '')
+    except Exception:
+        # Provider exceptions can contain private credential details.
+        return ''
+
+
+def get_bootstrap_secret(name, prompt):
+    value = notebook_secret(name)
+    if value:
+        return value
+    if NOTEBOOK_HOST == 'kaggle':
+        raise RuntimeError('Add ' + name + ' in Kaggle Add-ons → Secrets and enable notebook access, then rerun Start.')
     return getpass.getpass(prompt)
 
 
 def optional_colab_setting(name):
-    value = os.environ.get(name, '').strip()
-    if value:
-        return value
-    try:
-        from google.colab import userdata
-        return str(userdata.get(name) or '').strip()
-    except Exception:
-        return ''
+    # Keep the old name for saved notebooks and existing integrations.
+    return notebook_secret(name).strip()
 
 
 def dashboard_tunnel_settings():
@@ -229,7 +235,7 @@ def dashboard_tunnel_settings():
     if not token and not url:
         return '', ''
     if not token or not url:
-        raise RuntimeError('For a fixed dashboard URL, set both CLOUDFLARE_TUNNEL_TOKEN and HERMES_DASHBOARD_URL in Colab Secrets with notebook access enabled.')
+        raise RuntimeError('For a fixed dashboard URL, set both CLOUDFLARE_TUNNEL_TOKEN and HERMES_DASHBOARD_URL in your notebook Secrets with notebook access enabled.')
     parsed = urlsplit(url)
     if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password
             or parsed.port not in (None, 443) or parsed.path not in ('', '/')
@@ -357,15 +363,15 @@ UI_CACHE_PATHS = ('hermes_cli/web_dist', 'ui-tui/dist', 'ui-tui/packages/hermes-
 
 
 def cache_directory():
-    explicit = os.environ.get('HERMES_COLAB_CACHE_DIR')
+    explicit = os.environ.get('HERMES_NOTEBOOK_CACHE_DIR') or os.environ.get('HERMES_COLAB_CACHE_DIR')
     drive = Path('/content/drive/MyDrive')
-    cache = Path(explicit) if explicit else (drive/'HermesRuntimeCache' if drive.is_dir() else Path('/content/hermes-runtime-cache'))
+    cache = Path(explicit) if explicit else (drive/'HermesRuntimeCache' if NOTEBOOK_HOST == 'colab' and drive.is_dir() else NOTEBOOK_ROOT/'hermes-runtime-cache')
     cache.mkdir(parents=True, exist_ok=True)
     return cache
 
 
 def prepare_cache():
-    if os.environ.get('HERMES_COLAB_USE_DRIVE_CACHE') == '1':
+    if NOTEBOOK_HOST == 'colab' and os.environ.get('HERMES_COLAB_USE_DRIVE_CACHE') == '1':
         try:
             from google.colab import drive
             print('Connecting Drive cache. Only public builds and package downloads are cached here.')
@@ -666,8 +672,8 @@ class ColabAgent:
         token, fixed_url = dashboard_tunnel_settings()
         print("Starting fixed Cloudflare dashboard tunnel…" if fixed_url else "Starting Cloudflare tunnel…")
         binary = install_cloudflared()
-        home = Path("/content/hermes-cloudflare")
-        home.mkdir(mode=0o700, exist_ok=True)
+        home = Path(NOTEBOOK_ROOT / "hermes-cloudflare")
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
         log = home / "tunnel.log"
         ready_url = None
         command = [binary, 'tunnel', '--no-autoupdate', '--protocol', 'http2']
@@ -723,9 +729,11 @@ class ColabAgent:
             cloudflare_url = None
             detail = redact_secrets(str(exc), getattr(self, "env", {}))
             print("Cloudflare link unavailable:", type(exc).__name__, detail[:2000])
-            print("Tunnel logs: /content/hermes-cloudflare/tunnel.log. Retry HERMES_COLAB.dashboard().")
+            print("Tunnel logs:", NOTEBOOK_ROOT / "hermes-cloudflare/tunnel.log", "Retry HERMES_COLAB.dashboard().")
         colab_url = None
         try:
+            if NOTEBOOK_HOST != "colab":
+                raise ImportError("Colab embedding is unavailable on this host")
             from google.colab import output
             colab_url = output.eval_js("google.colab.kernel.proxyPort(10000)")
             if not isinstance(colab_url, str) or not colab_url.startswith(("https://", "http://")):
@@ -993,18 +1001,20 @@ class StartupProgress:
 
 def main(confirm_switch=False):
     if sys.version_info < (3, 11):
-        raise RuntimeError("Use a current Colab Python runtime (Python 3.11 or newer)")
+        raise RuntimeError("Use a current notebook Python runtime (Python 3.11 or newer)")
     previous = globals().get("HERMES_COLAB")
     if previous and previous.process.poll() is None:
         print("Already running. Use HERMES_COLAB.status() or HERMES_COLAB.stop().")
         ColabAgent.dashboard(previous)
         return previous
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
-        raise RuntimeError("This installer needs the root Linux runtime provided by Colab")
+        raise RuntimeError("This installer needs a root Linux notebook runtime (Colab or Kaggle)")
     with socket.socket() as sock:
         if sock.connect_ex(("127.0.0.1", 10000)) == 0:
             raise RuntimeError("Port 10000 is already occupied; stop the old launcher first")
-    print("Stop the Render/local copy after its latest successful backup before switching.")
+    NOTEBOOK_ROOT.mkdir(parents=True, exist_ok=True)
+    print("Notebook host:", NOTEBOOK_HOST.title())
+    print("Stop your other Hermes host after its successful backup before switching.")
     if not confirm_switch and input("Type SWITCH to confirm the other copy is stopped: ").strip() != "SWITCH":
         raise RuntimeError("No changes made")
     token = get_bootstrap_secret("GIT_STATE_TOKEN", "GitHub storage token: ")

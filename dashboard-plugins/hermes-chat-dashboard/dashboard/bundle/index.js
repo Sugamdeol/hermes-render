@@ -2038,7 +2038,7 @@ function observeAnswerBlocks(root) {
           const next = await fetchJSON(`${BASE}/agent-update`);
           if (!disposed && version === generation.current && !sending.current) { setState(next); setError(""); }
         } catch {
-          if (!disposed) setError("Cannot reach update control. If Hermes is restarting, wait or reopen its link from Colab.");
+          if (!disposed) setError("Cannot reach update control. If Hermes is restarting, wait or reopen its link from your notebook.");
         }
         if (!disposed) timer = setTimeout(poll, 3000);
       };
@@ -2055,14 +2055,14 @@ function observeAnswerBlocks(root) {
           headers: { "X-Hermes-Update": "1" },
           body: { action, ref: action === "update" ? state.result.target : "main" } });
         setState(next);
-      } catch (e) { setError(str(e.message, "Request failed. Check the Colab notebook before retrying.")); }
+      } catch (e) { setError(str(e.message, "Request failed. Check the your notebook notebook before retrying.")); }
       finally { sending.current = false; setPending(false); }
     };
     const result = state && state.result;
     const canUpdate = state && state.available && state.phase === "succeeded" && state.action === "check" && result && result.update_available;
     return h("section", { className: "hcd-agent-update", "aria-labelledby": "hcd-agent-update-title" },
       h("h5", { id: "hcd-agent-update-title" }, "Hermes agent"),
-      h("p", { className: "hcd-hint" }, "Check the official Hermes repository and update from Colab."),
+      h("p", { className: "hcd-hint" }, "Check the official Hermes repository and update from your notebook."),
       result ? h("p", { className: "hcd-hint" }, `Installed ${str(result.current).slice(0, 12)} · Latest ${str(result.target).slice(0, 12)}`) : null,
       h("p", { role: "status", "aria-live": "polite", className: "hcd-hint" }, state ? state.message : "Loading update control…"),
       error ? h("p", { role: "alert" }, error) : null,
@@ -2070,8 +2070,8 @@ function observeAnswerBlocks(root) {
         h("button", { type: "button", disabled: !state || !state.available || busy, onClick: () => submit("check") }, busy ? "Working…" : "Check for updates"),
         canUpdate ? h("button", { type: "button", className: "primary", disabled: busy, onClick: () => setConfirming(true) }, "Update Hermes") : null),
       confirming ? h("div", { className: "hcd-update-confirm", role: "group", "aria-label": "Confirm Hermes update" },
-        h("p", null, "Update Hermes now? Finish any running tasks first. A backup is required and the dashboard will briefly disconnect. Keep Colab running."),
-        h("p", { className: "hcd-hint" }, "If the dashboard address changes, open the new link shown in Colab."),
+        h("p", null, "Update Hermes now? Finish any running tasks first. A backup is required and the dashboard will briefly disconnect. Keep your notebook running."),
+        h("p", { className: "hcd-hint" }, "If the dashboard address changes, open the new link shown in your notebook."),
         h("div", { className: "hcd-settings-foot" },
           h("button", { type: "button", onClick: () => setConfirming(false) }, "Cancel"),
           h("button", { type: "button", className: "primary", disabled: busy, onClick: () => submit("update") }, "Back up and update"))) : null);
