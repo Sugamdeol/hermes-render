@@ -1451,7 +1451,7 @@ class RestoreFidelityTests(LocalRemoteTests):
 
         data_dir = self.root / "restored"
         data_dir.mkdir()
-        with self.assertRaisesRegex(storage.GitStateError, 'Could not restore symlink'):
+        with self.assertRaisesRegex(storage.GitStateError, 'Unsafe logical restore path|Could not restore symlink'):
             storage.materialize(workdir, data_dir, self.make_config())
 
         self.assertFalse(Path("/tmp/hermes-escape-test").exists())

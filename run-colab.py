@@ -513,10 +513,10 @@ def install(env=None):
         install_runtime(revision)
 
 
-def install_runtime(revision):
+def install_runtime(revision, target=None):
     marker = INSTALL / ".colab-launcher-revision"
     core_ready = (INSTALL/".venv/bin/python").exists() and all(p.exists() and p.stat().st_size > 0 for p in (INSTALL/"hermes_cli/web_dist/index.html", INSTALL/"ui-tui/dist/entry.js"))
-    if core_ready and (INSTALL / ".colab-native-updater").exists() and marker.exists() and marker.read_text().strip() == revision:
+    if target is None and core_ready and (INSTALL / ".colab-native-updater").exists() and marker.exists() and marker.read_text().strip() == revision:
         # Cached install: still enforce the root fix so an old runtime gains
         # it on relaunch (update-chat-ui.py restarts through this path).
         # Native Colab startup does not use the Docker entrypoint.
@@ -524,11 +524,13 @@ def install_runtime(revision):
         return
     if INSTALL.exists() and not marker.exists() and not (INSTALL / ".git").exists():
         raise RuntimeError("An unrelated /opt/hermes installation exists; use a fresh Colab runtime")
-    upstream = (SOURCE / "colab-upstream.txt").read_text().strip()
+    selection = cache_directory() / "selected-upstream.txt"
+    upstream = target or (selection.read_text().strip() if selection.exists() else
+                          (SOURCE / "colab-upstream.txt").read_text().strip())
     if not re.fullmatch(r"[0-9a-f]{40}", upstream):
         raise RuntimeError("Invalid reviewed Colab upstream revision")
     # A completed native update owns this checkout; never roll it back to the bootstrap pin.
-    if (INSTALL / '.colab-native-updater').exists():
+    if target is None and (INSTALL / '.colab-native-updater').exists():
         upstream = run(['git','-c',f'safe.directory={INSTALL}','rev-parse','HEAD'],cwd=INSTALL,capture_output=True,text=True).stdout.strip()
     cache = cache_directory()
     key = runtime_key(upstream)
@@ -756,6 +758,16 @@ class ColabAgent:
         if saved.exists():
             values.update(json.loads(saved.read_text()).get("variables", {}))
         print("Username: hermes\nPassword:", values.get("HERMES_GATEWAY_TOKEN", "Password is not ready yet"))
+
+    def check_update(self, ref="main"):
+        """Check official upstream without changing the running agent."""
+        import runpy
+        return runpy.run_path(str(TOOLS / "colab-update.py"))["check"](globals(), ref)
+
+    def update(self, ref="main"):
+        """Back up, validate upstream patches, update and restart; roll back runtime on failure."""
+        import runpy
+        return runpy.run_path(str(TOOLS / "colab-update.py"))["update"](globals(), self, ref)
 
     def dependencies(self):
         path = DATA/'.runtime-dependencies-status.json'

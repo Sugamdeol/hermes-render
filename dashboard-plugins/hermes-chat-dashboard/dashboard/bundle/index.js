@@ -3037,7 +3037,7 @@ function observeAnswerBlocks(root) {
         try {
           const res = await fetchJSON(`${BASE}/branch`, {
             method: "POST",
-            body: { session_id: selRef.current.id, message_index: index, title: `${(selRef.current.title || "Conversation").slice(0, 60)} (branch)` },
+            body: { session_id: selRef.current.id, message_id: msg.id, title: `${(selRef.current.title || "Conversation").slice(0, 60)} (branch)` },
           });
           toast(`Branched → ${res.session_id}`);
           refreshSessions({});
@@ -3298,9 +3298,7 @@ function observeAnswerBlocks(root) {
         : true;
       if (!ok) return;
       // live sessions must go through the gateway (4023 otherwise)
-      try {
-        await gwRef.current.request("session.delete", { session_id: sid }, 30000);
-      } catch { /* not live / gateway down — REST fallback below */ }
+      // One idempotent REST operation owns cross-process checks and deletion.
       try {
         await fetchJSON(`${BASE}/sessions/${encodeURIComponent(sid)}`, { method: "DELETE" });
         toast("Conversation deleted");

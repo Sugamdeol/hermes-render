@@ -9,6 +9,12 @@ import threading
 import time
 import secrets
 from datetime import datetime
+import runpy
+
+_guard_path = Path(__file__).with_name('session-guard.py')
+if not _guard_path.is_file():
+    _guard_path = Path('/opt/render-tools/session-guard.py')
+_session_guard = runpy.run_path(str(_guard_path))
 
 _lock = threading.RLock()
 RETRY_BASE_SECONDS = 20
@@ -112,7 +118,9 @@ def _write(data):
 def begin(entry, event):
     if getattr(event, 'internal', False):
         return
-    with _lock:
+    with _session_guard['mutation_lock'](), _lock:
+        if _session_guard['deleted'](_path().parent, entry.session_id):
+            raise RuntimeError('This conversation was deleted; start a new session')
         data = _read()
         previous = data.get(entry.session_key)
         if previous and previous.get('status', 'pending') == 'pending' and (event.text or '').strip().lower().rstrip('.!') in ('continue', 'resume', 'keep going', 'carry on'):

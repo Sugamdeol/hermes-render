@@ -10,9 +10,8 @@ BRIDGE_BODY = '''    import importlib.util
     if module is None:
         spec = importlib.util.spec_from_file_location('_hermes_chat_bridge', '/opt/render-tools/chat-bridge.py')
         module = importlib.util.module_from_spec(spec)
-        sys.modules['_hermes_chat_bridge'] = module
         spec.loader.exec_module(module)
-        app.add_event_handler("shutdown", module.bridge.shutdown)
+        sys.modules['_hermes_chat_bridge'] = module
     if _lite_pty_lock.locked():
         await ws.close(code=4429)
         return
@@ -72,6 +71,24 @@ def patch(source):
         position = min([handler.lineno]+[d.lineno for d in handler.decorator_list])-1
         lines[position:position] = ['import asyncio\n_lite_pty_lock = asyncio.Lock()\n\n']
     result = ''.join(lines)
+    marker = '# render chat bridge lifespan'
+    if marker not in result:
+        parsed = ast.parse(result)
+        assignment = next((n for n in parsed.body if isinstance(n, ast.Assign)
+                           and any(isinstance(t, ast.Name) and t.id == 'app' for t in n.targets)), None)
+        if assignment is not None:
+            rows = result.splitlines(keepends=True)
+            rows[assignment.end_lineno:assignment.end_lineno] = ['''
+# render chat bridge lifespan
+import importlib.util as _bridge_import
+_bridge_spec = _bridge_import.spec_from_file_location('_hermes_chat_bridge', '/opt/render-tools/chat-bridge.py')
+_bridge_module = _bridge_import.module_from_spec(_bridge_spec)
+_bridge_spec.loader.exec_module(_bridge_module)
+sys.modules['_hermes_chat_bridge'] = _bridge_module
+_bridge_module.install_lifespan(app)
+
+''']
+            result = ''.join(rows)
     compile(result,'web_server.py','exec')
     return result
 

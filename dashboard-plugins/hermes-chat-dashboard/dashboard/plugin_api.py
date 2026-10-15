@@ -29,6 +29,9 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from contextlib import contextmanager
+from functools import lru_cache, wraps
+import runpy
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse
@@ -103,6 +106,62 @@ def _session_db():
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"session database unavailable: {exc}")
     return SessionDB()
+
+
+@lru_cache(maxsize=1)
+def _session_guard():
+    path = Path('/opt/render-tools/session-guard.py')
+    if not path.is_file():
+        path = Path(__file__).resolve().parents[3] / 'scripts/session-guard.py'
+    return runpy.run_path(str(path))
+
+
+def _state_write(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with _session_guard()['mutation_lock'](_home()):
+            return function(*args, **kwargs)
+    return wrapped
+
+
+@contextmanager
+def _mutation_guard(session_id, db=None):
+    guard = _session_guard()
+    lease = None
+    with guard['mutation_lock'](_home()):
+        try:
+            identities = {session_id}
+            if db is not None:
+                row = db.get_session(session_id)
+                while isinstance(row, dict) and row.get('parent_session_id') and row['parent_session_id'] not in identities:
+                    identities.add(row['parent_session_id'])
+                    row = db.get_session(row['parent_session_id'])
+            bridge = sys.modules.get('_hermes_chat_bridge')
+            if bridge and any(bridge.bridge.owns_session(sid) for sid in identities):
+                raise HTTPException(status_code=409, detail='Session is active; close or stop it first')
+            journal = _home() / '.render-recovery.json'
+            records = json.loads(journal.read_text()) if journal.exists() else {}
+            if not isinstance(records, dict):
+                raise ValueError('Invalid recovery journal')
+            if any(isinstance(row, dict) and row.get('session_id') in identities
+                   and row.get('status', 'pending') == 'pending' for row in records.values()):
+                raise HTTPException(status_code=409, detail='Session has an unfinished turn; stop it first')
+            try:
+                from hermes_cli.active_sessions import try_acquire_active_session
+            except ImportError:
+                if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
+                    raise HTTPException(status_code=503, detail='Session ownership checks unavailable')
+            else:
+                lease, refusal = try_acquire_active_session(session_id=session_id,
+                    surface='dashboard:mutation', config={}, registry_home=_home())
+                if refusal:
+                    raise HTTPException(status_code=409, detail=str(refusal))
+            yield guard
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=503, detail='Session ownership could not be verified') from exc
+        finally:
+            if lease is not None:
+                lease.release()
 
 
 def _load_config() -> dict:
@@ -243,11 +302,13 @@ def capabilities(request: Request):
 
 def _read_meta() -> dict:
     meta = _read_json(META_FILE, {})
-    return meta if isinstance(meta, dict) else {}
+    if not isinstance(meta, dict):
+        raise HTTPException(status_code=500, detail='Saved metadata is not an object; restore it from backup')
+    return meta
 
 
 @router.get("/metadata")
-async def metadata(request: Request):
+def metadata(request: Request):
     _require_session(request)
     return _read_meta()
 
@@ -267,7 +328,8 @@ def _sanitize_tags(tags: Any) -> list[str]:
 
 
 @router.put("/metadata/{session_id}")
-async def put_metadata(request: Request, session_id: str, body: dict):
+@_state_write
+def put_metadata(request: Request, session_id: str, body: dict):
     _require_session(request)
     meta = _read_meta()
     entry = meta.get(session_id, {}) if isinstance(meta.get(session_id), dict) else {}
@@ -305,7 +367,8 @@ def _apply_meta_patch(meta: dict, session_id: str, patch: dict) -> None:
 
 
 @router.post("/metadata/bulk")
-async def bulk_metadata(request: Request, body: dict):
+@_state_write
+def bulk_metadata(request: Request, body: dict):
     """Apply one metadata patch (or a delete) to many sessions at once.
 
     Body: ``{"ids": [...], "patch": {...}}`` or ``{"ids": [...], "delete": true}``.
@@ -335,7 +398,10 @@ async def bulk_metadata(request: Request, body: dict):
             ok = False
             if db is not None:
                 try:
-                    ok = bool(db.delete_session(sid, sessions_dir=_home() / "sessions"))
+                    with _mutation_guard(sid, db) as guard:
+                        ok = bool(db.delete_session(sid, sessions_dir=_home() / "sessions"))
+                        if ok:
+                            guard['record_deleted'](_home(), sid)
                 except Exception:
                     ok = False
             if ok:
@@ -372,7 +438,7 @@ def _folder_names(meta: dict) -> list[str]:
 
 
 @router.get("/folders")
-async def list_folders(request: Request):
+def list_folders(request: Request):
     _require_session(request)
     meta = _read_meta()
     counts: dict[str, int] = {}
@@ -383,7 +449,8 @@ async def list_folders(request: Request):
 
 
 @router.put("/folders/{name}")
-async def put_folder(request: Request, name: str, body: dict | None = None):
+@_state_write
+def put_folder(request: Request, name: str, body: dict | None = None):
     """Create a folder, or rename it when ``{"new_name": "..."}`` is given."""
     _require_session(request)
     name = str(name or "").strip()[:60]
@@ -412,7 +479,8 @@ async def put_folder(request: Request, name: str, body: dict | None = None):
 
 
 @router.delete("/folders/{name}")
-async def delete_folder(request: Request, name: str):
+@_state_write
+def delete_folder(request: Request, name: str):
     """Remove a folder; sessions keep their transcripts and simply become unfiled."""
     _require_session(request)
     name = str(name or "").strip()
@@ -565,6 +633,8 @@ def list_chat_sessions(request: Request, limit: int = 120, offset: int = 0, q: s
 
         if query:
             hits = _search_hits(db, query)
+            out = [entry for entry in out if query.casefold() in
+                   ' '.join(str(entry.get(k) or '') for k in ('title','preview')).casefold()]
             if hits:
                 by_id = {s["id"]: s for s in out}
                 merged = list(out)
@@ -767,7 +837,7 @@ def get_session_tree(request: Request, session_id: str):
 
 
 @router.post("/sessions/{session_id}/rename")
-async def rename_chat_session(request: Request, session_id: str, body: dict):
+def rename_chat_session(request: Request, session_id: str, body: dict):
     _require_session(request)
     title = str((body or {}).get("title") or "").strip()
     if not title:
@@ -789,7 +859,8 @@ async def rename_chat_session(request: Request, session_id: str, body: dict):
 
 
 @router.delete("/sessions/{session_id}")
-async def delete_chat_session(request: Request, session_id: str):
+@_state_write
+def delete_chat_session(request: Request, session_id: str):
     """Delete a stored conversation.
 
     The UI first asks the gateway (``session.delete``) so sessions that are
@@ -799,14 +870,16 @@ async def delete_chat_session(request: Request, session_id: str):
     _require_session(request)
     db = _session_db()
     try:
-        if not db.get_session(session_id):
-            raise HTTPException(status_code=404, detail="session not found")
-        try:
-            deleted = db.delete_session(
-                session_id, sessions_dir=_home() / "sessions"
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=409, detail=f"delete failed: {exc}")
+        with _mutation_guard(session_id, db) as guard:
+            if db.get_session(session_id):
+                try:
+                    deleted = db.delete_session(session_id, sessions_dir=_home() / "sessions")
+                except Exception as exc:
+                    raise HTTPException(status_code=409, detail='Session could not be deleted') from exc
+            else:
+                deleted = True
+            if deleted:
+                guard['record_deleted'](_home(), session_id)
     finally:
         try:
             db.close()
@@ -877,7 +950,7 @@ def usage_summary(request: Request, days: int = 14):
 
 
 @router.get("/settings")
-async def get_settings(request: Request):
+def get_settings(request: Request):
     _require_session(request)
     defaults = {
         "density": "comfortable",
@@ -906,11 +979,12 @@ async def get_settings(request: Request):
 
 
 @router.put("/settings")
-async def put_settings(request: Request, body: dict):
+@_state_write
+def put_settings(request: Request, body: dict):
     _require_session(request)
     if not isinstance(body, dict):
         raise HTTPException(status_code=400, detail="settings body must be an object")
-    current = await get_settings(request)
+    current = get_settings(request)
     current.update(body)
     _write_json(SETTINGS_FILE, current)
     return {"ok": True, "settings": current}
@@ -963,36 +1037,50 @@ async def upload_attachment(request: Request, file: UploadFile = File(...), conv
 
 
 @router.post("/branch")
-async def branch_from_message(request: Request, body: dict):
+def branch_from_message(request: Request, body: dict):
     _require_session(request)
     source = str(body.get("session_id") or "").strip()
-    upto = int(body.get("message_index", -1))
+    message_id = str(body.get('message_id') or '').strip()
     title = str(body.get("title") or "").strip() or "Branch"
-    if not source or upto < 0:
-        raise HTTPException(status_code=400, detail="session_id and message_index required")
+    if not source or not message_id:
+        raise HTTPException(status_code=400, detail="session_id and stored message_id required")
     db = _session_db()
     try:
         if not db.get_session(source):
             raise HTTPException(status_code=404, detail="session not found")
-        try:
-            messages = (db.get_messages(source) or [])[: upto + 1]
-        except Exception:
-            messages = []
-        new_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
-        try:
-            db.create_session(new_id, source="web", parent_session_id=source)
-        except TypeError:
-            db.create_session(new_id, source="web")
-        for msg in messages:
-            db.append_message(new_id, msg.get("role", "user"), msg.get("content"), tool_name=msg.get("tool_name"), tool_calls=msg.get("tool_calls"), tool_call_id=msg.get("tool_call_id"))
-        try:
-            db.set_session_title(new_id, title)
-        except Exception:
-            pass
-        try:
-            db.end_session(source, "branched")
-        except Exception:
-            pass
+        # SQLite freezes a consistent source while the original session stays open.
+        with _session_guard()['mutation_lock'](_home()):
+            conn = getattr(db, '_conn', None)
+            if conn is None:
+                raise HTTPException(status_code=503, detail='Transactional branching unavailable')
+            with db._lock:
+                conn.execute('BEGIN IMMEDIATE')
+                try:
+                    target = conn.execute('SELECT timestamp,id FROM messages WHERE session_id=? AND CAST(id AS TEXT)=?',
+                                          (source,message_id)).fetchone()
+                    if target is None:
+                        raise HTTPException(status_code=404, detail='Stored message not found; refresh the conversation')
+                    new_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(8)}"
+                    session_cols = [r[1] for r in conn.execute('PRAGMA table_info(sessions)')]
+                    values = {'id':new_id,'source':'web','parent_session_id':source,'title':title,
+                              'started_at':time.time(),'ended_at':None,'end_reason':None,'message_count':0}
+                    values.update({c:0 for c in ('tool_call_count','input_tokens','output_tokens',
+                        'cache_read_tokens','cache_write_tokens','reasoning_tokens','api_call_count')})
+                    values.update(estimated_cost_usd=None, actual_cost_usd=None)
+                    expressions = ['?' if c in values else '"'+c+'"' for c in session_cols]
+                    conn.execute('INSERT INTO sessions ('+','.join('"'+c+'"' for c in session_cols)+') SELECT '+
+                                 ','.join(expressions)+' FROM sessions WHERE id=?',
+                                 [values[c] for c in session_cols if c in values]+[source])
+                    cols = [r[1] for r in conn.execute('PRAGMA table_info(messages)') if r[1] != 'id']
+                    expressions = ['?' if c == 'session_id' else '"'+c+'"' for c in cols]
+                    conn.execute('INSERT INTO messages ('+','.join('"'+c+'"' for c in cols)+') SELECT '+
+                                 ','.join(expressions)+' FROM messages WHERE session_id=? AND '
+                                 '(timestamp < ? OR (timestamp = ? AND id <= ?)) ORDER BY timestamp,id',
+                                 (new_id,source,target[0],target[0],target[1]))
+                    conn.commit()
+                except BaseException:
+                    conn.rollback()
+                    raise
         return {"ok": True, "session_id": new_id, "parent": source, "title": title}
     finally:
         try:
@@ -1037,7 +1125,8 @@ def export_session(request: Request, session_id: str, format: str = "markdown"):
 
 
 @router.post("/share/{session_id}")
-async def create_share(request: Request, session_id: str, body: dict | None = None):
+@_state_write
+def create_share(request: Request, session_id: str, body: dict | None = None):
     _require_session(request)
     db = _session_db()
     try:
@@ -1108,7 +1197,8 @@ def list_shares(request: Request):
 
 
 @router.delete("/share/{token}")
-async def revoke_share(request: Request, token: str):
+@_state_write
+def revoke_share(request: Request, token: str):
     _require_session(request)
     shares = _read_json(SHARES_FILE, {})
     if token not in shares:

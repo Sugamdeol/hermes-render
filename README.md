@@ -299,3 +299,27 @@ again. It also remembers the selected conversation. This requires the updated
 chat bridge and UI together; use `update-chat-ui.py` in the running Colab notebook
 when no task is active. The updater backs up before restarting the service.
 Full server/runtime loss still relies on the existing recovery and backup system.
+
+## Update Hermes in Colab
+
+After starting the latest notebook, use a new code cell:
+
+```python
+HERMES_COLAB.check_update()           # check NousResearch/hermes-agent main
+HERMES_COLAB = HERMES_COLAB.update()  # back up, validate, install and restart
+```
+
+Pass a release tag or full commit SHA, for example `update(ref="<release-tag>")`,
+if you prefer a specific version. Updating is explicit; it never runs in the
+background. Wait for tasks to finish first. Compatibility checks run before the
+host stops. An incompatible upstream version or failed backup leaves it running.
+Installation/startup failure restarts the retained previous runtime. User data is
+kept in place; rollback is for runtime code and dependencies, not a reversal of
+possible upstream database migrations. The confirmed Git backup remains the
+recovery checkpoint. Failed and previous runtime folders are retained for review.
+
+Keep Drive cache enabled to preserve your selected upstream SHA across fresh
+Colab runtimes. Without persistent cache, a fresh VM starts from the repository's
+reviewed pin. Launcher/custom integration updates still come from
+`Sugamdeol/hermes-render/main` when Start runs. A running older notebook must first
+save, stop, and rerun Start to gain these new updater methods.

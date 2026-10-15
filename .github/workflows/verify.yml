@@ -1,6 +1,45 @@
 name: Hermes Render 512 MB
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
 jobs:
+  colab-compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - run: pip install --constraint requirements-render.lock pyyaml cryptography fastapi httpx python-multipart
+      - name: Validate patches against the exact native Colab pin
+        run: |
+          git init /tmp/hermes-colab-upstream
+          git -C /tmp/hermes-colab-upstream remote add origin https://github.com/NousResearch/hermes-agent.git
+          git -C /tmp/hermes-colab-upstream fetch --depth=1 origin "$(cat colab-upstream.txt)"
+          git -C /tmp/hermes-colab-upstream checkout --detach FETCH_HEAD
+          python scripts/patch-colab-full.py /tmp/hermes-colab-upstream
+          python -m unittest discover -s tests -p test_audit_release.py -v
+          python -m unittest discover -s tests -p test_native_task_recovery.py -v
+          python -m unittest discover -s tests -p test_native_ui_recovery.py -v
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_PATH: ${{ runner.temp }}/hermes-browser/node_modules
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm install --prefix "$RUNNER_TEMP/hermes-browser" --no-audit --no-fund playwright@1.62.1
+      - run: node "$RUNNER_TEMP/hermes-browser/node_modules/playwright/cli.js" install --with-deps chromium
+      - name: Verify mobile and desktop answer layout
+        run: node tests/intelligent_ui_probe.cjs dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/style.css
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -9,11 +48,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pyyaml cryptography fastapi httpx websockets
+      - run: pip install --constraint requirements-render.lock pyyaml cryptography fastapi httpx websockets python-multipart
       - run: python -m unittest discover -s tests -q
       - run: node --check dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js
       - run: node --check dashboard-plugins/render-api-providers/dashboard/bundle/index.js
-      - run: docker build -t hermes-lite .
+      - id: image
+        run: docker build -t hermes-lite .
       - name: Boot native dashboard under 512 MB without swap
         run: |
           docker run -d --name hermes-lite --memory=512m --memory-swap=512m -p 10000:10000 -e HERMES_GATEWAY_TOKEN=ci-only-password hermes-lite
@@ -24,17 +64,21 @@ jobs:
           docker exec -d -e STORAGE_ENCRYPTION_KEY=ci-only-key -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/combined_load_probe.py storage
           python tests/container_smoke.py
       - name: Verify native provider key failover and custom model IDs
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
         run: |
           docker cp tests/provider_keys_probe.py hermes-lite:/tmp/provider_keys_probe.py
           docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/provider_keys_probe.py
       - name: Verify native gateway starts without artificial allocation caps
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
         run: |
           docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /opt/render-tools/agent-budget.py run gateway /opt/hermes/.venv/bin/python -c 'import resource; before=resource.getrlimit(resource.RLIMIT_DATA); from gateway.run import GatewayRunner; runner=GatewayRunner(); assert resource.getrlimit(resource.RLIMIT_DATA)==before; print("Native gateway starts without artificial allocation caps")'
       - name: Verify repeated PTY process-tree cleanup
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
         run: |
           docker cp tests/pty_cleanup_probe.py hermes-lite:/tmp/pty_cleanup_probe.py
           docker exec -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/pty_cleanup_probe.py
       - name: Verify durable native gateway recovery
+        if: ${{ !cancelled() && steps.image.outcome == 'success' }}
         run: |
           docker cp tests/native_recovery_probe.py hermes-lite:/tmp/native_recovery_probe.py
           docker exec -u hermes -w /opt/hermes hermes-lite /opt/hermes/.venv/bin/python /tmp/native_recovery_probe.py

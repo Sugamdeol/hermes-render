@@ -424,12 +424,14 @@ if [ "${HERMES_RUNTIME_DEPS_AUTORESTORE:-0}" = "1" ] && [ "$(id -u)" = "0" ] \
   }
   if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ] && [ "${HERMES_RUNTIME_DEPS_BACKGROUND:-0}" = "1" ]; then
     echo "[dependencies] Restoring saved apps in background; dashboard and Telegram can start now"
+    HERMES_DEPENDENCY_RUN_ID="$(/opt/hermes/.venv/bin/python /opt/render-tools/runtime-dependencies.py prepare "${DATA_DIR}")"
+    export HERMES_DEPENDENCY_RUN_ID HERMES_RUNTIME_DEPS_RESTORE_STARTED=1
     restore_apps &
   else
     echo "[dependencies] Restoring saved apps and libraries before gateway startup"
     restore_apps
+    export HERMES_RUNTIME_DEPS_RESTORED=1
   fi
-  export HERMES_RUNTIME_DEPS_RESTORED=1
 fi
 
 if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then

@@ -10,6 +10,9 @@ import sys
 import tempfile
 import time
 import urllib.request
+from contextlib import contextmanager
+import secrets
+import fcntl
 
 NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.+-]{0,150}$')
 VERSION = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.+!-]{0,100}$')
@@ -38,6 +41,8 @@ def python_packages(python):
 
 
 def atomic(path,data):
+    if path.name == '.runtime-dependencies-status.json':
+        data = dict(data, run_id=os.environ.get('HERMES_DEPENDENCY_RUN_ID', ''), pid=os.getpid())
     path.parent.mkdir(parents=True,exist_ok=True)
     fd,temp=tempfile.mkstemp(dir=path.parent,prefix='.dependency-')
     try:
@@ -63,19 +68,22 @@ def _capture(home):
              'system':os.environ.get('HERMES_COLAB_SYSTEM_PYTHON',sys.executable)}
     for kind,python in targets.items():
         if Path(python).exists():
-            result['python'][kind]={**previous.get('python',{}).get(kind,{}),**python_packages(python)}
+            result['python'][kind]=python_packages(python)
     manual=command(['apt-mark','showmanual'])
     if manual.returncode==0:
         # Colab supplies kernels, CUDA, GPU drivers and base libraries itself.
         packages=[n for n in manual.stdout.splitlines() if NAME.fullmatch(n) and
                   not n.startswith(('linux-','cuda-','nvidia-'))]
-        result['apt']=sorted(set(result['apt'])|set(packages))
+        result['apt']=sorted(set(packages))
     try:
         npm=command(['npm','list','--global','--depth=0','--json'])
+        current_npm = {}
         for name,row in json.loads(npm.stdout or '{}').get('dependencies',{}).items():
             version=row.get('version')
             if name not in ('npm','corepack') and NPM_NAME.fullmatch(name) and isinstance(version,str) and VERSION.fullmatch(version):
-                result['npm'][name]=version
+                current_npm[name]=version
+        if npm.returncode == 0:
+            result['npm'] = current_npm
     except (OSError,ValueError):pass
     for base in (home/'home/.cache/ms-playwright',Path.home()/'.cache/ms-playwright'):
         if base.is_dir():
@@ -86,11 +94,37 @@ def _capture(home):
     return result
 
 
-def capture(home):
-    import fcntl
+@contextmanager
+def dependency_lock():
     with open('/tmp/hermes-dependency-inventory.lock','a+') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
+        yield
+
+
+def capture(home):
+    with dependency_lock():
+        status = read(Path(home)/'.runtime-dependencies-status.json')
+        if status and not status.get('ready') and status.get('state') in ('scheduled','installing','error'):
+            return read(Path(home)/'.runtime-dependencies.json')
         return _capture(home)
+
+
+def prepare_restore(home):
+    run_id = secrets.token_hex(16)
+    os.environ['HERMES_DEPENDENCY_RUN_ID'] = run_id
+    atomic(Path(home)/'.runtime-dependencies-status.json',
+           {'ready':False,'state':'scheduled','errors':[],'updated_at':int(time.time())})
+    return run_id
+
+
+def wait_for_restore(home, stop, run_id, timeout=1800):
+    deadline = time.monotonic() + timeout
+    while not stop.is_set() and time.monotonic() < deadline:
+        status = read(Path(home)/'.runtime-dependencies-status.json')
+        if status.get('run_id') == run_id and status.get('state') in ('ready','error'):
+            return status
+        stop.wait(.5)
+    return {'ready':False,'state':'error','errors':['Dependency restore has not confirmed completion']}
 
 
 def missing_python(desired,current,exact=True):
@@ -121,7 +155,7 @@ def browser_ready(python, browser):
         return False
 
 
-def restore(home):
+def _restore(home):
     home=Path(home);recipe=read(home/'.runtime-dependencies.json')
     if os.environ.get('HERMES_RUNTIME_DEPS_AUTORESTORE') == '1':
         # Chrome is a Colab startup requirement, even for older saved recipes.
@@ -193,9 +227,30 @@ def restore(home):
     return errors
 
 
+def restore(home):
+    home = Path(home)
+    flag = Path('/tmp/hermes-dependencies-restoring')
+    with dependency_lock():
+        flag.touch(mode=0o600)
+        try:
+            errors = _restore(home)
+            atomic(home/'.runtime-dependencies-status.json',
+                   {'ready':not errors,'state':'error' if errors else 'ready','errors':errors,
+                    'updated_at':int(time.time())})
+            return errors
+        except Exception:
+            atomic(home/'.runtime-dependencies-status.json',
+                   {'ready':False,'state':'error','errors':['Dependency restoration failed'],
+                    'updated_at':int(time.time())})
+            raise
+        finally:
+            flag.unlink(missing_ok=True)
+
+
 if __name__=='__main__':
     action,home=sys.argv[1:3]
     if action=='capture':capture(home)
+    elif action=='prepare':print(prepare_restore(home))
     elif action=='restore':
         errors=restore(home)
         for error in errors:print('[dependencies]',error,flush=True)

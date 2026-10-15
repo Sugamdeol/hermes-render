@@ -51,20 +51,21 @@ def supervise_dependencies():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     home = Path(os.environ.get('HERMES_HOME','/opt/data'))
-    flag = Path('/tmp/hermes-dependencies-restoring')
-    flag.touch(mode=0o600)
     try:
-        module.atomic(home/'.runtime-dependencies-status.json',{'ready':False,'phase':'restoring'})
-        errors = module.read(home/'.runtime-dependencies-status.json').get('errors', []) if os.environ.get('HERMES_RUNTIME_DEPS_RESTORED') == '1' else module.restore(home)
+        if os.environ.get('HERMES_RUNTIME_DEPS_RESTORE_STARTED') == '1':
+            status = module.wait_for_restore(home, stop, os.environ.get('HERMES_DEPENDENCY_RUN_ID',''))
+            errors = status.get('errors') or ([] if status.get('ready') else ['Restore is incomplete'])
+        elif os.environ.get('HERMES_RUNTIME_DEPS_RESTORED') == '1':
+            status = module.read(home/'.runtime-dependencies-status.json')
+            errors = status.get('errors') or ([] if status.get('ready') else ['Restore is incomplete'])
+        else:
+            errors = module.restore(home)
         print('[dependencies] '+('Extra apps restored.' if not errors else 'Some apps need attention; see dependency status.'),flush=True)
-        if not errors:
-            module.atomic(home/'.runtime-dependencies-status.json',{'ready':True,'phase':'ready'})
+        if errors:
+            return
     except Exception as error:
-        module.atomic(home/'.runtime-dependencies-status.json',{'ready':False,'phase':'failed','errors':[type(error).__name__]})
         print(f'[dependencies] Restore failed ({type(error).__name__}); existing recipe preserved.',flush=True)
         return
-    finally:
-        flag.unlink(missing_ok=True)
     while not stop.is_set():
         try:module.capture(home)
         except Exception as error:print(f'[dependencies] Capture failed ({type(error).__name__}); keeping previous recipe.',flush=True)
