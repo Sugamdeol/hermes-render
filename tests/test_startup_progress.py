@@ -80,6 +80,14 @@ class StartupProgressTests(unittest.TestCase):
             progress.finish()
         self.assertEqual(progress.state, 'ready')
 
+    def test_restore_progress_uses_counts_without_disclosing_file_names(self):
+        progress = self.make()
+        with patch.object(progress, 'render'):
+            progress.observe('[restore] Assembling private-name: 1048576/2097152 bytes, chunk 1/2')
+        view = progress.snapshot()
+        self.assertIn('1.0 / 2.0 MiB', view['detail'])
+        self.assertNotIn('private-name', str(view))
+
     def test_launch_records_ready_only_after_gateway_health_and_dashboard(self):
         progress = Mock()
         process = Mock()

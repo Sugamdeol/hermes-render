@@ -853,6 +853,7 @@ class StartupProgress:
         self.history = {}
         self.handle = None
         self.state = 'loading'
+        self.restore_detail = ''
         self.done = threading.Event()
         self.lock = threading.RLock()
         try:
@@ -893,7 +894,7 @@ class StartupProgress:
                     eta = 'About ' + self.duration(remaining) + ' left (based on your last similar start)'
             else:
                 eta = 'Calculating time left on this first ' + self.kind + ' start'
-            return {'stage':stage, 'percent':percent, 'elapsed':self.duration(elapsed), 'eta':eta}
+            return {'stage':stage, 'percent':percent, 'elapsed':self.duration(elapsed), 'eta':eta, 'detail':self.restore_detail}
 
     def render(self):
         try:
@@ -910,6 +911,7 @@ class StartupProgress:
 <div style="font-weight:700">{html.escape(view['stage'])}</div>
 <progress aria-label="Startup steps completed" max="100" value="{view['percent']}" style="width:100%;height:12px;accent-color:#2563eb;margin:10px 0"></progress>
 <div>Elapsed: {view['elapsed']} · {html.escape(view['eta'])}</div>
+<div>{html.escape(view['detail'])}</div>
 <small>Bar shows completed steps. Download speed can change the estimate.</small></div>'''
             self.handle.update(HTML(content))
         else:
@@ -929,6 +931,14 @@ class StartupProgress:
     def observe(self, text):
         # Only fixed milestones affect the UI. Log contents and secrets are
         # never interpolated into the notebook progress display.
+        chunks = re.findall(r'\[restore\] Assembling .*?: (\d+)/(\d+) bytes, chunk (\d+)/(\d+)', text)
+        if chunks:
+            done, total, part, parts = map(int, chunks[-1])
+            self.restore_detail = f'Large backup: {done / 1048576:.1f} / {total / 1048576:.1f} MiB · chunk {part}/{parts}'
+            self.render()
+        if '[restore] Large backups verified; restoring local files' in text:
+            self.restore_detail = 'Large backups verified. Restoring local files…'
+            self.render()
         if '[render-tools] state restore finished' in text:
             self.step(2)
         if '[render-tools] starting one foreground' in text:
@@ -1026,7 +1036,11 @@ def launch_with_progress(env, progress):
         try:
             with LOG.open('rb') as startup_log:
                 startup_log.seek(max(offset, LOG.stat().st_size - 32768))
-                progress.observe(startup_log.read().decode('utf-8', errors='replace'))
+                log_text = startup_log.read().decode('utf-8', errors='replace')
+                progress.observe(log_text)
+                if 'private state restore failed; refusing to start' in log_text:
+                    raise RuntimeError('Saved-state restore failed. Keep this runtime open. '
+                                       'Verified chunks are cached for retry; inspect ' + str(LOG))
         except OSError:
             pass
         if process.poll() is not None:

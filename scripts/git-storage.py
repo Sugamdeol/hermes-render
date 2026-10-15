@@ -1614,47 +1614,120 @@ def reuse_chunks(previous: Path, target: Path, record: dict) -> bool:
     return True
 
 
+def _restore_cache_json(path, value):
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.checkpoint-')
+    try:
+        with os.fdopen(fd, 'w') as handle:
+            json.dump(value, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _restore_file_identity(path):
+    stat = path.stat()
+    return [stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+
+
+def assemble_restore_blob(root, record, cache, label):
+    """Resume at verified chunk boundaries; publish only after full SHA validation."""
+    import fcntl
+    parts, size, expected = record.get('parts'), record.get('size'), record.get('sha256')
+    if (not isinstance(parts, list) or not parts or not isinstance(size, int) or size < 0
+            or not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected)):
+        raise GitStateError('Invalid large-file backup manifest')
+    sources, sizes = [], []
+    for name in parts:
+        validate_restore_name(name)
+        part = root / name
+        if (not name.startswith(CHUNK_DIRECTORY + '/') or part.is_symlink()
+                or not part.resolve().is_relative_to(root.resolve()) or not part.is_file()
+                or part.stat().st_size > GIT_BLOB_CHUNK_BYTES):
+            raise GitStateError('Missing or invalid backup chunk')
+        sources.append(part); sizes.append(part.stat().st_size)
+    if sum(sizes) != size:
+        raise GitStateError('Backup chunk sizes do not match manifest')
+    key = hashlib.sha256(json.dumps([label, parts, size, expected, record.get('mode', 0o644)], separators=(',', ':')).encode()).hexdigest()
+    directory = cache / key
+    if cache.is_symlink() or directory.is_symlink():
+        raise GitStateError('Unsafe restore cache directory')
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory.chmod(0o700)
+    with (directory / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        completed, partial, checkpoint = directory/'verified', directory/'partial', directory/'checkpoint.json'
+        if any(path.is_symlink() for path in (completed, partial, checkpoint)):
+            raise GitStateError('Unsafe restore cache file')
+        try:
+            state = json.loads(checkpoint.read_text())
+            if not isinstance(state, dict): state = {}
+        except (OSError, ValueError):
+            state = {}
+        if completed.exists() and state.get('verified') == _restore_file_identity(completed):
+            LOG.info('[restore] Reusing verified large file %s (%d bytes)', label, size)
+            return completed
+        index = state.get('next_part', 0)
+        if not isinstance(index, int) or not 0 <= index <= len(parts): index = 0
+        offset = sum(sizes[:index])
+        if not partial.exists() or partial.stat().st_size < offset:
+            index, offset = 0, 0
+        fd = os.open(partial, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        digest = hashlib.sha256()
+        LOG.info('[restore] Assembling %s: %d/%d bytes, chunk %d/%d', label, offset, size, index, len(parts))
+        last_report = time.monotonic()
+        with os.fdopen(fd, 'r+b') as output:
+            output.truncate(offset)
+            # Rehash the saved prefix; never trust an unverified partial digest.
+            while payload := output.read(1024 * 1024):
+                digest.update(payload)
+                if time.monotonic() - last_report >= 10:
+                    LOG.info('[restore] Checking saved prefix for %s: %d/%d bytes', label, output.tell(), offset)
+                    last_report = time.monotonic()
+            total = offset
+            for number in range(index, len(parts)):
+                with sources[number].open('rb') as handle:
+                    while payload := handle.read(1024 * 1024):
+                        output.write(payload); digest.update(payload); total += len(payload)
+                        if total > size:
+                            raise GitStateError('Backup chunks grew during restore')
+                        if time.monotonic() - last_report >= 10:
+                            LOG.info('[restore] Assembling %s: %d/%d bytes, chunk %d/%d', label, total, size, number+1, len(parts))
+                            last_report = time.monotonic()
+                output.flush(); os.fsync(output.fileno())
+                _restore_cache_json(checkpoint, {'next_part': number+1})
+            if total != size or digest.hexdigest() != expected:
+                checkpoint.unlink(missing_ok=True)
+                raise GitStateError('Backup chunk integrity verification failed')
+        os.replace(partial, completed)
+        os.chmod(completed, int(record.get('mode', 0o644)) & 0o777)
+        _restore_cache_json(checkpoint, {'verified': _restore_file_identity(completed)})
+        LOG.info('[restore] Verified %s (%d bytes)', label, size)
+        return completed
+
+
 def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
-    records = read_manifest(workdir).get("large_files", {})
+    records = read_manifest(workdir).get('large_files', {})
     if not records:
         return _materialize_tree(workdir, data_dir, config)
     if not isinstance(records, dict):
-        raise GitStateError("Invalid large-file backup manifest")
+        raise GitStateError('Invalid large-file backup manifest')
     root = workdir / DATA_SUBDIR
-    with tempfile.TemporaryDirectory(prefix="hermes-restore-") as temporary:
-        assembled = Path(temporary) / DATA_SUBDIR
-        # Only chunked files need staging. Read ordinary files directly from
-        # the clone instead of creating another 100,000-file directory tree.
-        assembled.mkdir(parents=True)
-        for relative, record in records.items():
-            if not isinstance(relative, str) or not relative or relative.startswith("/") or ".." in PurePosixPath(relative).parts or PurePosixPath(relative).parts[0] == CHUNK_DIRECTORY:
-                raise GitStateError("Unsafe large-file restore path")
-            destination = assembled / relative
-            if (root / relative).exists() or destination.exists() or not isinstance(record, dict):
-                raise GitStateError("Conflicting large-file restore entry")
-            parts = record.get("parts")
-            if not isinstance(parts, list) or not parts:
-                raise GitStateError("Missing backup chunks")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            digest, total = hashlib.sha256(), 0
-            with destination.open("wb") as output:
-                for name in parts:
-                    if not isinstance(name, str) or not name.startswith(CHUNK_DIRECTORY + "/") or ".." in PurePosixPath(name).parts:
-                        raise GitStateError("Unsafe backup chunk path")
-                    part = root / name
-                    if part.is_symlink() or not part.is_file() or part.stat().st_size > GIT_BLOB_CHUNK_BYTES:
-                        raise GitStateError("Missing or invalid backup chunk")
-                    with part.open("rb") as handle:
-                        while payload := handle.read(1024 * 1024):
-                            output.write(payload)
-                            digest.update(payload)
-                            total += len(payload)
-            if total != record.get("size") or digest.hexdigest() != record.get("sha256"):
-                raise GitStateError("Backup chunk integrity verification failed")
-            os.chmod(destination, int(record.get("mode", 0o644)) & 0o777)
-        # Verify all chunks before touching live state, then use the existing decryption path.
-        return _materialize_tree(workdir, data_dir, config, extra_root=assembled)
-
+    # This cache is outside the clone and live data; never uploaded as user state.
+    cache = workdir.parent / ('.' + workdir.name + '-restore-cache')
+    assembled = {}
+    LOG.info('[restore] Preparing %d large backup file(s)', len(records))
+    for relative, record in records.items():
+        validate_restore_name(relative)
+        if PurePosixPath(relative).parts[0] == CHUNK_DIRECTORY:
+            raise GitStateError('Unsafe large-file restore path')
+        if (root / relative).exists() or not isinstance(record, dict):
+            raise GitStateError('Conflicting large-file restore entry')
+        cached = assemble_restore_blob(root, record, cache, relative)
+        assembled[relative] = cached
+    LOG.info('[restore] Large backups verified; restoring local files')
+    return _materialize_tree(workdir, data_dir, config, extra_files=assembled)
 
 def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     """Publish a complete local snapshot, retaining the old tree on failure."""
@@ -2072,7 +2145,7 @@ def reconcile_restored_paths(data_dir, config, current):
     config._restored_paths = sorted(current)
 
 
-def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None) -> int:
+def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None, extra_files: dict | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
     Existing local files are overwritten, but local files absent from the repo
@@ -2108,12 +2181,23 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             if source.is_file():
                 source_files.append(source)
                 relative_paths[source] = source.relative_to(extra_root).as_posix()
+    for relative, source in (extra_files or {}).items():
+        validate_restore_name(relative)
+        if source.is_symlink() or not source.is_file():
+            raise GitStateError('Invalid verified restore source')
+        source_files.append(source)
+        relative_paths[source] = relative
     source_relatives = list(relative_paths.values())
     sqlite_dbs, sqlite_sidecars = sqlite_files(source_root, source_relatives)
     if extra_root is not None:
         extra_dbs, extra_sidecars = sqlite_files(extra_root, source_relatives)
         sqlite_dbs.update(extra_dbs)
         sqlite_sidecars.update(extra_sidecars)
+    for relative, source in (extra_files or {}).items():
+        if relative.lower().endswith(('.db', '.sqlite', '.sqlite3')):
+            with source.open('rb') as handle:
+                if handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER:
+                    sqlite_dbs.add(relative)
     sqlite_dbs = {decoded_backup_path(name, manifest) for name in sqlite_dbs}
     recorded_sqlite = manifest.get("sqlite_snapshots", [])
     if isinstance(recorded_sqlite, list):
