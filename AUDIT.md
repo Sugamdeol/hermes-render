@@ -1,5 +1,8 @@
 # Repository audit — 2026-10-07
 
+October 15 follow-up fixes and rollout instructions are documented in
+[docs/audit-fixes.md](docs/audit-fixes.md). Findings below describe the earlier audit.
+
 Reviewed the deployment/bootstrap scripts, Colab and local launchers, chat UI and API, provider configuration, Git storage, memory supervision and task recovery against the pinned Hermes runtime. This is a review of this integration repository, not a claim that every upstream Hermes dependency is bug-free.
 
 ## Confirmed issues fixed

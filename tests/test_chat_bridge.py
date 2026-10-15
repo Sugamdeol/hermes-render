@@ -113,7 +113,7 @@ async def gateway_ws(ws):
   fixed=patch(source)
   self.assertEqual(fixed.split('    import importlib.util')[0],source.split('    from tui_gateway.ws')[0])
   self.assertEqual(patch(fixed),fixed)
-  self.assertIn('app.add_event_handler("shutdown", module.bridge.shutdown)',fixed)
+  self.assertNotIn('app.add_event_handler',fixed)
 
  def test_renamed_handler_is_found_by_route_and_retains_auth(self):
   import runpy

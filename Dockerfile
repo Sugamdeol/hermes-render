@@ -1,14 +1,14 @@
 # syntax=docker/dockerfile:1.7
 # Native Hermes, without local ML models, Chromium or unrelated channel SDKs.
-FROM node:24-bookworm-slim AS assets
+FROM node:24-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS assets
 ARG HERMES_REF=498bfc7bc12a937621b4215312049b1000726df3
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /opt/hermes
 RUN git init . && git remote add origin https://github.com/NousResearch/hermes-agent.git && git fetch --depth=1 origin ${HERMES_REF} && git checkout --detach FETCH_HEAD && rm -rf .git
 RUN cd web && npm ci --no-audit --no-fund && npm run build
-RUN cd ui-tui && npm install --no-audit --no-fund && npm run build
+RUN cd ui-tui && npm ci --no-audit --no-fund && npm run build
 
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 PYTHONUNBUFFERED=1 \
     VIRTUAL_ENV=/opt/hermes/.venv PATH=/opt/hermes/.venv/bin:$PATH \
     HERMES_HOME=/opt/data HERMES_TUI_DIR=/opt/hermes/ui-tui \
@@ -26,7 +26,8 @@ COPY --from=assets /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/n
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
 COPY --from=assets --chown=hermes:hermes /opt/hermes /opt/hermes
 WORKDIR /opt/hermes
-RUN uv venv ${VIRTUAL_ENV} && uv pip install -e ".[web,mcp,pty,cli]" \
+COPY requirements-render.lock /opt/render-tools/requirements-render.lock
+RUN uv venv ${VIRTUAL_ENV} && uv pip install --constraint /opt/render-tools/requirements-render.lock -e ".[web,mcp,pty,cli]" \
     "python-telegram-bot[webhooks]>=22.6,<23" "aiohttp>=3.13.3,<4" cryptography \
     && rm -rf /root/.cache/uv /opt/hermes/web/node_modules
 COPY scripts/ /opt/render-tools/

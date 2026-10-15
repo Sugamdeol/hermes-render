@@ -19,6 +19,9 @@ password = os.environ.get("HERMES_GATEWAY_TOKEN", "")
 if not password:
     raise SystemExit("HERMES_GATEWAY_TOKEN is required for dashboard access")
 port = int(os.environ.get("PORT", "10000"))
+upload_limit = int(os.environ.get('HERMES_CHAT_UPLOAD_MAX_BYTES', str(25 * 1024 * 1024)))
+if not 1 <= upload_limit <= 1024 * 1024 * 1024:
+    raise SystemExit('Upload limit must be between 1 byte and 1 GiB')
 password_hash = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=password + "\n", capture_output=True, text=True, check=True).stdout.strip()
 Path("/etc/nginx/hermes.htpasswd").write_text("hermes:" + password_hash + "\n")
 Path("/etc/nginx/hermes.htpasswd").chmod(0o640)
@@ -41,7 +44,7 @@ http {
   }
   server {
     listen PORT_VALUE;
-    client_max_body_size 20m;
+    client_max_body_size UPLOAD_BODY_LIMIT;
     auth_basic "Hermes";
     auth_basic_user_file /etc/nginx/hermes.htpasswd;
     location = /healthz {
@@ -66,5 +69,5 @@ http {
     }
   }
 }
-'''.replace("PORT_VALUE", str(port)))
+'''.replace("PORT_VALUE", str(port)).replace('UPLOAD_BODY_LIMIT', str(upload_limit + 1024 * 1024)))
 subprocess.run(["nginx", "-s", "reload"] if Path("/run/nginx.pid").exists() else ["nginx"], check=True)

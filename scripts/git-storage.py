@@ -82,6 +82,7 @@ import datetime as dt
 import fnmatch
 import hashlib
 import json
+import contextlib
 import logging
 import os
 import re
@@ -171,6 +172,7 @@ DEFAULT_EXCLUDES = (
     "*.tmp",
     "*.sock",
     ".git",
+    '.restore-quarantine',
 )
 
 
@@ -195,6 +197,8 @@ def is_excluded(relative: str, excludes: "tuple[str, ...]" = DEFAULT_EXCLUDES) -
     without pulling in a dependency.
     """
     parts = [part for part in relative.replace("\\", "/").split("/") if part not in ("", ".")]
+    if parts and parts[0] == '.restore-quarantine':
+        return True
     if excludes == DEFAULT_EXCLUDES and os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
         # Only known runtime churn is disposable. Project files, installed
         # tools and nested dependency trees are part of a complete Colab home.
@@ -914,16 +918,21 @@ def _write_sync_base(config: GitConfig, remote_sha: str, local_fingerprint: str,
     fd, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=".state-base-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            managed = getattr(config, '_restored_paths', None)
+            if managed is None and (config.workdir / DATA_SUBDIR).is_dir():
+                managed = backup_managed_paths(config.workdir)
             json.dump({"repo": config.api_repo, "remote": _remote_identity(config),
                        "branch": config.branch,
                        "remote_sha": remote_sha, "local_fingerprint": local_fingerprint,
-                       "sqlite_hashes": sqlite_hashes or {},
+                       "sqlite_hashes": sqlite_hashes or {}, 'managed_paths':managed or [],
                        "boot_id": runtime_boot_id(),
                        "local_identity": local_tree_identity(data_dir) if data_dir else None}, handle)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary_name, 0o600)
         os.replace(temporary_name, path)
+        if hasattr(config, '_restored_paths'):
+            del config._restored_paths
     finally:
         Path(temporary_name).unlink(missing_ok=True)
 
@@ -1958,6 +1967,111 @@ def repair_plaintext_enc_files(workdir: Path, data_dir: Path) -> int:
     return restored
 
 
+def backup_managed_paths(workdir):
+    manifest = read_manifest(workdir)
+    cache = workdir / '.git' if (workdir / '.git').is_dir() else workdir
+    try:
+        inventory = json.loads((cache/'hermes-source-inventory.json').read_text())
+        paths = set(inventory['files'])
+    except (OSError, ValueError, KeyError, TypeError):
+        paths = set()
+        root = workdir / DATA_SUBDIR
+        for directory, dirs, files in os.walk(root):
+            if Path(directory) == root:
+                dirs[:] = [d for d in dirs if d != CHUNK_DIRECTORY]
+            for name in files:
+                stored = (Path(directory)/name).relative_to(root).as_posix()
+                logical = decoded_backup_path(stored, manifest)
+                if backup_file_is_encrypted(Path(directory)/name, stored, manifest):
+                    logical = logical[:-len(ENCRYPTED_SUFFIX)]
+                paths.add(logical)
+        for stored in manifest.get('large_files', {}):
+            logical = decoded_backup_path(stored, manifest)
+            if logical.endswith(ENCRYPTED_SUFFIX) and logical[:-len(ENCRYPTED_SUFFIX)] in manifest.get('encrypted', []):
+                logical = logical[:-len(ENCRYPTED_SUFFIX)]
+            paths.add(logical)
+    paths.update((manifest.get('symlinks') or {}).keys())
+    for path in paths:
+        validate_restore_name(path)
+    return sorted(paths)
+
+
+def validate_restore_name(relative):
+    if (not isinstance(relative, str) or not relative or '\\' in relative or '\x00' in relative
+            or any(part in ('', '.', '..') for part in relative.split('/'))
+            or PurePosixPath(relative).is_absolute()):
+        raise GitStateError('Unsafe logical restore path')
+    return relative
+
+
+@contextlib.contextmanager
+def restore_parent(data_dir, relative):
+    """Hold no-follow directory descriptors throughout every restore write."""
+    parts = validate_restore_name(relative).split('/')
+    data_dir.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptors = []
+    try:
+        fd = os.open(data_dir, flags)
+        descriptors.append(fd)
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, dir_fd=fd)
+            except FileExistsError:
+                pass
+            fd = os.open(part, flags, dir_fd=fd)
+            descriptors.append(fd)
+        yield fd, parts[-1]
+    except OSError as exc:
+        raise GitStateError('Restore path is unavailable or traverses a symlink') from exc
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
+
+
+def publish_restored_file(data_dir, relative, writer, mode=0o600, sqlite=False):
+    with restore_parent(data_dir, relative) as (directory, leaf):
+        parent = Path('/proc/self/fd') / str(directory)
+        fd, name = tempfile.mkstemp(dir=parent, prefix='.restore-')
+        os.close(fd)
+        temporary = Path(name)
+        try:
+            writer(temporary)
+            temporary.chmod(mode)
+            with temporary.open('rb') as handle:
+                os.fsync(handle.fileno())
+            if sqlite:
+                for suffix in ('-wal', '-shm', '-journal'):
+                    try:
+                        os.unlink(leaf + suffix, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+            os.replace(temporary, leaf, dst_dir_fd=directory)
+            os.fsync(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def reconcile_restored_paths(data_dir, config, current):
+    previous = getattr(config, '_previous_managed_paths', [])
+    if not isinstance(previous, list):
+        raise GitStateError('Invalid prior restore inventory')
+    batch = str(int(time.time())) + '-' + secrets.token_hex(8)
+    for relative in sorted(set(previous) - set(current)):
+        validate_restore_name(relative)
+        if any(name.startswith(relative + '/') for name in current):
+            continue
+        path = data_dir / relative
+        if not path.exists() and not path.is_symlink():
+            continue
+        with restore_parent(data_dir, relative) as (source, leaf):
+            if stat.S_ISDIR(os.stat(leaf, dir_fd=source, follow_symlinks=False).st_mode):
+                continue
+            with restore_parent(data_dir, '.restore-quarantine/' + batch + '/' + relative) as (destination, target):
+                os.replace(leaf, target, src_dir_fd=source, dst_dir_fd=destination)
+    config._restored_paths = sorted(current)
+
+
 def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
@@ -1970,6 +2084,10 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         return 0
 
     manifest = read_manifest(workdir)
+    for relative in manifest.get('empty_dirs', []) or []:
+        validate_restore_name(relative)
+    for relative in (manifest.get('symlinks') or {}):
+        validate_restore_name(relative)
     recorded_modes = manifest.get("modes")
     if not isinstance(recorded_modes, dict):
         recorded_modes = {}
@@ -1978,8 +2096,12 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     for directory, dirs, files in os.walk(source_root):
         if Path(directory) == source_root:
             dirs[:] = [name for name in dirs if name != CHUNK_DIRECTORY]
-        source_files.extend(Path(directory) / name for name in files
-                            if (Path(directory) / name).is_file())
+        for name in files:
+            source = Path(directory) / name
+            if source.is_symlink():
+                raise GitStateError('Backup contains an unexpected symlink blob')
+            if source.is_file():
+                source_files.append(source)
     relative_paths = {source: source.relative_to(source_root).as_posix() for source in source_files}
     if extra_root is not None:
         for source in extra_root.rglob("*"):
@@ -2002,6 +2124,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
                 sqlite_sidecars.add(relative + suffix)
 
     restored = 0
+    managed = set()
     for source in sorted(source_files):
         relative = relative_paths[source]
         if relative in sqlite_sidecars or any(decoded_backup_path(relative, manifest) == db + suffix
@@ -2012,32 +2135,27 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         relative = decoded_backup_path(relative, manifest)
         logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
         is_sqlite = logical_relative in sqlite_dbs
-        destination = data_dir / logical_relative
+        validate_restore_name(logical_relative)
         if is_sqlite:
             # Restore only the database snapshot. A legacy branch may still
             # contain sidecars from the old raw-file mirror; never replay them
             # against this restored image.
-            Path(str(destination) + "-wal").unlink(missing_ok=True)
-            Path(str(destination) + "-shm").unlink(missing_ok=True)
-            Path(str(destination) + "-journal").unlink(missing_ok=True)
-            destination.parent.mkdir(parents=True, exist_ok=True)
             with source.open("rb") as handle:
                 prefix = handle.readline(64)
             if prefix in (_STREAM_SEALED_PREFIX, _COMPRESSED_STREAM_PREFIX):
-                decrypt_stream_file(source, destination, config)
+                writer = lambda target: decrypt_stream_file(source, target, config)
             elif sealed:
-                decrypt_age_file(source, destination, config)
+                writer = lambda target: decrypt_age_file(source, target, config)
             else:
                 # Older mirrors stored the main file and live WAL/SHM as
                 # separate blobs. Fold any same-generation WAL frames into a
                 # new DB snapshot instead of discarding the latest commits.
-                snapshot_sqlite(source, destination)
+                writer = lambda target: snapshot_sqlite(source, target)
             mode = manifest_mode(recorded_modes.get(logical_relative))
-            try:
-                os.chmod(destination, mode or (source.stat().st_mode & 0o777))
-            except OSError:
-                pass
+            publish_restored_file(data_dir, logical_relative, writer,
+                                  mode or (source.stat().st_mode & 0o777), sqlite=True)
             restored += 1
+            managed.add(logical_relative)
             continue
         payload = None
         if sealed:
@@ -2047,19 +2165,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             if opened is None:
                 raise GitStateError(f'Could not decrypt {relative}; restore is incomplete and backup remains blocked')
             payload = opened
-        destination = data_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if relative in sqlite_dbs:
-            # Restore happens before Hermes starts. Remove any sidecars from a
-            # prior legacy backup so SQLite cannot replay them against this
-            # newly restored snapshot.
-            Path(str(destination) + "-wal").unlink(missing_ok=True)
-            Path(str(destination) + "-shm").unlink(missing_ok=True)
-            Path(str(destination) + "-journal").unlink(missing_ok=True)
-        if payload is None:
-            shutil.copyfile(source, destination)
-        else:
-            destination.write_bytes(payload)
+        writer = (lambda target: shutil.copyfile(source, target)) if payload is None else (lambda target: target.write_bytes(payload))
         # git records the executable bit in the object mode, so a script that
         # was 0755 in /opt/data has to come back runnable -- a restored
         # entrypoint or hook that lost its +x simply does not run. Modes git
@@ -2075,26 +2181,22 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
                     mode = source.stat().st_mode & 0o777
                 except OSError:
                     mode = 0o644
-        try:
-            os.chmod(destination, mode or 0o644)
-        except OSError:
-            pass
+        publish_restored_file(data_dir, relative, writer, mode or 0o644,
+                              sqlite=relative in sqlite_dbs)
         restored += 1
+        managed.add(relative)
 
     # Directories git could not hold, and the symlinks the walk did not copy
     # as blobs. Both come from the manifest the mirror wrote.
     for relative in manifest.get("empty_dirs", []) or []:
-        if not isinstance(relative, str) or not relative or relative.startswith("/"):
-            continue
-        try:
-            (data_dir / relative).mkdir(parents=True, exist_ok=True)
+        with restore_parent(data_dir, relative + '/.directory') as (_directory, _leaf):
             restored += 1
-        except OSError as exc:
-            raise GitStateError(f'Could not restore directory {relative}: {redact(str(exc))}') from exc
     for relative, target in (manifest.get("symlinks") or {}).items():
         if not restore_symlink(data_dir, relative, target):
             raise GitStateError(f'Could not restore symlink {relative}; restore is incomplete')
         restored += 1
+        managed.add(relative)
+    reconcile_restored_paths(data_dir, config, managed)
     return restored
 
 
@@ -2106,7 +2208,9 @@ def restore_symlink(data_dir: Path, relative: str, target: str) -> bool:
     directory is created, which is what keeps a tampered manifest from writing
     somewhere outside the restored tree.
     """
-    if not isinstance(relative, str) or not relative or relative.startswith("/"):
+    try:
+        validate_restore_name(relative)
+    except GitStateError:
         return False
     if not isinstance(target, str) or not target or PurePosixPath(target).is_absolute():
         LOG.warning("not restoring symlink %s: target %r is not relative",
@@ -2121,12 +2225,14 @@ def restore_symlink(data_dir: Path, relative: str, target: str) -> bool:
                     relative, target)
         return False
     try:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink() or destination.exists():
-            destination.unlink()
-        os.symlink(target, destination)
+        with restore_parent(data_dir, relative) as (directory, leaf):
+            try:
+                os.unlink(leaf, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            os.symlink(target, leaf, dir_fd=directory)
         return True
-    except OSError as exc:
+    except (OSError, GitStateError) as exc:
         LOG.warning("could not restore symlink %s -> %s: %s", relative, target, exc)
         return False
 
@@ -2426,6 +2532,12 @@ def local_restore_is_current(data_dir: Path, config: GitConfig, remote_sha: str)
 
 def restore(data_dir: Path, config: GitConfig) -> bool:
     data_dir.mkdir(parents=True, exist_ok=True)
+    previous_base = _read_sync_base(config)
+    previous_paths = (previous_base or {}).get('managed_paths')
+    if previous_paths is None and previous_base and (config.workdir / DATA_SUBDIR).is_dir():
+        local_head = run_git(['rev-parse', 'HEAD'], cwd=config.workdir, check=False, config=config)
+        if local_head.returncode == 0 and local_head.stdout.strip() == previous_base.get('remote_sha'):
+            previous_paths = backup_managed_paths(config.workdir)
     try:
         workdir = ensure_clone(config)
         remote_sha = head_commit(workdir, config)
@@ -2461,6 +2573,7 @@ def restore(data_dir: Path, config: GitConfig) -> bool:
         LOG.info('Retaining local state from this VM; skipping repeat restore and preserving unsynced changes')
         return True
     # A partial restore must never leave permission to publish this tree.
+    config._previous_managed_paths = previous_paths or []
     _sync_base_path(config).unlink(missing_ok=True)
     restored = materialize(workdir, data_dir, config)
     _write_sync_base(config, head_commit(workdir, config), state_fingerprint(data_dir),

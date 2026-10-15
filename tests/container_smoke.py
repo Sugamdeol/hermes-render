@@ -58,6 +58,20 @@ providers = call(endpoint, token=token)
 assert "ci-custom" in providers and "ci-provider-secret" not in providers
 assert json.loads(call("/api/env", {"key": "CI_SAVED_ENV", "value": "ci-value"}, method="PUT", token=token))["ok"]
 
+# Above the proxy's former 20 MiB cap, below the shared app upload limit.
+boundary = 'hermes-ci-upload'
+attachment = b'x' * (22 * 1024 * 1024)
+body = (('--'+boundary+'\r\nContent-Disposition: form-data; name="file"; filename="limit-probe.txt"\r\n'
+         'Content-Type: text/plain\r\n\r\n').encode() + attachment + ('\r\n--'+boundary+'--\r\n').encode())
+request = urllib.request.Request(BASE+'/api/plugins/hermes-chat-dashboard/attachments', data=body,
+    headers={'Authorization':AUTH,'X-Hermes-Session-Token':token,
+             'Content-Type':'multipart/form-data; boundary='+boundary},method='POST')
+with urllib.request.urlopen(request,timeout=60) as response:
+    upload=json.load(response)
+assert upload['size'] == len(attachment)
+print('22 MiB attachment passes the authenticated proxy and application limit',flush=True)
+del attachment, body
+
 # Select the local fake provider in native Hermes' actual configuration.
 subprocess.check_call(["docker", "exec", CONTAINER, "/opt/hermes/.venv/bin/python", "-c", "from pathlib import Path; import yaml; p=Path('/opt/data/config.yaml'); c=yaml.safe_load(p.read_text()); c['model']={'default':'ci-model','provider':'custom:ci-custom'}; p.write_text(yaml.safe_dump(c,sort_keys=False))"])
 
