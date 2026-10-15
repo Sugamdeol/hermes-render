@@ -2125,6 +2125,33 @@ def publish_restored_file(data_dir, relative, writer, mode=0o600, sqlite=False):
             temporary.unlink(missing_ok=True)
 
 
+def copy_restored_plain_file(source, data_dir, relative, mode):
+    """Reuse a byte-identical partial restore without following destination links."""
+    import stat
+    with restore_parent(data_dir, relative) as (directory, leaf):
+        try:
+            fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        except OSError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, 'rb') as existing:
+                info = os.fstat(existing.fileno())
+                if stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_size == source.stat().st_size:
+                    equal = True
+                    with source.open('rb') as saved:
+                        while True:
+                            block = saved.read(1024 * 1024)
+                            if block != existing.read(1024 * 1024):
+                                equal = False; break
+                            if not block: break
+                    if equal:
+                        if stat.S_IMODE(info.st_mode) != mode:
+                            os.fchmod(existing.fileno(), mode)
+                            os.fsync(existing.fileno())
+                        return
+    publish_restored_file(data_dir, relative, lambda target: shutil.copyfile(source, target), mode)
+
+
 def reconcile_restored_paths(data_dir, config, current):
     previous = getattr(config, '_previous_managed_paths', [])
     if not isinstance(previous, list):
@@ -2187,7 +2214,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             raise GitStateError('Invalid verified restore source')
         source_files.append(source)
         relative_paths[source] = relative
-    source_relatives = list(relative_paths.values())
+    source_relatives = set(relative_paths.values())
     sqlite_dbs, sqlite_sidecars = sqlite_files(source_root, source_relatives)
     if extra_root is not None:
         extra_dbs, extra_sidecars = sqlite_files(extra_root, source_relatives)
@@ -2202,21 +2229,23 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     recorded_sqlite = manifest.get("sqlite_snapshots", [])
     if isinstance(recorded_sqlite, list):
         sqlite_dbs.update(value for value in recorded_sqlite if isinstance(value, str))
-    for relative in sqlite_dbs:
-        for suffix in ("-wal", "-shm", "-journal"):
-            if relative + suffix in source_relatives:
-                sqlite_sidecars.add(relative + suffix)
-
+    decoded_sidecars = {db + suffix for db in sqlite_dbs for suffix in ('-wal', '-shm', '-journal')}
+    sqlite_sidecars.update(decoded_sidecars & source_relatives)
+    LOG.info('[restore] Restoring %d local files (%d SQLite databases)', len(source_files), len(sqlite_dbs))
     restored = 0
     managed = set()
+    last_report = time.monotonic()
     for source in sorted(source_files):
+        if time.monotonic() - last_report >= 10:
+            LOG.info('[restore] Local files: %d/%d processed', restored, len(source_files))
+            last_report = time.monotonic()
         relative = relative_paths[source]
-        if relative in sqlite_sidecars or any(decoded_backup_path(relative, manifest) == db + suffix
-                                             for suffix in ('-wal', '-shm', '-journal')
-                                             for db in sqlite_dbs):
+        # Decode once per file; comparing every file to every database was quadratic.
+        decoded = decoded_backup_path(relative, manifest)
+        if relative in sqlite_sidecars or decoded in decoded_sidecars:
             continue
         sealed = backup_file_is_encrypted(source, relative, manifest)
-        relative = decoded_backup_path(relative, manifest)
+        relative = decoded
         logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
         is_sqlite = logical_relative in sqlite_dbs
         validate_restore_name(logical_relative)
@@ -2265,8 +2294,11 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
                     mode = source.stat().st_mode & 0o777
                 except OSError:
                     mode = 0o644
-        publish_restored_file(data_dir, relative, writer, mode or 0o644,
-                              sqlite=relative in sqlite_dbs)
+        if payload is None:
+            copy_restored_plain_file(source, data_dir, relative, mode or 0o644)
+        else:
+            publish_restored_file(data_dir, relative, writer, mode or 0o644,
+                                  sqlite=relative in sqlite_dbs)
         restored += 1
         managed.add(relative)
 
@@ -2281,6 +2313,7 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         restored += 1
         managed.add(relative)
     reconcile_restored_paths(data_dir, config, managed)
+    LOG.info('[restore] Restored %d local entries', restored)
     return restored
 
 
