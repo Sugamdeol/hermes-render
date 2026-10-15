@@ -161,6 +161,7 @@ def runtime_env(token, key, dashboard_password=None):
         "HERMES_DASHBOARD": "1", "HERMES_DASHBOARD_HOST": "127.0.0.1",
         "HERMES_DASHBOARD_PORT": "9119",
         "HERMES_RUNTIME_PROFILE": "colab-full",
+        "HERMES_COLAB_UPDATE_DIR": "/tmp/hermes-colab-control",
         "HERMES_MAX_CONCURRENT_SESSIONS": "10",
         "HERMES_RESUME_ALL_INTERRUPTED": "1",
         "HERMES_CRON_MAX_PARALLEL": "10",
@@ -1002,6 +1003,11 @@ def main(confirm_switch=False):
         return launch_with_progress(env, progress)
 
 
+def start_update_control():
+    import runpy
+    runpy.run_path(str(TOOLS / "colab-update-control.py"))["start"](globals())
+
+
 def launch_with_progress(env, progress):
     install(env)
     progress.step(1)
@@ -1036,6 +1042,7 @@ def launch_with_progress(env, progress):
     else:
         raise RuntimeError(f"Startup is still pending. Inspect {LOG} and use HERMES_COLAB.status()")
     progress.step(4)
+    start_update_control()
     agent.dashboard()
     progress.finish()
     print("Telegram polling is running. Use HERMES_COLAB.backup() and HERMES_COLAB.stop() before switching hosts.")

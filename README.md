@@ -323,3 +323,11 @@ Colab runtimes. Without persistent cache, a fresh VM starts from the repository'
 reviewed pin. Launcher/custom integration updates still come from
 `Sugamdeol/hermes-render/main` when Start runs. A running older notebook must first
 save, stop, and rerun Start to gain these new updater methods.
+
+You can also open **Chat settings → Hermes agent → Check for updates** in the
+Colab dashboard. When a new commit is available, choose **Update Hermes** and
+confirm **Back up and update**. Keep the notebook running. The notebook owns the
+update job, so the operation survives the dashboard restarting. Its status is
+shown when you reopen settings. If a tunnel address changes, open the new
+link shown in Colab. Older notebook launchers show an offline update control;
+save, stop and rerun Start once to enable it.

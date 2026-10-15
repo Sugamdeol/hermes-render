@@ -89,9 +89,10 @@ class StartupProgressTests(unittest.TestCase):
         response.__enter__ = Mock(return_value=response)
         response.__exit__ = Mock(return_value=False)
         response.read.return_value = b'{"gateway_running":true,"gateway_state":"running"}'
-        with patch.object(launcher, 'LOG', self.cache / 'startup.log'), patch.object(launcher, 'install'), patch.object(launcher.subprocess, 'Popen', return_value=process), patch.object(launcher, 'ColabAgent', return_value=agent), patch.object(launcher.urllib.request, 'urlopen', return_value=response), patch.dict(launcher.__dict__, {'HERMES_COLAB':None}):
+        with patch.object(launcher, 'start_update_control') as update_control, patch.object(launcher, 'LOG', self.cache / 'startup.log'), patch.object(launcher, 'install'), patch.object(launcher.subprocess, 'Popen', return_value=process), patch.object(launcher, 'ColabAgent', return_value=agent), patch.object(launcher.urllib.request, 'urlopen', return_value=response), patch.dict(launcher.__dict__, {'HERMES_COLAB':None}):
             self.assertIs(launcher.launch_with_progress({}, progress), agent)
             self.assertIs(launcher.HERMES_COLAB, agent)
+        update_control.assert_called_once()
         progress.finish.assert_called_once()
         agent.dashboard.assert_called_once()
         self.assertEqual(progress.step.call_args_list[-1].args, (4,))
