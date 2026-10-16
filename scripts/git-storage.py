@@ -2102,25 +2102,30 @@ def restore_parent(data_dir, relative):
 
 def publish_restored_file(data_dir, relative, writer, mode=0o600, sqlite=False):
     with restore_parent(data_dir, relative) as (directory, leaf):
-        parent = Path('/proc/self/fd') / str(directory)
-        fd, name = tempfile.mkstemp(dir=parent, prefix='.restore-')
-        os.close(fd)
-        temporary = Path(name)
-        try:
-            writer(temporary)
-            temporary.chmod(mode)
-            with temporary.open('rb') as handle:
-                os.fsync(handle.fileno())
-            if sqlite:
-                for suffix in ('-wal', '-shm', '-journal'):
-                    try:
-                        os.unlink(leaf + suffix, dir_fd=directory)
-                    except FileNotFoundError:
-                        pass
-            os.replace(temporary, leaf, dst_dir_fd=directory)
-            os.fsync(directory)
-        finally:
-            temporary.unlink(missing_ok=True)
+        _publish_restored_at(directory, leaf, writer, mode, sqlite)
+
+
+def _publish_restored_at(directory, leaf, writer, mode=0o600, sqlite=False):
+    """Publish through the caller's already verified directory descriptor."""
+    parent = Path('/proc/self/fd') / str(directory)
+    fd, name = tempfile.mkstemp(dir=parent, prefix='.restore-')
+    os.close(fd)
+    temporary = Path(name)
+    try:
+        writer(temporary)
+        temporary.chmod(mode)
+        with temporary.open('rb') as handle:
+            os.fsync(handle.fileno())
+        if sqlite:
+            for suffix in ('-wal', '-shm', '-journal'):
+                try:
+                    os.unlink(leaf + suffix, dir_fd=directory)
+                except FileNotFoundError:
+                    pass
+        os.replace(temporary, leaf, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def prepare_large_restore(root, record, cache, relative, data_dir, manifest):
@@ -2197,7 +2202,7 @@ def copy_restored_plain_file(source, data_dir, relative, mode):
                             os.fchmod(existing.fileno(), mode)
                             os.fsync(existing.fileno())
                         return
-    publish_restored_file(data_dir, relative, lambda target: shutil.copyfile(source, target), mode)
+        _publish_restored_at(directory, leaf, lambda target: shutil.copyfile(source, target), mode)
 
 
 def reconcile_restored_paths(data_dir, config, current):
@@ -2241,15 +2246,19 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         recorded_modes = {}
 
     source_files = []
-    for directory, dirs, files in os.walk(source_root):
-        if Path(directory) == source_root:
-            dirs[:] = [name for name in dirs if name != CHUNK_DIRECTORY]
-        for name in files:
-            source = Path(directory) / name
-            if source.is_symlink():
-                raise GitStateError('Backup contains an unexpected symlink blob')
-            if source.is_file():
-                source_files.append(source)
+    directories = [source_root]
+    while directories:
+        directory = directories.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if directory == source_root and entry.name == CHUNK_DIRECTORY:
+                    continue
+                if entry.is_symlink():
+                    raise GitStateError('Backup contains an unexpected symlink blob')
+                if entry.is_dir(follow_symlinks=False):
+                    directories.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    source_files.append(Path(entry.path))
     relative_paths = {source: source.relative_to(source_root).as_posix() for source in source_files}
     if extra_root is not None:
         for source in extra_root.rglob("*"):
@@ -2264,9 +2273,10 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
         relative_paths[source] = relative
     # Queue placeholders, not assembled files: at most two large blobs are staged.
     large_records = large_records or {}
+    occupied = set(relative_paths.values())
     for relative in large_records:
         source = source_root / relative
-        if relative in relative_paths.values():
+        if relative in occupied:
             raise GitStateError('Conflicting large-file restore entry')
         source_files.append(source)
         relative_paths[source] = relative
