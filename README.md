@@ -60,6 +60,12 @@ install builds the native web UI and can take several minutes. Open the printed
 dashboard link through Colab's browser proxy. Username is `hermes`; the saved
 password is shown with the dashboard link after startup. Keep the notebook private.
 
+In Telegram, `/model` shows the complete paginated picker catalog without the
+old 50-model-per-provider cap. Use `/model --refresh` to fetch fresh catalogs
+from all configured providers, including custom endpoints. Regular picker opens
+keep their fast cached path; an explicit refresh can take longer when an API is
+slow. Manually configured model IDs remain available alongside discovery results.
+
 In another cell, use `HERMES_COLAB.status()`, `HERMES_COLAB.backup()` or
 `HERMES_COLAB.stop()`. Stop saves through the existing storage daemon and refuses
 to shut down on a failed backup. A failed `backup()` prints the reason from the
