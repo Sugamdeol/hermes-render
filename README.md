@@ -360,3 +360,22 @@ full notebook runtime profile on both hosts. Requires Linux with root access
 and Python 3.11 or newer. Host-routing/secrets behavior is tested locally; a
 complete live Kaggle launch remains unverified. No always-on lifetime or speed
 is promised.
+
+
+### Full notebook state restore
+
+Cold Colab/Kaggle startup restores the complete backup before starting the gateway.
+Large chunked files are SHA-256 verified with at most two files staged at once.
+On the same filesystem, verified ordinary files are moved into their final location
+instead of copied again. Encrypted database snapshots are decrypted and published
+before their staging file is removed. The Git clone and original backup chunks
+remain intact. This reduces temporary disk use without excluding caches, projects,
+tools, chats or settings from the existing backup.
+
+Retrying an interrupted restore checks already restored large ordinary files against
+the manifest SHA-256 and skips assembly/writes when the bytes match. Modified files
+are restored again. Symlink guards, atomic publication, SQLite snapshot handling,
+and the rule blocking backups after an incomplete restore remain enabled.
+Notebook restore/startup budgets are two hours rather than thirty minutes; this
+prevents the old premature cancellation and is not itself a speed improvement.
+Download time still depends on the actual backup size and GitHub/network speed.

@@ -43,8 +43,8 @@ class FullColabTests(unittest.TestCase):
         self.assertEqual(env['HERMES_MAX_CONCURRENT_SESSIONS'], '10')
         self.assertEqual(env['GIT_STATE_HTTP_LOW_SPEED_LIMIT'], '0')
         self.assertEqual(env['GIT_STATE_GIT_TIMEOUT_SECONDS'], '1800')
-        self.assertEqual(env['HERMES_RESTORE_TIMEOUT_SECONDS'], '1800')
-        self.assertEqual(env['HERMES_COLAB_STARTUP_TIMEOUT_SECONDS'], '1800')
+        self.assertEqual(env['HERMES_RESTORE_TIMEOUT_SECONDS'], '7200')
+        self.assertEqual(env['HERMES_COLAB_STARTUP_TIMEOUT_SECONDS'], '7200')
         self.assertIn('GIT_STATE_HTTP_LOW_SPEED_LIMIT', env['HERMES_ENV_OVERRIDE_KEYS'])
         self.assertIn('HERMES_MAX_CONCURRENT_SESSIONS', env['HERMES_ENV_OVERRIDE_KEYS'])
 

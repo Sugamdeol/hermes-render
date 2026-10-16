@@ -154,8 +154,9 @@ def runtime_env(token, key, dashboard_password=None):
         # GitHub may spend over a minute preparing a large shallow clone.
         "GIT_STATE_HTTP_LOW_SPEED_LIMIT": "0",
         "GIT_STATE_GIT_TIMEOUT_SECONDS": "1800",
-        "HERMES_RESTORE_TIMEOUT_SECONDS": "1800",
-        "HERMES_COLAB_STARTUP_TIMEOUT_SECONDS": "1800",
+        # Full state must finish before startup; large cold restores need room to complete.
+        "HERMES_RESTORE_TIMEOUT_SECONDS": "7200",
+        "HERMES_COLAB_STARTUP_TIMEOUT_SECONDS": "7200",
         "HERMES_HOME": str(DATA), "GIT_STATE_WORKDIR": str(SOURCE.parent / "hermes-git-cache/state"),
         "HERMES_UID": "", "HERMES_GID": "",
         "HERMES_RECOVERY_CHECKPOINT_FILE": "/tmp/hermes-recovery-checkpoint.json",

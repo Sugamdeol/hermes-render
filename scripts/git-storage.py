@@ -1716,18 +1716,16 @@ def materialize(workdir: Path, data_dir: Path, config: GitConfig) -> int:
     root = workdir / DATA_SUBDIR
     # This cache is outside the clone and live data; never uploaded as user state.
     cache = workdir.parent / ('.' + workdir.name + '-restore-cache')
-    assembled = {}
-    LOG.info('[restore] Preparing %d large backup file(s)', len(records))
     for relative, record in records.items():
         validate_restore_name(relative)
         if PurePosixPath(relative).parts[0] == CHUNK_DIRECTORY:
             raise GitStateError('Unsafe large-file restore path')
         if (root / relative).exists() or not isinstance(record, dict):
             raise GitStateError('Conflicting large-file restore entry')
-        cached = assemble_restore_blob(root, record, cache, relative)
-        assembled[relative] = cached
-    LOG.info('[restore] Large backups verified; restoring local files')
-    return _materialize_tree(workdir, data_dir, config, extra_files=assembled)
+    LOG.info('[restore] Streaming %d large backup file(s) into local restore', len(records))
+    return _materialize_tree(workdir, data_dir, config, large_records=records,
+                             restore_cache=cache)
+
 
 def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
     """Publish a complete local snapshot, retaining the old tree on failure."""
@@ -2125,6 +2123,56 @@ def publish_restored_file(data_dir, relative, writer, mode=0o600, sqlite=False):
             temporary.unlink(missing_ok=True)
 
 
+def prepare_large_restore(root, record, cache, relative, data_dir, manifest):
+    """Verify a completed plain file on retries before doing any assembly/write."""
+    logical = decoded_backup_path(relative, manifest)
+    validate_restore_name(logical)
+    # Databases require snapshot/WAL handling; sealed files require decryption.
+    if not relative.endswith(ENCRYPTED_SUFFIX) and not logical.lower().endswith(('.db', '.sqlite', '.sqlite3', '-wal', '-shm', '-journal')):
+        expected, size = record.get('sha256'), record.get('size')
+        if isinstance(expected, str) and re.fullmatch(r'[0-9a-f]{64}', expected) and isinstance(size, int) and size >= 0:
+            with restore_parent(data_dir, logical) as (directory, leaf):
+                try:
+                    fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                except OSError:
+                    fd = None
+                if fd is not None:
+                    with os.fdopen(fd, 'rb') as existing:
+                        before = os.fstat(existing.fileno())
+                        if stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size == size:
+                            digest = hashlib.sha256()
+                            while block := existing.read(1024 * 1024):
+                                digest.update(block)
+                            after = os.fstat(existing.fileno())
+                            unchanged = all(getattr(before, key) == getattr(after, key) for key in
+                                            ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+                            if unchanged and digest.hexdigest() == expected:
+                                modes = manifest.get('modes')
+                                mode = manifest_mode(modes.get(logical)) if isinstance(modes, dict) else None
+                                if mode is None:
+                                    mode = int(record.get('mode', 0o644)) & 0o777
+                                if logical in SENSITIVE_FILES:
+                                    mode = 0o600
+                                if stat.S_IMODE(after.st_mode) != (mode or 0o644):
+                                    os.fchmod(existing.fileno(), mode or 0o644)
+                                    os.fsync(existing.fileno())
+                                LOG.info('[restore] Verified existing large file %s (%d bytes)', logical, size)
+                                return None
+    return assemble_restore_blob(root, record, cache, relative)
+
+
+def move_verified_restore(source, target):
+    """Consume a verified staging file without a second full write on one disk."""
+    import errno
+    try:
+        os.replace(source, target)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        shutil.copyfile(source, target)
+        # Keep staging until the durable publication has succeeded.
+
+
 def copy_restored_plain_file(source, data_dir, relative, mode):
     """Reuse a byte-identical partial restore without following destination links."""
     import stat
@@ -2172,7 +2220,7 @@ def reconcile_restored_paths(data_dir, config, current):
     config._restored_paths = sorted(current)
 
 
-def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None, extra_files: dict | None = None) -> int:
+def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, source_root: Path | None = None, extra_root: Path | None = None, extra_files: dict | None = None, large_records: dict | None = None, restore_cache: Path | None = None) -> int:
     """Copy the repo's data/ tree into data_dir, decrypting what is sealed.
 
     Existing local files are overwritten, but local files absent from the repo
@@ -2214,6 +2262,14 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             raise GitStateError('Invalid verified restore source')
         source_files.append(source)
         relative_paths[source] = relative
+    # Queue placeholders, not assembled files: at most two large blobs are staged.
+    large_records = large_records or {}
+    for relative in large_records:
+        source = source_root / relative
+        if relative in relative_paths.values():
+            raise GitStateError('Conflicting large-file restore entry')
+        source_files.append(source)
+        relative_paths[source] = relative
     source_relatives = set(relative_paths.values())
     sqlite_dbs, sqlite_sidecars = sqlite_files(source_root, source_relatives)
     if extra_root is not None:
@@ -2245,19 +2301,48 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
     LOG.info('[restore] Using %d bounded file-copy worker(s)', workers)
     pending = deque()
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='hermes-restore') as pool:
-        for source in sorted(source_files):
+        large_names = iter(sorted(large_records))
+        large_pending = {}
+        def queue_large():
+            name = next(large_names, None)
+            if name is not None:
+                large_pending[name] = pool.submit(prepare_large_restore, source_root,
+                                                 large_records[name], restore_cache, name, data_dir, manifest)
+        for _ in range(min(2, workers)):
+            queue_large()
+        for source in sorted(source_files, key=lambda item: relative_paths[item]):
             if time.monotonic() - last_report >= 10:
                 LOG.info('[restore] Local files: %d/%d processed', restored, len(source_files))
                 last_report = time.monotonic()
             relative = relative_paths[source]
+            staged_large = relative in large_records
+            if staged_large:
+                source = large_pending.pop(relative).result()
+                if source is None:
+                    logical = decoded_backup_path(relative, manifest)
+                    if logical in managed:
+                        raise GitStateError('Conflicting logical restore paths')
+                    managed.add(logical)
+                    restored += 1
+                    queue_large()
+                    continue
             # Decode once per file; comparing every file to every database was quadratic.
             decoded = decoded_backup_path(relative, manifest)
             if relative in sqlite_sidecars or decoded in decoded_sidecars:
+                if staged_large:
+                    source.unlink(missing_ok=True)
+                    queue_large()
                 continue
             sealed = backup_file_is_encrypted(source, relative, manifest)
             relative = decoded
             logical_relative = relative[:-len(ENCRYPTED_SUFFIX)] if sealed else relative
             is_sqlite = logical_relative in sqlite_dbs
+            if staged_large and not sealed and logical_relative.lower().endswith(('.db', '.sqlite', '.sqlite3')):
+                with source.open('rb') as handle:
+                    is_sqlite = handle.read(len(_SQLITE_HEADER)) == _SQLITE_HEADER
+                if is_sqlite:
+                    sqlite_dbs.add(logical_relative)
+                    decoded_sidecars.update(logical_relative + suffix for suffix in ('-wal', '-shm', '-journal'))
             validate_restore_name(logical_relative)
             if logical_relative in managed:
                 raise GitStateError('Conflicting logical restore paths')
@@ -2279,6 +2364,9 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
                 mode = manifest_mode(recorded_modes.get(logical_relative))
                 publish_restored_file(data_dir, logical_relative, writer,
                                       mode or (source.stat().st_mode & 0o777), sqlite=True)
+                if staged_large:
+                    source.unlink(missing_ok=True)
+                    queue_large()
                 restored += 1
                 managed.add(logical_relative)
                 continue
@@ -2307,7 +2395,12 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
                     except OSError:
                         mode = 0o644
             if payload is None:
-                if workers == 1:
+                if staged_large:
+                    publish_restored_file(data_dir, relative,
+                                          lambda target: move_verified_restore(source, target),
+                                          mode or 0o644)
+                    source.unlink(missing_ok=True)
+                elif workers == 1:
                     copy_restored_plain_file(source, data_dir, relative, mode or 0o644)
                 else:
                     pending.append(pool.submit(copy_restored_plain_file, source, data_dir, relative, mode or 0o644))
@@ -2316,6 +2409,10 @@ def _materialize_tree(workdir: Path, data_dir: Path, config: GitConfig, *, sourc
             else:
                 publish_restored_file(data_dir, relative, writer, mode or 0o644,
                                       sqlite=relative in sqlite_dbs)
+            if staged_large:
+                if sealed:
+                    source.unlink(missing_ok=True)
+                queue_large()
             restored += 1
             managed.add(relative)
         # No completion marker, symlink publication or backup is allowed until
