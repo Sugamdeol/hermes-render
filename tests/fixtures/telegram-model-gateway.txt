@@ -1,0 +1,127 @@
+# Source: NousResearch/hermes-agent@7cc3fb8cb55898747dd1dfa56fda3e16ebba028e
+class NativeModelCommands:
+    async def _send_model_picker(self, event: MessageEvent, source, adapter, session_key: str, listing_kwargs: dict, on_model_selected) -> bool:
+        """Send the interactive /model picker; False when nothing was sent (text fallback). *source*
+        is session-key-normalized so the picker's thread metadata lands where the next turn reads."""
+        from hermes_cli.model_switch_providers import list_picker_providers
+        try:  # off-loop: listing still reads config/disk cache synchronously (#41289)
+            providers = await asyncio.to_thread(
+                list_picker_providers, max_models=50, include_moa=True, **listing_kwargs
+            )
+        except Exception:
+            providers = []
+        if not providers:
+            return False
+        result = await adapter.send_model_picker(
+            chat_id=source.chat_id, providers=providers,
+            current_model=listing_kwargs["current_model"],
+            current_provider=listing_kwargs["current_provider"], session_key=session_key,
+            on_model_selected=on_model_selected,
+            metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+        )
+        return bool(result.success)
+
+
+    async def _model_listing_reply(
+        self, event: MessageEvent, ctx: _ModelSwitchContext, profile_home
+    ) -> Optional[str]:
+        """``/model`` with no args: interactive picker where supported, else the text list."""
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.providers import get_label
+
+        listing_kwargs = dict(
+            current_provider=ctx.current_provider, current_base_url=ctx.current_base_url,
+            current_model=ctx.current_model, user_providers=ctx.user_provs,
+            custom_providers=ctx.custom_provs, excluded_providers=ctx.excluded_provs,
+            # Chat `/model` is a read path: catalogs come from the disk cache and stale ones warm
+            # in the background, and only the selected custom endpoint is probed live, so one
+            # degraded provider can't stall the reply (#74003). Mirrors the GUI read path.
+            non_blocking_catalogs=True, probe_custom_providers=False, probe_current_custom_provider=True,
+        )
+        adapter = self._delivery_adapter_for(ctx.source)
+        if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
+            async def _picker_switch(model_id: str, provider_slug: str) -> str:
+                # The picker callback binds the raw event source (pre-normalization).
+                result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
+                if error is not None:
+                    return error
+                return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
+
+            async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+                if profile_home is None:
+                    return await _picker_switch(model_id, provider_slug)
+                from gateway.run import _profile_runtime_scope
+                with _profile_runtime_scope(profile_home):
+                    return await _picker_switch(model_id, provider_slug)
+
+            if await self._send_model_picker(event, ctx.source, adapter, ctx.session_key, listing_kwargs, _on_model_selected):
+                return None  # Picker sent — adapter handles the response
+
+        lines = [t("gateway.model.current_label", model=ctx.current_model or t("gateway.shared.unknown_value"),
+                   provider=get_label(ctx.current_provider)), ""]
+        try:  # off-loop: listing still reads config/disk cache synchronously (#41289)
+            providers = await asyncio.to_thread(list_authenticated_providers, max_models=_TEXT_LISTING_MODELS, **listing_kwargs)
+            lines.extend(_model_provider_listing_lines(providers))
+        except Exception:
+            pass
+        lines.append(t("gateway.model.usage_switch_model"))
+        lines.append(t("gateway.model.usage_switch_provider"))
+        lines.append(t("gateway.model.usage_persist"))
+        return "\n".join(lines)
+
+
+    async def _handle_model_command_locked(self, event: MessageEvent) -> Optional[str]:
+        from gateway.run import _hermes_home
+        from hermes_cli.model_switch import parse_model_switch_args, resolve_persist_behavior
+
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(event.source)
+        request = parse_model_switch_args(event.get_command_args().strip())  # single-owner parser
+        if request.errors:
+            return f"❌ {request.error_messages()[0]}"  # gateway decoration over canonical copy
+        if request.force_refresh:  # bust the disk cache so the picker shows live data
+            with contextlib.suppress(Exception):
+                from hermes_cli.models import clear_provider_models_cache
+                clear_provider_models_cache()
+        # Normalize like a message turn (Telegram DM topic recovery) before deriving the override
+        # key, so the override lands under the key the next turn reads.
+        # Check for session override. See #30479.
+        source = await asyncio.to_thread(self._normalize_source_for_session_key, event.source)
+        session_key = self._session_key_for_source(source)
+        ctx = _ModelSwitchContext(
+            # Gateway routing columns — forward ALL of them at CREATE time, same fix as the
+            # compression-rotation bug in agent/conversation_compression.py. Without these, the branched
+            # child row has NULL routing columns until switch_session() below calls
+            # _record_gateway_session_peer() — a crash/kill anywhere between here and there (most plausibly
+            # mid-history-copy, since each append_message call a few lines down is independently
+            # best-effort) leaves the branch permanently unroutable: unreachable by chat/thread lookup, and
+            # unreachable via /resume's IDOR guard too (which requires the row's chat_id/thread_id to match
+            # the caller's). user_id is critical for the fallback lookup path (hermes_state.py:1994-2009)
+            # that searches by the complete peer tuple when session_key doesn't match. origin_json and
+            # display_name complete the identity (same shape as the reset path's db_create_kwargs in
+            # gateway/session.py, #82633) so consumers that read routing/presentation data from state.db
+            # (mcp_serve, mirror, channel directory) see the branch row fully formed with zero backfill gap.
+            session_key=session_key,
+            source=source,
+            config_path=(profile_home or _hermes_home) / "config.yaml",
+            persist_global=resolve_persist_behavior(
+                request.is_global, request.is_session, is_once=request.is_once,
+                explicit_provider=request.explicit_provider,
+            ),
+            one_turn=request.is_once,
+            reasoning_effort=request.reasoning_effort,
+            restore_snapshot=self._snapshot_session_model_override(session_key) if request.is_once else None,
+        )
+        ctx.read_config()
+        ctx.apply_override(self._session_model_overrides.get(session_key, {}))
+        if not request.target and not request.explicit_provider:
+            return await self._model_listing_reply(event, ctx, profile_home)
+        result, error = await self._perform_model_switch(ctx, request.target, request.explicit_provider, source)
+        if error is not None:
+            return error
+        guard_fired, guard_reply = await self._model_selection_guard_reply(event, ctx, result)
+        if guard_fired:
+            return guard_reply
+        return await self._commit_model_switch_locked(result, ctx, source=source, picker=False)
+
