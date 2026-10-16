@@ -80,10 +80,16 @@ def update(ns, agent, ref='main'):
         old_tools = tools.with_name(tools.name + '-before-update-' + stamp)
         revision = ns['run'](['git', 'rev-parse', 'HEAD'], cwd=ns['SOURCE'],
                              capture_output=True, text=True).stdout.strip()
-        shutil.copytree(tools, old_tools, symlinks=True)
-        agent.stop()  # A second checkpoint closes the preflight/stop gap.
-        if agent.process.poll() is None:
-            raise RuntimeError('Previous host did not stop; update cancelled')
+        try:
+            shutil.copytree(tools, old_tools, symlinks=True)
+            agent.stop()  # A second checkpoint closes the preflight/stop gap.
+            if agent.process.poll() is None:
+                raise RuntimeError('Previous host did not stop; update cancelled')
+        except BaseException:
+            # No runtime swap happened yet; failed saves must not leak another tools copy.
+            if old_tools.is_dir() and not old_tools.is_symlink():
+                shutil.rmtree(old_tools)
+            raise
         install.rename(previous)
         try:
             ns['install_runtime'](revision, target=info['target'])

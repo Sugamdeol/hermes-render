@@ -49,6 +49,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: pip install --constraint requirements-render.lock pyyaml cryptography fastapi httpx websockets python-multipart
+      - run: python scripts/rebuild-standalone.py --check
       - run: python -m unittest discover -s tests -q
       - run: node --check dashboard-plugins/hermes-chat-dashboard/dashboard/bundle/index.js
       - run: node --check dashboard-plugins/render-api-providers/dashboard/bundle/index.js
