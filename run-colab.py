@@ -1064,7 +1064,9 @@ def launch_with_progress(env, progress):
         try:
             with urllib.request.urlopen("http://127.0.0.1:10000/healthz", timeout=3) as response:
                 health = json.load(response)
-            if health.get("gateway_running") and health.get("gateway_state") == "running":
+            if health.get("gateway_running") and health.get("gateway_state") in ("running", "degraded"):
+                if health.get("gateway_state") == "degraded":
+                    print("Hermes is running with a platform warning. Use HERMES_COLAB.status() to check it.")
                 break
         except (OSError, ValueError):
             pass
@@ -1075,7 +1077,7 @@ def launch_with_progress(env, progress):
     start_update_control()
     agent.dashboard()
     progress.finish()
-    print("Telegram polling is running. Use HERMES_COLAB.backup() and HERMES_COLAB.stop() before switching hosts.")
+    print("Hermes is running. Use HERMES_COLAB.status() to check Telegram and other platforms, and save before switching hosts.")
     return agent
 
 

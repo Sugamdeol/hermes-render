@@ -102,3 +102,16 @@ class UpdateTests(unittest.TestCase):
             self.assertTrue((tools/'old').exists())
             self.assertIs(ns['HERMES_COLAB'], replacement)
             self.assertFalse((root/'selected-upstream.txt').exists())
+
+    def test_second_backup_failure_removes_unused_tools_copy(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);home=root/'data';home.mkdir()
+            install=root/'install';install.mkdir()
+            tools=root/'tools';tools.mkdir();(tools/'keep').write_text('working')
+            agent=Mock();agent.stop.side_effect=RuntimeError('second backup failed')
+            ns={'INSTALL':install,'TOOLS':tools,'DATA':home,'SOURCE':root,
+                'run':Mock(return_value=subprocess.CompletedProcess([],0,'revision'))}
+            with patch.object(updater,'check',return_value={'update_available':True,'target':'a'*40}):
+                with self.assertRaisesRegex(RuntimeError,'second backup failed'):updater.update(ns,agent)
+            self.assertTrue(install.exists());self.assertEqual((tools/'keep').read_text(),'working')
+            self.assertEqual(list(root.glob('tools-before-update-*')),[])

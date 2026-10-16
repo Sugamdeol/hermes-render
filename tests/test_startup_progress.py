@@ -88,6 +88,18 @@ class StartupProgressTests(unittest.TestCase):
         self.assertIn('1.0 / 2.0 MiB', view['detail'])
         self.assertNotIn('private-name', str(view))
 
+    def test_degraded_gateway_starts_with_visible_warning_instead_of_timing_out(self):
+        progress=Mock();process=Mock();process.poll.return_value=None;agent=Mock()
+        response=Mock();response.__enter__=Mock(return_value=response);response.__exit__=Mock(return_value=False)
+        response.read.return_value=b'{"gateway_running":true,"gateway_state":"degraded"}'
+        with patch.object(launcher,'start_update_control'), patch.object(launcher,'LOG',self.cache/'startup.log'), \
+             patch.object(launcher,'install'),patch.object(launcher.subprocess,'Popen',return_value=process), \
+             patch.object(launcher,'ColabAgent',return_value=agent),patch.object(launcher.urllib.request,'urlopen',return_value=response), \
+             patch('builtins.print') as printed,patch.object(launcher.time,'sleep',side_effect=AssertionError('must not wait')):
+            self.assertIs(launcher.launch_with_progress({},progress),agent)
+        self.assertTrue(any('platform warning' in str(row.args) for row in printed.call_args_list))
+        progress.finish.assert_called_once()
+
     def test_launch_records_ready_only_after_gateway_health_and_dashboard(self):
         progress = Mock()
         process = Mock()
