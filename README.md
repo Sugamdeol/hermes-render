@@ -379,3 +379,13 @@ and the rule blocking backups after an incomplete restore remain enabled.
 Notebook restore/startup budgets are two hours rather than thirty minutes; this
 prevents the old premature cancellation and is not itself a speed improvement.
 Download time still depends on the actual backup size and GitHub/network speed.
+
+
+The notebook also overlaps full private-state restoration with the independent
+runtime installation when the notebook Python already has `cryptography`.
+Installation and restoration both finish before bootstrap starts the gateway.
+Bootstrap checks the remote revision again and reuses the completed same-VM restore
+checkpoint only if it still matches. A changed remote revision or failed/partial
+preparation follows the normal checked restore path. Without notebook crypto,
+only downloading is overlapped and decryption remains in normal bootstrap.
+No extra pip install is added to the notebook's system Python for this optimization.

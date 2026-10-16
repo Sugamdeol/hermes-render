@@ -32,6 +32,14 @@ class ParallelStartTests(unittest.TestCase):
                 self.assertTrue(script.with_suffix('.done').exists())
                 self.assertEqual((root/'hermes-state-prefetch.log').stat().st_mode & 0o777, 0o600)
 
+    def test_crypto_availability_selects_full_restore_or_download_fallback(self):
+        for available, expected in ((True, 'prepare-startup'), (False, 'prefetch')):
+            process = Mock(); process.wait.return_value = 0; process.poll.return_value = 0
+            with tempfile.TemporaryDirectory() as td, patch.object(launcher, 'SOURCE', Path(td)/'source'), patch.object(launcher.importlib.util, 'find_spec', return_value=object() if available else None), patch.object(launcher.subprocess, 'Popen', return_value=process) as popen:
+                with launcher.StatePrefetch({'GIT_STATE_TOKEN':'test', 'GIT_STATE_REPO':'owner/repo'}, Path('fetch')):
+                    pass
+                self.assertEqual(popen.call_args.args[0][2], expected)
+
     def test_install_failure_terminates_fetch_before_leaving_context(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

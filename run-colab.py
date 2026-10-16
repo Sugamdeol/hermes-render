@@ -437,9 +437,10 @@ def save_ui_cache(cache, key):
 
 
 class StatePrefetch:
-    """Download private state while public runtime dependencies are installing."""
+    """Restore full private state while independent runtime dependencies install."""
     def __init__(self, env, script):
         self.env, self.script, self.process, self.log = env, script, None, None
+        self.restoring = False
 
     def __enter__(self):
         if not self.env or not self.env.get('GIT_STATE_TOKEN') or not self.env.get('GIT_STATE_REPO'):
@@ -449,14 +450,19 @@ class StatePrefetch:
         os.fchmod(fd, 0o600)
         self.log = os.fdopen(fd, 'w')
         try:
+            # Existing notebook crypto can decrypt state before the agent venv exists.
+            # If unavailable, overlap the download and let normal bootstrap decrypt.
+            self.restoring = importlib.util.find_spec('cryptography') is not None
+            command = 'prepare-startup' if self.restoring else 'prefetch'
             self.process = subprocess.Popen(
-                [sys.executable, str(self.script), 'prefetch', str(DATA)],
+                [sys.executable, str(self.script), command, str(DATA)],
                 env=self.env, stdout=self.log, stderr=subprocess.STDOUT,
                 start_new_session=True)
         except BaseException:
             self.log.close()
             raise
-        print('Downloading saved state alongside runtime installation…')
+        print('Restoring all saved data alongside runtime installation…' if self.restoring
+              else 'Downloading saved state alongside runtime installation…')
         return self
 
     def __exit__(self, kind, value, traceback):
@@ -467,7 +473,9 @@ class StatePrefetch:
                 try:
                     code = self.process.wait(timeout=int(self.env.get('HERMES_RESTORE_TIMEOUT_SECONDS', '1800')))
                     if code:
-                        print('State download needs a retry; the normal restore will check it before starting.')
+                        print('State preparation needs a retry; normal restore will check it before starting.')
+                    elif self.restoring:
+                        print('Full state preparation finished; bootstrap will recheck the saved revision before starting.')
                 except subprocess.TimeoutExpired:
                     print('Background state download timed out; the normal restore will retry.')
         finally:

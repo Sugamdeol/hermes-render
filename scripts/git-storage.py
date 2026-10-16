@@ -3351,11 +3351,25 @@ def _request_restart(reason: str) -> bool:
         return False
 
 
+def prepare_startup_state(data_dir, config):
+    """Finish a full restore while the notebook installs its independent runtime."""
+    found = probe_state(config)
+    if found == REMOTE_EMPTY:
+        LOG.info('State repository is empty; normal bootstrap will handle first launch')
+        return True
+    if found != REMOTE_HAS_STATE:
+        raise GitStateError('Cannot verify private state during startup preparation')
+    if not restore(data_dir, config):
+        raise GitStateError('Full startup state preparation failed; normal restore must retry')
+    LOG.info('Full private state restored during runtime installation')
+    return True
+
+
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "command",
-        choices=("restore", "sync", "seed", "state", "daemon", "role", "release", "prefetch", "repair-enc"),
+        choices=("restore", "sync", "seed", "state", "daemon", "role", "release", "prefetch", "prepare-startup", "repair-enc"),
     )
     parser.add_argument("data_dir", type=Path)
     args = parser.parse_args(argv)
@@ -3375,6 +3389,8 @@ def main(argv: "list[str] | None" = None) -> int:
         if args.command == 'repair-enc':
             repair_plaintext_enc_files(config.workdir, args.data_dir)
             return 0
+        if args.command == "prepare-startup":
+            return 0 if prepare_startup_state(args.data_dir, config) else 2
         if args.command == "prefetch":
             ensure_clone(config)
             LOG.info('Private state download is ready for restore')
