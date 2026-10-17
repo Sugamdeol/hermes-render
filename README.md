@@ -10,6 +10,14 @@ and private GitHub persistence. This replaces the Nanobot deployment.
 
 ## One-cell Colab start
 
+Colab runs independently of InstaBox: it needs no InstaBox machine, SSH mount,
+or pooled disk. On restore, notebook startup maps saved InstaBox workspace paths
+to local restored files and clears host-specific settings. Files saved under
+`shared-storage` remain ordinary local files in the notebook. Colab uses its own
+dashboard links and dependency setup. This does not modify the running InstaBox
+machines. With the same Telegram bot and backup branch, run only one host at a
+time: finish a backup and stop the previous copy before starting the notebook.
+
 Open the notebook above. Once only, add `GIT_STATE_TOKEN` and the existing
 `STORAGE_ENCRYPTION_KEY` to Colab's Secrets panel and enable Notebook access.
 Then press **▶ Start Hermes**. It starts the dashboard and Telegram together,

@@ -192,6 +192,17 @@ def runtime_env(token, key, dashboard_password=None):
     }
     if dashboard_password:
         values["HERMES_GATEWAY_TOKEN"] = dashboard_password
+    if NOTEBOOK_HOST in ('colab', 'kaggle'):
+        # These belong to this notebook, never a restored InstaBox deployment.
+        values.update({
+            'GIT_STATE_BASE_FILE': str(SOURCE.parent / 'hermes-git-cache/state.base.json'),
+            'GIT_STATE_MAX_COMMITS': '200',
+            'HERMES_DASHBOARD_FILES_ROOT': '',
+            'CLOUDFLARE_TUNNEL_TOKEN': '',
+            'HERMES_DASHBOARD_URL': '',
+            'PYTHONPATH': str(INSTALL),
+            'PYTHONHOME': '',
+        })
     values["HERMES_ENV_OVERRIDE_KEYS"] = ",".join([*values, "PATH", "HERMES_ENV_OVERRIDE_KEYS"])
     values["PATH"] = str(INSTALL / ".venv/bin") + ":/usr/local/bin:" + os.environ.get("PATH", "")
     if not token or not key:

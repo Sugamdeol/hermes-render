@@ -262,6 +262,11 @@ fi
 
 # Export the restored dotenv/runtime snapshot BEFORE proxy, patcher, daemon
 # and gateway initialization. Invalid saved settings fail closed.
+case "${HERMES_NOTEBOOK_HOST:-}" in
+  colab|kaggle)
+    /opt/hermes/.venv/bin/python /opt/render-tools/notebook-host-isolation.py "${DATA_DIR}"
+    ;;
+esac
 if exports="$(gosu hermes "${SEEDER}" --env-file "${DATA_DIR}/.env" --load-existing)"; then
   eval "${exports}"
   unset exports
