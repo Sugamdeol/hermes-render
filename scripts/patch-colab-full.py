@@ -65,6 +65,7 @@ def patch(root):
     runpy.run_path(str(Path(__file__).with_name('patch-native-task-recovery.py')))['patch'](root)
     dashboard = runpy.run_path(str(Path(__file__).with_name('patch-colab-dashboard.py')))
     dashboard['patch'](root)
+    runpy.run_path(str(Path(__file__).with_name('patch-auxiliary-pool.py')))['patch'](root)
 
 
 if __name__ == '__main__':
