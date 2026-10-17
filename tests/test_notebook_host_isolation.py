@@ -77,7 +77,7 @@ class NotebookIsolationTests(unittest.TestCase):
                 env = launcher.runtime_env('token', 'key', 'password')
             for key in ('GIT_STATE_BASE_FILE', 'HERMES_DASHBOARD_FILES_ROOT', 'CLOUDFLARE_TUNNEL_TOKEN', 'PYTHONPATH', 'PYTHONHOME'):
                 self.assertIn(key, env['HERMES_ENV_OVERRIDE_KEYS'])
-            self.assertEqual(env['CLOUDFLARE_TUNNEL_TOKEN'], '')
+            self.assertNotIn('CLOUDFLARE_TUNNEL_TOKEN', env)
             self.assertNotIn('/data/hermes', env['GIT_STATE_BASE_FILE'])
 
     def test_cleanup_precedes_loading_saved_environment(self):
