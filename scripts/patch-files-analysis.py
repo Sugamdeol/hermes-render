@@ -1,4 +1,4 @@
-"""Portable reconstruction of the Files Search/Analysis recorded in the private backup."""
+"""Install the exact original Files tab recovered from InstaBox, verified by SHA256."""
 import argparse
 from pathlib import Path
 import subprocess
@@ -6,34 +6,35 @@ import sys
 
 
 def patch(root):
+    import hashlib, json
     root = Path(root)
-    assets = Path(__file__).parent
+    assets = Path(__file__).parent / 'original-files-tab'
+    manifest = json.loads((assets / 'manifest.json').read_text())
+    outputs = {}
+    for name, digest in manifest['files'].items():
+        source = assets / name
+        if not source.resolve().is_relative_to(assets.resolve()):
+            raise RuntimeError('Invalid original Files asset path')
+        content = source.read_bytes()
+        if hashlib.sha256(content).hexdigest() != digest:
+            raise RuntimeError('Original Files asset checksum mismatch: ' + name)
+        if name.endswith('.py'): compile(content, name, 'exec')
+        outputs[root / name] = content
     server = root / 'hermes_cli/web_server.py'
-    page = root / 'web/src/pages/FilesPage.tsx'
-    text, jsx = server.read_text(), page.read_text()
+    text = server.read_text()
     anchor = 'app.include_router(_files_routes.router)'
     addition = '\nfrom hermes_cli.web_routers import fs_analysis as _fs_analysis_routes\napp.include_router(_fs_analysis_routes.router)'
-    if addition not in text:
+    if 'app.include_router(_fs_analysis_routes.router)' not in text:
         if text.count(anchor) != 1:
             raise RuntimeError('Files router registration changed; refusing an unverified patch')
         text = text.replace(anchor, anchor + addition, 1)
-    imp = 'import FilesStorageTools from "@/components/FilesStorageTools";\n'
-    old = '<PluginSlot name="files:top" />'
-    new = old + '\n      <FilesStorageTools path={activePath} onNavigate={setCurrentPath} />'
-    if new not in jsx:
-        if jsx.count(old) != 1 or 'const activePath =' not in jsx:
-            raise RuntimeError('Files page integration changed; refusing an unverified patch')
-        jsx = imp + jsx.replace(old, new, 1)
-    router = (assets / 'files-analysis-router.py').read_text()
-    compile(router, 'fs_analysis.py', 'exec')
     compile(text, str(server), 'exec')
-    outputs = {server: text, page: jsx,
-               root / 'hermes_cli/web_routers/fs_analysis.py': router,
-               root / 'web/src/components/FilesStorageTools.tsx': (assets / 'FilesStorageTools.tsx').read_text()}
+    outputs[server] = text.encode()
     changed = False
     for path, content in outputs.items():
-        if not path.exists() or path.read_text() != content:
-            path.write_text(content)
+        if not path.exists() or path.read_bytes() != content:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
             changed = True
     return changed
 

@@ -157,6 +157,7 @@ def runtime_env(token, key, dashboard_password=None):
         # Full state must finish before startup; large cold restores need room to complete.
         "HERMES_RESTORE_TIMEOUT_SECONDS": "7200",
         "HERMES_COLAB_STARTUP_TIMEOUT_SECONDS": "7200",
+        "HERMES_PORTABLE_PATHS": "1", "GIT_STATE_INCLUDE_ALL_FILES": "1", "GIT_STATE_CAPTURE_RUNTIME_SOURCE": "1",
         "HERMES_HOME": str(DATA), "GIT_STATE_WORKDIR": str(SOURCE.parent / "hermes-git-cache/state"),
         "HERMES_UID": "", "HERMES_GID": "",
         "HERMES_RECOVERY_CHECKPOINT_FILE": "/tmp/hermes-recovery-checkpoint.json",

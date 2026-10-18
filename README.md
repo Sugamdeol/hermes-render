@@ -407,3 +407,30 @@ Use **`run-windows.cmd start`** on Windows (Python, Git and Docker Desktop requi
 The saved InstaBox notes describe recursive file search and storage analysis implemented directly in its runtime, rather than a backed-up dashboard plugin. The notebook launcher now ships a portable reconstruction: Search, on-demand storage totals, folder sizes, and largest files. Scans stop at 500,000 nodes or 15 seconds and explicitly label partial totals. Native authentication, managed-root checks and sensitive-path filtering apply. Symlinks and other mounted filesystems are skipped. ZIP download, recent-file reporting and the original sorting controls are not reconstructed here.
 
 Existing Colab runtimes can run `update-files-tab.py` inside the active notebook. It downloads hash-verified public assets, explicitly prepares managed Node dependencies and builds the web UI, then requests a restart of the dashboard worker only. It does not restore private state or restart the Telegram gateway. Refresh after the supervisor restarts the dashboard. Fresh notebook installs and updates apply the same integration automatically. Runtime testing on the user's current Colab VM is still required.
+
+
+### Complete portable backups
+
+Notebook launchers include ordinary files throughout the Hermes data home, including
+project dependencies, nested Git repositories, tools, caches and logs. The recovery
+quarantine is retained locally rather than uploaded. `.backup-coverage.json` lists
+external links and special files that cannot be carried as ordinary files. External
+operating-system targets are supplied by the host or dependency restore, not copied
+through a link. Unreadable source data makes the backup fail instead of publishing
+an incomplete snapshot.
+
+Modified and untracked non-ignored Hermes source files are captured in encrypted
+`.hermes-runtime-source.json`, including file modes and deletions. Restoring these
+edits requires the exact upstream base commit; an incompatible revision stops with
+an error rather than silently discarding custom work. The original InstaBox Files
+page, Search, Analysis and ZIP API are preserved byte-for-byte under
+`scripts/original-files-tab` with SHA256 checksums.
+
+Notebook restores expose `/storage`, `/mnt/hermes-storage`, `/mnt/hermes-shared`,
+`/data/hermes/state`, `/data/workspace` and `/data/home` as local aliases. Existing
+populated or conflicting aliases stop migration before being overwritten. Files
+unique to the second disk stay available through relative links in the pooled view.
+Normal service starts fetch the state branch before deciding whether local state
+can be reused. A missing or outdated restore checkpoint never grants permission to
+overwrite GitHub. Suspending and resuming a machine is different from restarting a
+service: restart normally when switching hosts, and keep only one active writer.

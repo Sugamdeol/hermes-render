@@ -137,7 +137,7 @@ DEFAULT_PUSH_RETRY_SECONDS = 5
 # Whether they are committed in the clear is GIT_STATE_ENV_MODE's decision,
 # not a hard-coded one: the operator asked for a complete, restartable copy of
 # the instance, and .env is part of that.
-SENSITIVE_FILES = (".env", "config.yaml", "auth.json", ".render-recovery.json", ".render-runtime-env.json")
+SENSITIVE_FILES = (".hermes-runtime-source.json", ".env", "config.yaml", "auth.json", ".render-recovery.json", ".render-runtime-env.json")
 _SEALED_PREFIX = b"HERMES-FERNET-v1\n"
 _SEALED_CACHE = {}
 
@@ -199,6 +199,8 @@ def is_excluded(relative: str, excludes: "tuple[str, ...]" = DEFAULT_EXCLUDES) -
     parts = [part for part in relative.replace("\\", "/").split("/") if part not in ("", ".")]
     if parts and parts[0] == '.restore-quarantine':
         return True
+    if excludes == DEFAULT_EXCLUDES and os.environ.get('GIT_STATE_INCLUDE_ALL_FILES') == '1':
+        return False
     if excludes == DEFAULT_EXCLUDES and os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
         # Only known runtime churn is disposable. Project files, installed
         # tools and nested dependency trees are part of a complete Colab home.
@@ -1737,7 +1739,8 @@ def build_worktree(data_dir: Path, workdir: Path, config: GitConfig) -> dict:
         if target.exists():
             shutil.rmtree(target)
         os.replace(previous, target)
-    if os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full':
+    if (os.environ.get('HERMES_RUNTIME_PROFILE') == 'colab-full'
+            or os.environ.get('GIT_STATE_INCLUDE_ALL_FILES') == '1'):
         import runpy
         helper = runpy.run_path(str(Path(__file__).with_name('incremental-mirror.py')))
         return helper['build_snapshot'](data_dir, workdir, config, globals(),
@@ -2715,6 +2718,16 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
     if saved_manifest.returncode == 0:
         prior_manifest = json.loads(saved_manifest.stdout)
         previous_files = int(prior_manifest.get("files", 0) or 0)
+    if os.environ.get('GIT_STATE_CAPTURE_RUNTIME_SOURCE') == '1':
+        import runpy
+        helper = runpy.run_path(str(Path(__file__).with_name('runtime-source-backup.py')))
+        if helper['capture'](Path('/opt/hermes'), data_dir):
+            config._source_changes = None
+    if os.environ.get('GIT_STATE_INCLUDE_ALL_FILES') == '1':
+        import runpy
+        audit = runpy.run_path(str(Path(__file__).with_name('backup-coverage.py')))
+        if audit['capture'](data_dir):
+            config._source_changes = None
     capture_runtime_secrets(data_dir, config)
     manifest = build_worktree(data_dir, workdir, config)
     reject_destructive_shrink(previous_files, int(manifest["files"]))

@@ -12,7 +12,7 @@ REPO = 'Sugamdeol/hermes-render'
 TOOLS = Path('/opt/render-tools')
 PROC = Path('/proc')
 LOG = Path('/content/hermes-colab.log')
-FILES = ('git-storage.py', 'state-events.py', 'incremental-mirror.py')
+FILES = ('git-storage.py', 'state-events.py', 'incremental-mirror.py', 'runtime-source-backup.py', 'backup-coverage.py')
 
 
 def process_info(pid):

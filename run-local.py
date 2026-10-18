@@ -51,7 +51,7 @@ def runtime_env(token, key):
         "GIT_STATE_BRANCH": os.environ.get("GIT_STATE_BRANCH", "state"),
         "GIT_STATE_TOKEN": token, "STORAGE_ENCRYPTION_KEY": key,
         "GIT_STATE_ENV_MODE": "encrypt", "HERMES_FAILOVER": "0",
-        "HERMES_HOME": "/opt/data", "GIT_STATE_WORKDIR": "/tmp/hermes-git-cache/state",
+        "GIT_STATE_INCLUDE_ALL_FILES": "1", "HERMES_HOME": "/opt/data", "GIT_STATE_WORKDIR": "/tmp/hermes-git-cache/state",
         "HERMES_UID": "", "HERMES_GID": "",
         "HERMES_RECOVERY_CHECKPOINT_FILE": "/tmp/hermes-recovery-checkpoint.json",
         "HERMES_INSTANCE_ID": "local-" + secrets.token_hex(6),
