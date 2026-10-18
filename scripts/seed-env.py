@@ -192,7 +192,7 @@ def main(argv: "list[str] | None" = None) -> int:
             if not isinstance(key, str) or not is_valid_key(key) or not isinstance(value, str):
                 raise ValueError("invalid saved environment entry")
             if key in {"STORAGE_ENCRYPTION_KEY", "SOPS_AGE_KEY", "SOPS_AGE_KEY_FILE", "PORT", "HERMES_HOME",
-                       "GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                       "GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "GIT_STATE_REQUIRED_MOUNT", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
                        "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"}:
                 continue
             overrides = {name.strip() for name in os.environ.get("HERMES_ENV_OVERRIDE_KEYS", "").split(",")}

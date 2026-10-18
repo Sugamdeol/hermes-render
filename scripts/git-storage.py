@@ -355,7 +355,7 @@ class GitConfig:
             token=token,
             branch=os.environ.get("GIT_STATE_BRANCH", "state"),
             interval=positive_int("GIT_STATE_INTERVAL_SECONDS", 300),
-            max_commits=positive_int("GIT_STATE_MAX_COMMITS", 200),
+            max_commits=non_negative_int("GIT_STATE_MAX_COMMITS", 200),
             age_recipient=os.environ.get("GIT_STATE_AGE_RECIPIENT", "").strip(),
             age_key_file=os.environ.get("SOPS_AGE_KEY_FILE", "").strip(),
             instance_id=sanitize_instance_id(
@@ -791,7 +791,11 @@ def probe_state(config: GitConfig) -> str:
         return REMOTE_UNKNOWN
     if tree.stdout.strip():
         # Repair an interrupted checkout before restore reads filesystem bytes.
-        run_git(["reset", "--hard", "HEAD"], cwd=workdir, config=config)
+        clean = run_git(["diff", "--quiet", "HEAD", "--"], cwd=workdir, config=config, check=False)
+        if clean.returncode == 1:
+            run_git(["reset", "--hard", "HEAD"], cwd=workdir, config=config)
+        elif clean.returncode != 0:
+            raise GitStateError("Cannot verify backup checkout integrity")
         return REMOTE_HAS_STATE
     return REMOTE_EMPTY
 
@@ -2574,7 +2578,7 @@ def capture_runtime_secrets(data_dir: Path, config: GitConfig) -> None:
                  "USER", "LOGNAME", "SHELL", "TERM", "LANG", "TZ", "PORT",
                  "VIRTUAL_ENV", "UV_LINK_MODE", "UV_COMPILE_BYTECODE",
                  "HERMES_HOME", "HERMES_TUI_DIR", "GIT_STATE_SEED_ON_BOOT",
-                 "GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+                 "GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "GIT_STATE_REQUIRED_MOUNT", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
                  "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS",
                  "TELEGRAM_WEBHOOK_URL", "TELEGRAM_WEBHOOK_PORT", "TELEGRAM_WEBHOOK_SECRET"}
     runtime = {key: value for key, value in os.environ.items()
@@ -2674,7 +2678,7 @@ def stage_snapshot(workdir: Path, config: GitConfig) -> None:
         submit()
 
 
-def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
+def _sync_once_unlocked(data_dir: Path, config: GitConfig, *, force: bool = False,
               seed: bool = False) -> bool:
     if config.failover and config.role == ROLE_STANDBY:
         LOG.debug("standby instance; not pushing state")
@@ -2730,6 +2734,7 @@ def sync_once(data_dir: Path, config: GitConfig, *, force: bool = False,
             config._source_changes = None
     capture_runtime_secrets(data_dir, config)
     manifest = build_worktree(data_dir, workdir, config)
+    config._restored_paths = backup_managed_paths(workdir)
     reject_destructive_shrink(previous_files, int(manifest["files"]))
 
     _write_sync_progress(config, 'staging')
@@ -2789,6 +2794,7 @@ def local_restore_is_current(data_dir: Path, config: GitConfig, remote_sha: str)
 
 
 def restore(data_dir: Path, config: GitConfig) -> bool:
+    require_data_mount()
     data_dir.mkdir(parents=True, exist_ok=True)
     previous_base = _read_sync_base(config)
     previous_paths = (previous_base or {}).get('managed_paths')
@@ -3123,7 +3129,7 @@ def recovery_checkpoint(data_dir: Path, config: GitConfig) -> bool:
     return True
 
 
-def run_daemon(data_dir: Path, config: GitConfig,
+def _run_daemon_unlocked(data_dir: Path, config: GitConfig,
                stop: "threading.Event | None" = None) -> None:
     stop = stop if stop is not None else threading.Event()
 
@@ -3376,6 +3382,46 @@ def prepare_startup_state(data_dir, config):
         raise GitStateError('Full startup state preparation failed; normal restore must retry')
     LOG.info('Full private state restored during runtime installation')
     return True
+
+
+def _exclusive_storage_operation(config, label):
+    import fcntl
+    identity = hashlib.sha256(str(config.workdir.resolve()).encode()).hexdigest()[:24]
+    guard = open('/tmp/hermes-storage-' + identity + '-' + label + '.lock', 'a+')
+    try:
+        fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        guard.close()
+        return None
+    return guard
+
+
+def require_data_mount():
+    required = os.environ.get('GIT_STATE_REQUIRED_MOUNT', '').strip()
+    if required and not os.path.ismount(required):
+        raise GitStateError('Required data storage is not mounted; previous backup retained')
+
+
+def sync_once(data_dir, config, **kwargs):
+    require_data_mount()
+    guard = _exclusive_storage_operation(config, 'snapshot')
+    if guard is None:
+        raise GitStateError('Another backup operation owns this local mirror; retry later')
+    try:
+        return _sync_once_unlocked(data_dir, config, **kwargs)
+    finally:
+        guard.close()
+
+
+def run_daemon(data_dir, config, stop=None):
+    guard = _exclusive_storage_operation(config, 'daemon')
+    if guard is None:
+        LOG.info('Another backup worker already owns this mirror; duplicate worker will exit')
+        return
+    try:
+        return _run_daemon_unlocked(data_dir, config, stop=stop)
+    finally:
+        guard.close()
 
 
 def main(argv: "list[str] | None" = None) -> int:
