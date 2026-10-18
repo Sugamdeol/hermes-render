@@ -1575,7 +1575,7 @@ class InterruptedCloneTests(unittest.TestCase):
         storage = load_storage()
         config = make_config(storage)
         present = subprocess.CompletedProcess([], 0, "data/state.db.enc\n", "")
-        with patch.object(storage, "remote_branch_state", return_value="present"), patch.object(storage, "ensure_clone", return_value=Path("/tmp/clone")), patch.object(storage, "run_git", return_value=present) as run:
+        with patch.object(storage, "remote_branch_state", return_value="present"), patch.object(storage, "ensure_clone", return_value=Path("/tmp/clone")), patch.object(storage, "run_git", side_effect=[present, subprocess.CompletedProcess([], 1, "", ""), present]) as run:
             self.assertEqual(storage.probe_state(config), storage.REMOTE_HAS_STATE)
             self.assertEqual(run.call_args_list[-1].args[0], ["reset", "--hard", "HEAD"])
 
@@ -1604,7 +1604,7 @@ class CompactionFenceTests(unittest.TestCase):
 class RuntimeEnvironmentBackupTests(unittest.TestCase):
     def test_host_cache_and_checkpoint_paths_are_not_portable_settings(self):
         storage = load_storage()
-        names = ["GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+        names = ["GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "GIT_STATE_REQUIRED_MOUNT", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
                  "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"]
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
                 {name: "host-specific" for name in names}, clear=True):

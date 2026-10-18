@@ -257,7 +257,7 @@ class SavedRuntimeTests(unittest.TestCase):
     def test_migration_does_not_load_old_host_paths_or_launcher_overrides(self):
         import contextlib, io, json
         seed = load_seed_env()
-        names = ["GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+        names = ["GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "GIT_STATE_REQUIRED_MOUNT", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
                  "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"]
         with TemporaryDirectory() as directory:
             env = Path(directory) / ".env"

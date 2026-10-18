@@ -44,3 +44,21 @@ class RuntimeSourceTests(unittest.TestCase):
    self.assertEqual((fs/'storage/workspace/project/file').read_text(),'saved')
    self.assertEqual((fs/'mnt/hermes-shared/workspace/project/file').read_text(),'saved')
    self.assertTrue(helper.apply(home,fs))
+
+class WriterGuardTests(unittest.TestCase):
+ def test_disabled_compaction_and_missing_mount(self):
+  from unittest.mock import patch
+  m=load('git-storage.py')
+  with patch.dict(os.environ,{'GIT_STATE_REPO':'owner/repo','GIT_STATE_TOKEN':'test','GIT_STATE_MAX_COMMITS':'0','GIT_STATE_REQUIRED_MOUNT':'/missing'}):
+   self.assertEqual(m.GitConfig.from_env().max_commits,0)
+   with patch.object(m.os.path,'ismount',return_value=False),self.assertRaisesRegex(RuntimeError,'not mounted'):m.require_data_mount()
+ def test_duplicate_local_writer_is_rejected(self):
+  m=load('git-storage.py')
+  with tempfile.TemporaryDirectory() as d:
+   c=m.GitConfig(repo='owner/repo',token='test',workdir=Path(d))
+   first=m._exclusive_storage_operation(c,'snapshot')
+   self.assertIsNotNone(first)
+   try:self.assertIsNone(m._exclusive_storage_operation(c,'snapshot'))
+   finally:first.close()
+   next_guard=m._exclusive_storage_operation(c,'snapshot')
+   self.assertIsNotNone(next_guard);next_guard.close()
