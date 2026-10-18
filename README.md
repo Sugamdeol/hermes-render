@@ -400,4 +400,4 @@ No extra pip install is added to the notebook's system Python for this optimizat
 
 ### Local Windows and Android launchers
 
-Use **`run-windows.cmd start`** on Windows (Python, Git and Docker Desktop required), or **`bash run-android.sh install`** inside Termux on Android. Windows reuses the existing private-backup launcher. Android runs a separate native Hermes installation inside Ubuntu and does not automatically import the private backup. See [setup, commands and platform limits](docs/local-devices.md).
+Use **`run-windows.cmd start`** on Windows (Python, Git and Docker Desktop required), or **`bash run-android.sh install`** inside Termux on Android. Windows reuses the existing private-backup launcher. Android runs Hermes inside Ubuntu; `backup-setup`, `backup`, and `restore` save encrypted Android snapshots in `archives/android/` on the same private branch. Android Stop backs up first. Its restore reads Android snapshots rather than the main Colab/Windows state. See [setup, commands and platform limits](docs/local-devices.md).

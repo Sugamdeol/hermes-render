@@ -8,12 +8,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AndroidLauncherTests(unittest.TestCase):
-    def run_android(self, command, session=False, reply=''):
+    def run_android(self, command, session=False, reply='', fail_backup=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             log = root / 'commands'
             for name, body in {
-                'proot-distro': 'echo "proot:$*" >> "$CALL_LOG"; exit 0',
+                'proot-distro': 'echo "proot:$*" >> "$CALL_LOG"; case "$*" in *android-backup.py\\ backup*) exit "$BACKUP_EXIT";; esac; exit 0',
                 'tmux': 'echo "tmux:$*" >> "$CALL_LOG"; if [ "$1" = has-session ]; then exit "$SESSION_EXIT"; fi',
                 'termux-wake-lock': 'echo wake >> "$CALL_LOG"',
             }.items():
@@ -22,7 +22,7 @@ class AndroidLauncherTests(unittest.TestCase):
                 path.chmod(0o755)
             env = {**os.environ, 'HOME': directory, 'PREFIX': '/data/data/com.termux/files/usr',
                    'PATH': directory + ':' + os.environ['PATH'], 'CALL_LOG': str(log),
-                   'SESSION_EXIT': '0' if session else '1'}
+                   'SESSION_EXIT': '0' if session else '1', 'BACKUP_EXIT': '1' if fail_backup else '0'}
             result = subprocess.run(['bash', str(ROOT / 'run-android.sh'), command],
                                     env=env, input=reply, text=True, capture_output=True)
             return result, log.read_text() if log.exists() else ''
@@ -58,6 +58,16 @@ class AndroidLauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn('send-keys -t =hermes-android C-c', log)
         self.assertNotIn('kill-session', log)
+
+    def test_failed_backup_prevents_stop(self):
+        result, log = self.run_android('stop', session=True, fail_backup=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('send-keys', log)
+
+    def test_restore_refuses_running_gateway(self):
+        result, log = self.run_android('restore', session=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('android-backup.py restore', log)
 
     def test_help_and_unknown_command(self):
         result, _ = self.run_android('help')
