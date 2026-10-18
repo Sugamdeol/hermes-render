@@ -277,6 +277,7 @@ fi
 # Migrate only the Colab runtime away from the Render Free profile.
 if [ "${HERMES_RUNTIME_PROFILE:-}" = "colab-full" ]; then
   /opt/hermes/.venv/bin/python /opt/render-tools/colab-profile.py "${DATA_DIR}" /opt/hermes
+  /opt/hermes/.venv/bin/python /opt/render-tools/patch-reasoning-aliases.py /opt/hermes
   /opt/hermes/.venv/bin/python /opt/render-tools/patch-custom-models.py /opt/hermes
   /opt/hermes/.venv/bin/python /opt/render-tools/patch-native-task-recovery.py /opt/hermes
   unset MALLOC_ARENA_MAX OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS TOKENIZERS_PARALLELISM \

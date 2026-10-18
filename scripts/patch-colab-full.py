@@ -60,6 +60,7 @@ def patch(root):
         path.write_text(text)
 
     import runpy
+    runpy.run_path(str(Path(__file__).with_name('patch-reasoning-aliases.py')))['patch'](root)
     runpy.run_path(str(Path(__file__).with_name('patch-custom-models.py')))['patch'](root)
     runpy.run_path(str(Path(__file__).with_name('patch-telegram-models.py')))['patch'](root)
     runpy.run_path(str(Path(__file__).with_name('patch-native-task-recovery.py')))['patch'](root)
