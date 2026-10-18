@@ -397,3 +397,7 @@ checkpoint only if it still matches. A changed remote revision or failed/partial
 preparation follows the normal checked restore path. Without notebook crypto,
 only downloading is overlapped and decryption remains in normal bootstrap.
 No extra pip install is added to the notebook's system Python for this optimization.
+
+### Local Windows and Android launchers
+
+Use **`run-windows.cmd start`** on Windows (Python, Git and Docker Desktop required), or **`bash run-android.sh install`** inside Termux on Android. Windows reuses the existing private-backup launcher. Android runs a separate native Hermes installation inside Ubuntu and does not automatically import the private backup. See [setup, commands and platform limits](docs/local-devices.md).
