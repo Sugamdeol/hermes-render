@@ -26,6 +26,10 @@ def local_path(value, home):
     if not isinstance(value, str):
         return value
     home = Path(home)
+    if os.environ.get('HERMES_PORTABLE_PATHS') == '1':
+        if any(beneath(value, root) for root in (*POOL_ROOTS, REMOTE_ROOT, HOST_ROOT+'/state', '/data/home', '/data/workspace')):
+            if '..' in PurePosixPath(value).parts: raise ValueError('Saved host path contains parent traversal')
+            return value
     relative = None
     roots = (*POOL_ROOTS, REMOTE_ROOT, HOST_ROOT + '/state', HOST_ROOT)
     root = next((root for root in roots if beneath(value, root)), None)
@@ -52,6 +56,8 @@ def local_path(value, home):
 
 
 def host_setting(key, value):
+    if os.environ.get('HERMES_PORTABLE_PATHS') == '1' and key in ('TERMINAL_CWD', 'MESSAGING_CWD', 'HERMES_DASHBOARD_FILES_ROOT'):
+        return False
     return key.startswith(('INSTABOX_', 'HERMES_INSTABOX_')) or (
         key in HOST_ENV and any(beneath(value, root) for root in
                                (*POOL_ROOTS, REMOTE_ROOT, HOST_ROOT)))
@@ -68,6 +74,9 @@ def apply(home):
     if os.environ.get('HERMES_NOTEBOOK_HOST') not in ('colab', 'kaggle'):
         return
     home = Path(home)
+    if os.environ.get('HERMES_PORTABLE_PATHS') == '1':
+        import runpy
+        runpy.run_path(str(Path(__file__).with_name('portable-paths.py')))['apply'](home)
     (home / 'workspace').mkdir(parents=True, exist_ok=True)
     configs = [home / 'config.yaml', *sorted((home / 'profiles').glob('*/config.yaml'))]
     for path in configs:

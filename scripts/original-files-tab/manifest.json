@@ -1,0 +1,12 @@
+{
+  "origin": "Recovered directly through the InstaBox API from the original Hermes installation.",
+  "files": {
+    "web/src/pages/FilesPage.tsx": "6300d40f340ad7540167e00cc851d6ba85ac79b84d4f50a1191c84cc3193e362",
+    "web/src/components/FilesAnalysisCard.tsx": "2682df45b6c017a1fd8da340e7215fd5e5da9296fc6ef57847fd1939c37cdf12",
+    "web/src/components/FilesSearchDialog.tsx": "7046c6f8707c68b0424792e5f07ae02b726a1a7333acfd2736203b27354d55d9",
+    "web/src/lib/api-fs-analysis.ts": "fa17c200f4f092638b12e2e28c24ab8a2684358f6c071f89ab596ec5c7ae2bd7",
+    "web/src/lib/fs-format.ts": "a490a51ecd951d3f53f33f8acb7922162bab1afab0641e421a75af6933613bd5",
+    "hermes_cli/web_routers/fs_analysis.py": "b7e0eeeda4842f0d5a5ccf5520028229bcc86af7a2bf562a02293b742eb88561",
+    "tests/hermes_cli/test_web_server_fs_analysis.py": "379abbc28b6f3f9d84b4c2ee7f1b66f332435196b633215dd169ab74b4401fcc"
+  }
+}

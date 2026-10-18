@@ -1604,7 +1604,7 @@ class CompactionFenceTests(unittest.TestCase):
 class RuntimeEnvironmentBackupTests(unittest.TestCase):
     def test_host_cache_and_checkpoint_paths_are_not_portable_settings(self):
         storage = load_storage()
-        names = ["GIT_STATE_WORKDIR", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
+        names = ["GIT_STATE_WORKDIR", "GIT_STATE_BASE_FILE", "HERMES_INSTANCE_ID", "HERMES_UID", "HERMES_GID",
                  "HERMES_RECOVERY_CHECKPOINT_FILE", "HERMES_ENV_OVERRIDE_KEYS"]
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ,
                 {name: "host-specific" for name in names}, clear=True):
