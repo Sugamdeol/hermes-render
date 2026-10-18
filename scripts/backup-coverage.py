@@ -35,6 +35,17 @@ def walk(home):
 
 def capture(home):
     home=Path(home).resolve()
+    marker=Path(os.environ.get('GIT_STATE_REQUIRED_MOUNTS_FILE', '/tmp/hermes-required-backup-mounts.json'))
+    if marker.exists():
+        gate=json.loads(marker.read_text())
+        if gate.get('version') != 1 or not isinstance(gate.get('required'), list):
+            raise ValueError('Invalid host backup mount guard')
+        if gate.get('data_root') == str(home):
+            for mount in gate['required']:
+                if not isinstance(mount, str) or not Path(mount).is_absolute():
+                    raise ValueError('Invalid required backup mount path')
+                if not os.path.ismount(mount):
+                    raise OSError(errno.ENODEV, 'Required backup storage is not mounted', mount)
     report={'version':1,'regular_files':0,'regular_bytes':0,'external_links':[],
             'special_files':[],'excluded':['.restore-quarantine']}
     for directory, dirs, names in walk(home):

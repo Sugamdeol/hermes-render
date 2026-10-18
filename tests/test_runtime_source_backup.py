@@ -74,3 +74,13 @@ class NetworkMetadataRetryTests(unittest.TestCase):
   operation=Mock(side_effect=PermissionError(errno.EACCES,'unreadable'))
   with patch.object(m.time,'sleep') as sleep,self.assertRaises(PermissionError):m.retry_io(operation)
   sleep.assert_not_called()
+
+ def test_backup_mirror_mount_drop_blocks_audit(self):
+  from unittest.mock import patch
+  m=load('backup-coverage.py')
+  with tempfile.TemporaryDirectory() as d:
+   home=Path(d)/'home';home.mkdir();marker=Path(d)/'required-mounts.json'
+   marker.write_text(json.dumps({'version':1,'data_root':str(home.resolve()),'required':['/expected-storage']}))
+   with patch.dict(os.environ,{'GIT_STATE_REQUIRED_MOUNTS_FILE':str(marker)}),patch.object(m.os.path,'ismount',return_value=False):
+    with self.assertRaisesRegex(OSError,'not mounted'):m.capture(home)
+   self.assertFalse((home/m.NAME).exists())
