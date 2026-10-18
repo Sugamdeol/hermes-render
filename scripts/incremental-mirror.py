@@ -1,5 +1,6 @@
 """Transactional updates to the Colab snapshot; only dirty paths are revisited."""
 import json
+import errno
 import os
 from pathlib import Path
 import shutil
@@ -86,7 +87,12 @@ class Transaction:
                 if path.is_dir():
                     shutil.rmtree(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(saved, path)
+                try:
+                    os.replace(saved, path)
+                except OSError as exc:
+                    if exc.errno != errno.EXDEV: raise
+                    atomic(path, lambda temporary: shutil.copy2(saved, temporary))
+                    saved.unlink()
         if (self.folder/'mode').exists() and (self.folder/'mode').read_text() == 'new-tree' and self.target.exists():
             shutil.rmtree(self.target)
         shutil.rmtree(self.folder)
@@ -103,7 +109,11 @@ class Transaction:
             if path.is_symlink() or not path.is_file():
                 raise RuntimeError('Snapshot cache contains a non-regular file')
             backup = f'file-{len(self.records)}'
-            os.link(path, self.folder/backup)
+            try:
+                os.link(path, self.folder/backup)
+            except OSError as exc:
+                if exc.errno != errno.EXDEV: raise
+                shutil.copy2(path, self.folder/backup)
         self.index.write(json.dumps([name, backup])+'\n')
         self.index.flush()
         self.records[name] = backup

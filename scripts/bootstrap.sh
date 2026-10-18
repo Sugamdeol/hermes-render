@@ -265,6 +265,12 @@ if [ "${GIT_STATE_CAPTURE_RUNTIME_SOURCE:-0}" = "1" ]; then
   /opt/hermes/.venv/bin/python -c "import runpy,sys; from pathlib import Path; runpy.run_path('/opt/render-tools/runtime-source-backup.py')['restore'](Path('/opt/hermes'), Path(sys.argv[1]))" "${DATA_DIR}"
 fi
 
+# Portable edits may share files with host restart/CLI integration. Reapply
+# InstaBox wiring after the restored source, without invoking it in notebooks.
+if [ "${HERMES_NOTEBOOK_HOST:-}" = "instabox" ] && [ -f "${DATA_DIR}/bin/ensure-instabox-start.py" ]; then
+  /usr/bin/python3 "${DATA_DIR}/bin/ensure-instabox-start.py"
+fi
+
 # Export the restored dotenv/runtime snapshot BEFORE proxy, patcher, daemon
 # and gateway initialization. Invalid saved settings fail closed.
 case "${HERMES_NOTEBOOK_HOST:-}" in

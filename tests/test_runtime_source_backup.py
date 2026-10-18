@@ -16,6 +16,9 @@ class RuntimeSourceTests(unittest.TestCase):
    git('reset','--hard','HEAD');self.assertTrue(helper.restore(root,home))
    self.assertEqual((root/'app').read_text(),'custom');self.assertFalse((root/'deleted').exists())
    self.assertEqual((root/'app').stat().st_mode&0o777,0o755)
+   previous_mtime=(root/'app').stat().st_mtime_ns
+   helper.restore(root,home)
+   self.assertEqual((root/'app').stat().st_mtime_ns,previous_mtime)
    snapshot=home/helper.NAME;data=json.loads(snapshot.read_text());data['files']['app']['sha256']='bad';snapshot.write_text(json.dumps(data))
    with self.assertRaisesRegex(RuntimeError,'checksum'):helper.restore(root,home)
  def test_full_file_mode_keeps_dependencies_and_logs(self):
@@ -84,3 +87,29 @@ class NetworkMetadataRetryTests(unittest.TestCase):
    with patch.dict(os.environ,{'GIT_STATE_REQUIRED_MOUNTS_FILE':str(marker)}),patch.object(m.os.path,'ismount',return_value=False):
     with self.assertRaisesRegex(OSError,'not mounted'):m.capture(home)
    self.assertFalse((home/m.NAME).exists())
+
+class CrossFilesystemMirrorTests(unittest.TestCase):
+ def test_journal_preserves_and_restores_a_file_on_another_volume(self):
+  from unittest.mock import patch
+  import errno
+  m=load('incremental-mirror.py')
+  with tempfile.TemporaryDirectory() as d:
+   work=Path(d);cache=work/'.git';cache.mkdir();target=work/'data';target.mkdir();file=target/'file';file.write_text('old')
+   transaction=m.Transaction(work,cache,target,[])
+   with patch.object(m.os,'link',side_effect=OSError(errno.EXDEV,'different volume')):
+    transaction.write(file,lambda p:p.write_text('new'))
+   self.assertEqual(file.read_text(),'new')
+   replace=m.os.replace
+   def across(source,dest):
+    if Path(source).parent==transaction.folder:raise OSError(errno.EXDEV,'different volume')
+    return replace(source,dest)
+   with patch.object(m.os,'replace',side_effect=across):transaction.finish(False)
+   self.assertEqual(file.read_text(),'old');self.assertFalse(transaction.folder.exists())
+
+class HostOverlayOrderTests(unittest.TestCase):
+ def test_instabox_hook_runs_after_source_restore_and_is_host_gated(self):
+  source=(ROOT/'scripts/bootstrap.sh').read_text()
+  restore=source.index("runtime-source-backup.py')['restore']")
+  hook=source.index('"${DATA_DIR}/bin/ensure-instabox-start.py"')
+  self.assertLess(restore,hook)
+  self.assertIn('[ "${HERMES_NOTEBOOK_HOST:-}" = "instabox" ]',source[restore:hook])

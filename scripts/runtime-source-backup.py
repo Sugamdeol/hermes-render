@@ -63,5 +63,7 @@ def restore(root, home):
         if content is None: target.unlink(missing_ok=True)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(content); target.chmod(mode)
+            if not target.exists() or target.read_bytes() != content:
+                target.write_bytes(content)
+            if target.stat().st_mode & 0o777 != mode: target.chmod(mode)
     return True
