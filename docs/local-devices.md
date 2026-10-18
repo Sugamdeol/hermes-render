@@ -38,7 +38,26 @@ bash run-android.sh setup
 bash run-android.sh start
 ```
 
-`setup` configures your provider and messaging account through the official CLI. Android uses a **separate local Hermes home** inside Ubuntu at `/home/hermes/.hermes`. It does **not automatically restore or write the private GitHub backup**. Do not expect the Windows/Colab chats, memories, files or repository overlays to appear here. Migrating that backup needs a separate verified import and path conversion; this launcher never claims that it completed one.
+`setup` configures the official CLI and messaging account. Android keeps its own Hermes home at `/home/hermes/.hermes` inside Ubuntu. Configure private backup once:
+
+```bash
+bash run-android.sh backup-setup
+bash run-android.sh backup
+```
+
+Enter the same private repository, `state` branch, GitHub token and original encryption key. Credentials stay in `/home/hermes/.config/hermes-android-backup.json` with mode 600, outside the snapshot. All Android snapshot contents are encrypted in chunks under **`archives/android/`**, alongside the existing main backup. Normal pushes preserve other branch folders and reject concurrent remote changes. Only one Android snapshot destination is currently supported, so stop other hosts before saving.
+
+`stop` now backs up before requesting gateway shutdown. A failed or unconfigured backup leaves the gateway running. Backups are explicit and on Stop, not automatic on every file edit or Android process termination. For an existing installation, rerun `install` once to install system Python cryptography.
+
+Restore this Android snapshot with the gateway stopped and dashboard/CLI closed:
+
+```bash
+bash run-android.sh restore
+```
+
+Type `RESTORE`. Chunks are verified and decrypted before replacing local state; the previous local home is retained as `.hermes-before-android-restore`. The installed runtime is preserved. Move that previous copy aside before a subsequent restore. Restore needs space for the Git checkout, encrypted chunks, archive, extracted state and retained old files.
+
+SQLite databases use online snapshots so committed WAL data is included. Installed runtime code is excluded and symlinks cause backup to fail explicitly, requiring manual migration. Other actively changing files are best-effort snapshots; finish active tasks before backup. This format restores **Android snapshots**, not the main Colab/Windows `data/` snapshot. It does not automatically migrate Colab paths or apply notebook patches.
 
 ```bash
 bash run-android.sh cli
