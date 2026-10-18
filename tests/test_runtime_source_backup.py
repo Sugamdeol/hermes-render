@@ -62,3 +62,15 @@ class WriterGuardTests(unittest.TestCase):
    finally:first.close()
    next_guard=m._exclusive_storage_operation(c,'snapshot')
    self.assertIsNotNone(next_guard);next_guard.close()
+
+class NetworkMetadataRetryTests(unittest.TestCase):
+ def test_transient_errors_retry_but_permission_errors_fail(self):
+  from unittest.mock import Mock, patch
+  import errno
+  m=load('backup-coverage.py')
+  operation=Mock(side_effect=[OSError(errno.EIO,'temporary network error'),'ok'])
+  with patch.object(m.time,'sleep') as sleep:
+   self.assertEqual(m.retry_io(operation),'ok');self.assertEqual(operation.call_count,2);sleep.assert_called_once()
+  operation=Mock(side_effect=PermissionError(errno.EACCES,'unreadable'))
+  with patch.object(m.time,'sleep') as sleep,self.assertRaises(PermissionError):m.retry_io(operation)
+  sleep.assert_not_called()

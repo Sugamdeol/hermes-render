@@ -1,5 +1,7 @@
 """Record ordinary-file coverage and explicit exceptions without following external links."""
 import json
+import errno
+import time
 import os
 from pathlib import Path
 import stat
@@ -7,20 +9,46 @@ import stat
 NAME='.backup-coverage.json'
 
 
+def retry_io(operation):
+    transient = {errno.EIO, errno.ESTALE, errno.ETIMEDOUT, errno.EAGAIN}
+    for attempt in range(4):
+        try: return operation()
+        except OSError as exc:
+            if exc.errno not in transient or attempt == 3: raise
+            time.sleep(0.25 * (2 ** attempt))
+
+
+def walk(home):
+    # Retry the failed directory read, rather than restarting a large network
+    # scan from the beginning. Never follow links outside the data home.
+    pending = [Path(home)]
+    while pending:
+        root = pending.pop()
+        entries = retry_io(lambda: list(os.scandir(root)))
+        dirs, names = [], []
+        for entry in entries:
+            if retry_io(lambda: entry.is_dir(follow_symlinks=False)): dirs.append(entry.name)
+            else: names.append(entry.name)
+        yield root, dirs, names
+        pending.extend(root/name for name in reversed(dirs))
+
+
 def capture(home):
     home=Path(home).resolve()
     report={'version':1,'regular_files':0,'regular_bytes':0,'external_links':[],
             'special_files':[],'excluded':['.restore-quarantine']}
-    def fail(error): raise error
-    for directory, dirs, names in os.walk(home,followlinks=False,onerror=fail):
+    for directory, dirs, names in walk(home):
         root=Path(directory)
         if root==home: dirs[:]=[d for d in dirs if d!='.restore-quarantine']
         for name in dirs+names:
             path=root/name;relative=path.relative_to(home).as_posix()
             if relative==NAME:continue
-            info=path.lstat()
+            try:
+                info=retry_io(path.lstat)
+            except FileNotFoundError:
+                continue  # A live tool removed this entry after the directory scan.
             if stat.S_ISLNK(info.st_mode):
-                if not path.resolve().is_relative_to(home):report['external_links'].append(relative)
+                if not retry_io(path.resolve).is_relative_to(home):report['external_links'].append(relative)
             elif stat.S_ISREG(info.st_mode):
                 report['regular_files']+=1;report['regular_bytes']+=info.st_size
             elif not stat.S_ISDIR(info.st_mode):report['special_files'].append(relative)
