@@ -617,6 +617,8 @@ def install_runtime(revision, target=None):
                               ("dashboard-plugins", "dashboard-plugins")):
         shutil.copytree(SOURCE / name, TOOLS / destination, dirs_exist_ok=True)
     run([python, TOOLS / "patch-colab-full.py", INSTALL])
+    run([python, TOOLS / "patch-files-analysis.py", INSTALL, "--build"],
+        env=dict(os.environ, HERMES_HOME=str(DATA)))
     for path in TOOLS.glob("*"):
         if path.suffix in (".py", ".sh"):
             path.chmod(0o755)

@@ -401,3 +401,9 @@ No extra pip install is added to the notebook's system Python for this optimizat
 ### Local Windows and Android launchers
 
 Use **`run-windows.cmd start`** on Windows (Python, Git and Docker Desktop required), or **`bash run-android.sh install`** inside Termux on Android. Windows reuses the existing private-backup launcher. Android runs Hermes inside Ubuntu; `backup-setup`, `backup`, and `restore` save encrypted Android snapshots in `archives/android/` on the same private branch. Android Stop backs up first. Its restore reads Android snapshots rather than the main Colab/Windows state. See [setup, commands and platform limits](docs/local-devices.md).
+
+### Restore the customised Files tab
+
+The saved InstaBox notes describe recursive file search and storage analysis implemented directly in its runtime, rather than a backed-up dashboard plugin. The notebook launcher now ships a portable reconstruction: Search, on-demand storage totals, folder sizes, and largest files. Scans stop at 500,000 nodes or 15 seconds and explicitly label partial totals. Native authentication, managed-root checks and sensitive-path filtering apply. Symlinks and other mounted filesystems are skipped. ZIP download, recent-file reporting and the original sorting controls are not reconstructed here.
+
+Existing Colab runtimes can run `update-files-tab.py` inside the active notebook. It downloads hash-verified public assets, explicitly prepares managed Node dependencies and builds the web UI, then requests a restart of the dashboard worker only. It does not restore private state or restart the Telegram gateway. Refresh after the supervisor restarts the dashboard. Fresh notebook installs and updates apply the same integration automatically. Runtime testing on the user's current Colab VM is still required.
