@@ -3,9 +3,10 @@
 #
 # Runs as root (PID-1 child of tini). On every boot it:
 #   1. Ensures /opt/data exists and is owned by hermes:hermes.
-#   2. Restores state from the GitHub state repo (the state branch is empty
-#      on a first launch; seeding it is left to the git sync daemon, so
-#      nothing here can delay the port bind).
+#   2. Restores state from Gofile when GOFILE_TOKEN, GOFILE_SERVER,
+#      GOFILE_FILE_ID and GOFILE_FILENAME are set (current backup source
+#      since 2026-10-24). GitHub state restore is kept only as a fallback
+#      when Gofile is not configured.
 #   3. Seeds the upstream config template when this is a fresh instance.
 #   4. Runs the config patcher as the hermes user. On a fresh template it
 #      lowers known upstream resource defaults; later boots preserve edits.
@@ -32,8 +33,8 @@ python /opt/render-tools/start-proxy.py --holding
 export GIT_STATE_REPO="${GIT_STATE_REPO:-Sugamdeol/hermes-storage}"
 export GIT_STATE_BRANCH="${GIT_STATE_BRANCH:-state}"
 export GIT_STATE_ENV_MODE="${GIT_STATE_ENV_MODE:-encrypt}"
-if [ -n "${STORAGE_ENCRYPTION_KEY:-}" ] && [ -z "${GIT_STATE_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-  echo "[render-tools] private restore requires GIT_STATE_TOKEN as well as STORAGE_ENCRYPTION_KEY" >&2
+if [ -n "${STORAGE_ENCRYPTION_KEY:-}" ] && [ -z "${GIT_STATE_TOKEN:-${GITHUB_TOKEN:-}}" ] && [ -z "${GOFILE_TOKEN:-}" ]; then
+  echo "[render-tools] private restore requires GIT_STATE_TOKEN or GOFILE_TOKEN as well as STORAGE_ENCRYPTION_KEY" >&2
   exit 1
 fi
 
@@ -52,6 +53,21 @@ GIT_BACKEND=0
 if [ -x "${GIT_SYNC}" ] && [ -n "${GIT_STATE_REPO:-}" ] \
    && { [ -n "${GIT_STATE_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; }; then
   GIT_BACKEND=1
+fi
+
+# Gofile is the current backup source (since 2026-10-24). The backup is a
+# tar.gz of the Hermes data tree, uploaded every 2 hours by the Hermes
+# timer. It contains no git history and no credential files. Restore needs
+# the file id, server and filename from the latest backup log, plus the
+# Gofile token, all supplied as environment variables, never committed.
+# Gofile folder listing is Premium-only, so the latest file is not listed
+# here; the caller supplies the exact file to restore.
+GOFILE_BACKEND=0
+GOFILE_RESTORE="/opt/render-tools/gofile-restore.sh"
+if [ -n "${GOFILE_TOKEN:-}" ] && [ -n "${GOFILE_SERVER:-}" ] \
+   && [ -n "${GOFILE_FILE_ID:-}" ] && [ -n "${GOFILE_FILENAME:-}" ] \
+   && [ -x "${GOFILE_RESTORE}" ]; then
+  GOFILE_BACKEND=1
 fi
 
 # Make sure the data dir exists and the hermes user can write to it
@@ -112,7 +128,16 @@ GIT_HAS_STATE=0
 GIT_STATE_SEED_ON_BOOT=""
 export GIT_STATE_SEED_ON_BOOT
 
-if [ "${GIT_BACKEND}" -eq 1 ]; then
+if [ "${GOFILE_BACKEND}" -eq 1 ]; then
+  if run_bounded gosu hermes "${GOFILE_RESTORE}" "${DATA_DIR}"; then
+    STATE_SOURCE="gofile"
+  else
+    echo "[render-tools] gofile state restore failed; refusing to start with an empty state" >&2
+    exit 1
+  fi
+fi
+
+if [ "${GIT_BACKEND}" -eq 1 ] && [ "${STATE_SOURCE}" != "gofile" ]; then
   # Bounded for the same reason the restore is: `state` answers "is there
   # anything to restore?" by cloning the branch (a branch that exists is not
   # proof it holds state), so on every boot after the first this is a real
@@ -163,7 +188,7 @@ echo "[render-tools] state restore finished in $(elapsed_boot_seconds)s (source=
 #
 # The flag below is also the promise not to push a tree this instance never
 # restored from GitHub over state the branch already holds.
-if [ "${GIT_BACKEND}" -eq 1 ] && [ "${STATE_SOURCE}" != "github" ]; then
+if [ "${GIT_BACKEND}" -eq 1 ] && [ "${STATE_SOURCE}" != "github" ] && [ "${STATE_SOURCE}" != "gofile" ]; then
   GIT_STATE_SEED_ON_BOOT=1
   export GIT_STATE_SEED_ON_BOOT
   if [ "${GIT_HAS_STATE}" -eq 0 ]; then
@@ -418,7 +443,7 @@ fi
 # Keep a remote snapshot up to date in the background. The worker is started
 # as hermes so it cannot read files outside the data directory. It is optional
 # and exits cleanly when its credentials are not configured.
-if [ "${GIT_BACKEND}" -eq 1 ]; then
+if [ "${GIT_BACKEND}" -eq 1 ] && [ "${GOFILE_BACKEND}" -ne 1 ]; then
   export HERMES_GIT_SYNC_IN_PROCESS=1
   echo "[render-tools] started git state sync inside diagnostics (delta uploads on change)"
 fi
